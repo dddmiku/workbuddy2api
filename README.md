@@ -1,14 +1,14 @@
 <!--
   本仓库是二次开发版（fork）。
   上游：https://github.com/Sliverkiss/workbuddy2api （MIT，Copyright (c) 2026 Sliverkiss）
-  基线上游提交：c576b48
-  本仓库在基线之上做了下列改动，详见下方「本分支的改动」一节。
+  已 rebase 到上游 master 最新提交，本分支的改动叠在其上。
+  详见下方「本分支的改动」与「与上游的差异说明」两节。
   上游的 LICENSE 与版权声明原样保留。
 -->
 
 > **本仓库是 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的二次开发版本。**
 > 上游以 MIT 协议授权（Copyright (c) 2026 Sliverkiss），本分支保留其 LICENSE 与全部版权声明。
-> 基线：上游 `c576b48`，在其之上做了下面列出的修复与功能扩展。
+> 已 rebase 到上游 `master` 最新提交，本分支的改动叠在其上。
 > 主项目文档仍以上游 README 为准，本节只说明本分支的差异。
 
 ## 本分支的改动
