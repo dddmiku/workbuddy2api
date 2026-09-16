@@ -33,6 +33,7 @@ COPY scripts/global_region.py /app/scripts/global_region.py
 COPY scripts/task_common.py /app/scripts/task_common.py
 COPY scripts/task_runner.py /app/scripts/task_runner.py
 COPY scripts/school_open_day_2026.py /app/scripts/school_open_day_2026.py
+COPY scripts/growth_center.py /app/scripts/growth_center.py
 RUN sed -i 's/\r$//' /app/*.sh && chmod 755 /app/*.sh
 RUN sed -i 's/\r$//' /app/scripts/*.py && chmod 755 /app/scripts/*.py
 # 镜像不带真实配置：落 example 作为默认（生产由挂载卷 /app/config.json 覆盖）

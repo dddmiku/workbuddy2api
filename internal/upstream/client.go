@@ -35,6 +35,7 @@ const (
 	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
 	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
 	ErrClient                        // 其他 4xx / 业务错误
+	ErrContextTooLong                // 上下文超限（11115 prompt is too long）→ 请求终态，不轮转、透传原文
 )
 
 func (k ErrKind) String() string {
@@ -59,6 +60,8 @@ func (k ErrKind) String() string {
 		return "model_blocked"
 	case ErrClient:
 		return "client"
+	case ErrContextTooLong:
+		return "context_too_long"
 	default:
 		return "none"
 	}
@@ -169,6 +172,86 @@ var contentBlockedRule = errorRule{kind: ErrContentBlocked, mode: matchLower, pa
 	"blocked by security policy",
 	"unapproved channel",
 	"illegal api invocation",
+}}
+
+// contentBlockedClientMsg 内容拦截返回给调用方的固定文案。
+// [关键词] 填分类词（色情 / nsfw / 暴力 等），绝不填业务 code、账号、冷却、upstream 前缀。
+const contentBlockedClientMsg = "触发网站风控违禁词，无法调用模型：内容命中网关内容防火墙规则[%s]，已被拦截。请修改内容后重试。"
+
+const contentBlockedFallbackKeyword = "违禁词"
+
+// contentBlockedKeywords 审核分类词，按优先级扫描上游文案（大小写不敏感）。
+// 只收录可直接展示给调用方的分类标签，不收录错误码（如 11128）。
+var contentBlockedKeywords = []string{
+	"色情", "porn", "nsfw", "adult",
+	"暴力", "violence",
+	"政治", "politics",
+	"赌博", "gambling",
+	"毒品", "drug",
+	"违禁词",
+}
+
+// ContentBlockedClientMessage 把上游内容拦截改写成网关防火墙口径，不含账号/错误码。
+func ContentBlockedClientMessage(body string) string {
+	return fmt.Sprintf(contentBlockedClientMsg, contentBlockedKeyword(body))
+}
+
+// contentBlockedKeyword 从审核文案抽出分类关键词；抽不到则回「违禁词」。
+func contentBlockedKeyword(body string) string {
+	text := body
+	var env struct {
+		Msg string `json:"msg"`
+	}
+	if json.Unmarshal([]byte(body), &env) == nil && strings.TrimSpace(env.Msg) != "" {
+		text = env.Msg
+	}
+	lower := strings.ToLower(text)
+	for _, kw := range contentBlockedKeywords {
+		if strings.Contains(lower, kw) {
+			return kw
+		}
+	}
+	return contentBlockedFallbackKeyword
+}
+
+// contextTooLongRule 上下文超限关键词（上游 code 11115）。
+//
+// 定位：请求体 token 数超过模型上限，上游返回 HTTP 400 +
+// "prompt is too long: N tokens > M maximum"（extError.code=context_length_exceeded）。
+// 这是**调用方的会话/参数问题**，与账号健康毫无关系——换号必然失败，
+// 且每次轮转都在浪费一次上游请求。
+//
+// 独立成 ErrContextTooLong（而非复用 ErrBadParams）的理由：ErrBadParams 仍会轮转换号，
+// 而上下文超限换任何账号都是同一个结果（请求体没变），轮转纯属浪费配额。
+// 本类要求：不冷却 / 不熔断 / 不计错 / **立即中止轮转**，并把上游原文透传给调用方，
+// 让它看到 "prompt is too long: 1147681 tokens > 1048576 maximum" 自行压缩或换短会话。
+// 若落回 ErrClient 会被「只换号不罚」白白耗尽全部账号后吐 503
+// （实测 48 次上游请求仅产出 16 条 503，且用户看不到真实原因）。
+// ContextTooLongDetail 从上游 11115 响应体里抽出可展示的原文（msg 字段）。
+//
+// 期望形态：{"code":11115,"msg":"prompt is too long: 1147681 tokens > 1048576 maximum",...}
+// 抽不到 msg（形态变化 / 非 JSON）时退回整段 body，保证调用方总能看到上游给了什么。
+// 绝不返回空串：空串会让调用方拿到 "prompt is too long: " 这种无信息量的句子。
+func ContextTooLongDetail(body string) string {
+	var env struct {
+		Msg string `json:"msg"`
+	}
+	if json.Unmarshal([]byte(body), &env) == nil {
+		if m := strings.TrimSpace(env.Msg); m != "" {
+			return m
+		}
+	}
+	b := strings.TrimSpace(body)
+	if b == "" {
+		return "request exceeds model context window"
+	}
+	return b
+}
+
+var contextTooLongRule = errorRule{kind: ErrContextTooLong, mode: matchExact, patterns: []string{
+	"prompt is too long",
+	`"code":11115`,
+	"context_length_exceeded",
 }}
 
 // badParamsRule 请求体解析失败关键词（issue #41 连带）：HTTP 400 + 上游
@@ -382,6 +465,9 @@ func Classify(status int, body string) ErrKind {
 		if contentBlockedRule.hit(body, lower) {
 			return ErrContentBlocked
 		}
+		if contextTooLongRule.hit(body, lower) {
+			return ErrContextTooLong
+		}
 		if badParamsRule.hit(body, lower) {
 			return ErrBadParams
 		}
@@ -429,6 +515,12 @@ type Client struct {
 
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	SanitizeFingerprints bool
+
+	// OutboundImageBudgetBytes 出站请求体字节预算（<=0 = 不裁剪）。
+	// 入站两道边界（nginx client_max_body_size / 网关 max_body_mb）只决定「接不接收」，
+	// 不代表上游能收多大。这里在出站咽喉做按字节裁剪：超预算时从最旧的图片开始
+	// 替换为文本占位（见 image_budget.go），保证发往上游的体积始终在验证过的范围内。
+	OutboundImageBudgetBytes int
 
 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认 WorkBuddy
 	// 三段式与 billingUA 单段式）。空 = 默认官方形态：chat/refresh/FetchModels 走
@@ -558,6 +650,9 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
 	body = InjectPromptCacheKey(body, uid, conversationID)
+	// 出站图片预算（最后一环）：前面所有改写都可能让体积膨胀，这里统一按字节收口。
+	// 放在 prompt_cache_key 之后：裁剪只动图片 part，缓存键不受影响。
+	body = ShrinkOutboundImages(body, c.OutboundImageBudgetBytes)
 	return body
 }
 
@@ -823,6 +918,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	// global 首次路径 404/405 时换 fallback 路径重试；ensureConsoleSystem 在 prepareBody 后统一套用
 	// 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128）。
 	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
+
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
 	}

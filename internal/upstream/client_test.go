@@ -52,6 +52,13 @@ func TestClassify(t *testing.T) {
 		{400, `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`, ErrBadParams},
 		{400, `Unmarshal chat params failed`, ErrBadParams},
 		{400, `{"code":11101,"msg":"x"}`, ErrBadParams},
+		// ErrContextTooLong：上下文超限（HTTP 400 + code 11115 / prompt is too long）。
+		// 请求体本身超模型上限，换任何账号都是同一结果——必须立即中止轮转并透传原文，
+		// 落回 ErrClient 会「只换号不罚」白白耗尽全部账号后吐 503（实测 48 请求→16 条 503）。
+		{400, `{"code":11115,"msg":"prompt is too long: 1147681 tokens > 1048576 maximum","extError":{"code":"context_length_exceeded"}}`, ErrContextTooLong},
+		{400, `prompt is too long`, ErrContextTooLong},
+		{400, `{"code":11115,"msg":"x"}`, ErrContextTooLong},
+		{413, `{"extError":{"code":"context_length_exceeded"}}`, ErrContextTooLong},
 		{200, `quota exceeded`, ErrHardCredit},
 		// 账号级授权/配额故障（与 429 一起纳入轮换）：11140 request illegal = auth_forbidden
 		// 风控（需重登），14017 = quota_not_activated（试用未激活，需完成 register）。修复前
@@ -702,5 +709,31 @@ func TestRateRegexesPrecompiledConcurrent(t *testing.T) {
 	close(errs)
 	for e := range errs {
 		t.Error(e)
+	}
+}
+
+// TestContextTooLongDetail 校验原文提取：拿到 msg 时用它，
+// 拿不到时退回整段 body，且绝不返回空串（空串会给调用方
+// "prompt is too long: " 这种无信息量的句子）。
+func TestContextTooLongDetail(t *testing.T) {
+	cases := []struct{ body, want string }{
+		{`{"code":11115,"msg":"prompt is too long: 1147681 tokens > 1048576 maximum"}`,
+			"prompt is too long: 1147681 tokens > 1048576 maximum"},
+		{`{"code":11115,"msg":"  prompt is too long  "}`, "prompt is too long"},
+		// 上游 msg 已自带前缀，Detail 原样返回，调用方不应再叠加（否则文案重复）
+		{`{"code":11115,"msg":"prompt is too long: 3386426 tokens > 1048576 maximum"}`,
+			"prompt is too long: 3386426 tokens > 1048576 maximum"},
+		// 形态变化：非 JSON → 退回整段
+		{`prompt is too long`, "prompt is too long"},
+		// 空 body → 固定兜底文案，绝不空串
+		{``, "request exceeds model context window"},
+		{`   `, "request exceeds model context window"},
+		// JSON 但 msg 缺失 → 退回整段（保留上游原始信息）
+		{`{"code":11115}`, `{"code":11115}`},
+	}
+	for _, c := range cases {
+		if got := ContextTooLongDetail(c.body); got != c.want {
+			t.Errorf("ContextTooLongDetail(%q) = %q, want %q", c.body, got, c.want)
+		}
 	}
 }

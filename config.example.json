@@ -17,12 +17,18 @@
     "keepalive_hours": [22],
     "school_hours": [12],
     "cat_hours": [1],
+    "redeem_hours": [9],
+    "lottery_hours": [21],
+    "makeup_hours": [9],
     "checkin_enabled": true,
     "travel_enabled": true,
     "activity_enabled": true,
     "keepalive_enabled": true,
     "school_enabled": true,
-    "cat_enabled": true
+    "cat_enabled": true,
+    "redeem_enabled": true,
+    "lottery_enabled": true,
+    "makeup_enabled": true
   },
   "global": {
     "enabled": true,

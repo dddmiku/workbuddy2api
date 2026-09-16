@@ -488,10 +488,13 @@ func TestRunCheckinDoesNotTriggerTravel(t *testing.T) {
 // TestNextWakeTravelIndependent 旅行有独立时点，与签到互不影响。
 func TestNextWakeTravelIndependent(t *testing.T) {
 	s := New(Config{
-		CheckinHours:   []int{21},
-		TravelHours:    []int{9},
-		ActivityHours:  []int{10},
-		KeepaliveHours: []int{22},
+		CheckinHours:    []int{21},
+		TravelHours:     []int{9},
+		ActivityHours:   []int{10},
+		KeepaliveHours:  []int{22},
+		RedeemDisabled:  true,
+		LotteryDisabled: true,
+		MakeupDisabled:  true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 8, 0, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 9, 0, 0, 0, time.Local); !at.Equal(want) {
@@ -589,6 +592,9 @@ func TestAllFourDisabledNoSpin(t *testing.T) {
 		KeepaliveDisabled: true,
 		SchoolDisabled:    true,
 		CatDisabled:       true,
+		RedeemDisabled:    true,
+		LotteryDisabled:   true,
+		MakeupDisabled:    true,
 		CheckinHours:      []int{9, 21},
 		TravelHours:       []int{9},
 		ActivityHours:     []int{10},

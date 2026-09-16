@@ -1,3 +1,77 @@
+<!--
+  本仓库是二次开发版（fork）。
+  上游：https://github.com/Sliverkiss/workbuddy2api （MIT，Copyright (c) 2026 Sliverkiss）
+  基线上游提交：c576b48
+  本仓库在基线之上做了下列改动，详见下方「本分支的改动」一节。
+  上游的 LICENSE 与版权声明原样保留。
+-->
+
+> **本仓库是 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的二次开发版本。**
+> 上游以 MIT 协议授权（Copyright (c) 2026 Sliverkiss），本分支保留其 LICENSE 与全部版权声明。
+> 基线：上游 `c576b48`，在其之上做了下面列出的修复与功能扩展。
+> 主项目文档仍以上游 README 为准，本节只说明本分支的差异。
+
+## 本分支的改动
+
+### Responses API 支持（`internal/server/responses.go`）
+
+上游只实现了 `/v1/chat/completions`，用 Codex 这类走 OpenAI Responses API 的客户端会直接吃到 Go 默认的
+`404 page not found`。本分支新增 `POST /v1/responses`：把 Responses 请求归一成 chat completions 的
+内部结构复用既有链路，响应侧再还原成 Responses 的形状与 SSE 事件序列（含 `response.output_text.delta`
+与终态 `response.completed`）。无状态设计——`store` / `previous_response_id` / `truncation` /
+`text.format` 等字段一律忽略，会话由客户端每轮自带完整 `input`。
+
+### 站点图片预算（`internal/upstream/image_budget.go`）
+
+实测一次 471 轮的会话请求体 8.62MB，其中 27 张图片占 7.53MB（87.3%），而图片的字节数不随 token
+计费模型线性折算，体积远早于 token 到顶就把请求撑爆，而且会先撞 nginx 的 `client_max_body_size`
+或网关的 `server.max_body_mb` 直接 413。本分支在出站组包环节按字节做一次裁剪：把中间过程里已经
+被替换掉的图片块降级成文本占位符（首尾与最近的图片保留），让请求体稳定落在预算内。
+
+### 工具调用配对修复（`internal/upstream/tool_pairing.go`）
+
+修 `repackToolResultBlocks` 的分组收敛：Codex 会把 `<image_resize_notice>` 插进两条 tool 结果
+之间，导致 tool_call 与 tool_result 配对错位，上游在长会话（实测 11148 轮）会因此校验失败。
+现在按配对完整性重新分组，并把对称性检查写成了回归测试。
+
+### 定时任务补齐
+
+上游的排程缺三个任务，本分支补齐并对齐 `/tasks` 管理接口：
+
+- `internal/scheduler/tasks.go` — 任务元数据与手动触发，暴露小时 / 详情 / 下次运行 / 上次运行 / 是否运行中，可按 key 单独跑一次。
+- `internal/scheduler/growth.go` — 连登兑换（redeem）、成长抽奖（lottery）、补签（makeup）三个任务的接入。
+- `internal/scheduler/tasklog.go` — 每次执行的日志环（400 行），供 `GET /tasks/{key}/log` 查看；此前脚本输出被丢弃，只剩一句 `school: ok`，出问题无从查起。
+- `scripts/growth_center.py` — 成长中心脚本（连登档位兑换 / 抽奖 / 补签），与 `school` / `cat` 走同一套脚本执行路径。
+
+### 管理接口（`internal/server/tasks.go`）
+
+新增 `GET /tasks`、`POST /tasks/{key}/run`、`GET /tasks/{key}/log` 三个带鉴权的管理端点，
+给配套的账号管理台使用。
+
+### 测试
+
+新增 `responses_test.go`、`tasks_test.go`、`image_budget_test.go`、`tasks_test.go`（scheduler）等
+用例；`go build ./...`、`go vet ./...` 与 `go test ./...`（16 个包）在导出副本上全部通过。
+`real_session_test.go` 与 `diag_test.go` 依赖本机的大载荷文件，缺文件时自动 skip，不影响 CI。
+
+### 与上游的差异说明
+
+本分支已 rebase 到上游 `master` 最新提交，上游的全部改动都在，本分支的改动叠在其上。
+四个文件（`internal/upstream/client.go`、`internal/upstream/client_test.go`、
+`internal/scheduler/scheduler.go`、`internal/scheduler/tasks.go`）在上游也改过同名区域，
+冲突按下列口径合并：
+
+- `client.go`：保留本分支新增的内容拦截文案改写（上游该区域无对应实现）。
+- `client_test.go`：两边新增的测试都保留。
+- `scheduler.go`：上游新加的 `ctx` 传导与本分支的任务互斥 / 日志环合并——`dispatch`
+  与 `runTask` / `runKind` 都带 `ctx`，同时保留 `beginTask` / `endTask` 的防重入与
+  `taskSink` 日志归集。
+- `tasks.go`：手动触发没有请求上下文，`runTask` 传 `context.Background()`。
+
+合并后 `go build ./...`、`go vet ./...`、`go test ./...`（16 个包全部 ok）在干净副本上通过。
+
+---
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/DGZSbot/ai-icon/refs/heads/main/WorkBuddy.png" alt="WorkBuddy2API" width="120">
 </p>
@@ -78,7 +152,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
 - **开学季任务**（12 点）— 任务点亮 + claim + 自动抽空抽奖余额，活动下线时自动跳过
 - **夜猫子任务**（01 点）— 夜猫窗口（23:00–08:00 CST）内补一次 black_cat 任务
 
-六类任务独立排程、独立开关（`schedule.*_enabled`），互不影响。
+多类任务独立排程、独立开关（`schedule.*_enabled`），互不影响。
 
 ### 双域适配
 

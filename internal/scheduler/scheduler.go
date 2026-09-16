@@ -1,4 +1,5 @@
-// Package scheduler 定时任务：签到 / 活跃上报 / 猫猫旅行 / token keepalive / 开学季 / 夜猫子 六类独立排程。
+// Package scheduler 定时任务：签到 / 活跃上报 / 猫猫旅行 / token keepalive / 开学季 / 夜猫子 /
+// 连登兑换 / 成长抽奖 / 补签 —— 多类独立排程，各自独立开关与独立时点。
 // 签到成功后重新查余额，余额 > 0 的冷却账号自动解冻。
 package scheduler
 
@@ -18,7 +19,7 @@ import (
 
 // Config 调度器依赖。
 //
-// 任务开关用「禁用」命名而非「启用」：零值 Config 即六类任务都启用（hours 回落默认），
+// 任务开关用「禁用」命名而非「启用」：零值 Config 即各类任务都启用（hours 回落默认），
 // 与引入开关前的行为逐字一致（老调用方/老测试无需改动）。
 type Config struct {
 	Pool           *pool.Pool
@@ -29,6 +30,9 @@ type Config struct {
 	KeepaliveHours []int // 默认 [22]
 	SchoolHours    []int // 默认 [12]：开学季任务（迁移自系统 crontab）
 	CatHours       []int // 默认 [1]：夜猫子任务（迁移自系统 crontab）
+	RedeemHours    []int // 默认 [9]：连登档位兑换（7d/14d/28d）
+	LotteryHours   []int // 默认 [21]：成长中心抽奖（清空当日次数）
+	MakeupHours    []int // 默认 [9]：补签（补最近一次漏签）
 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
 	// 默认 5 条同一 conversationId 内多轮上报把 chat_5 刷满；0/缺省=1 兼容旧行为。
 	ActivityReportCount int
@@ -51,6 +55,12 @@ type Config struct {
 	SchoolDisabled bool
 	// CatDisabled 显式关闭夜猫子任务排程（schedule.cat_enabled=false）。
 	CatDisabled bool
+	// RedeemDisabled 显式关闭连登兑换排程（schedule.redeem_enabled=false）。
+	RedeemDisabled bool
+	// LotteryDisabled 显式关闭成长抽奖排程（schedule.lottery_enabled=false）。
+	LotteryDisabled bool
+	// MakeupDisabled 显式关闭补签排程（schedule.makeup_enabled=false）。
+	MakeupDisabled bool
 }
 
 // Scheduler 调度器。
@@ -70,6 +80,18 @@ type Scheduler struct {
 
 	// checkinMu 串行化签到：定时入口与手动触发互斥，避免同一时刻重复打上游签到接口。
 	checkinMu sync.Mutex
+
+	// taskMu/taskLast/taskBusy 任务自省状态：供 /tasks 与账户管理面板读取"上次完成时刻"
+	// 与"是否正在跑"，并由 beginTask 统一做定时入口与手动触发的互斥。
+	// 只存内存、重启即清零（与 adoptTried 同口径：这些是观测值，不是要持久化的业务状态）。
+	taskMu   sync.Mutex
+	taskLast map[TaskKey]time.Time
+	taskBusy map[TaskKey]bool
+
+	// runMu 全局任务互斥：同一时刻只允许一类任务在跑。这些任务打的是同一批上游
+	// 账号，并发只会让风控更容易命中；顺带让任务日志有唯一归属者，
+	// taskLogSink.cur 因此不必处理多重归属。
+	runMu sync.Mutex
 }
 
 // New 构建。
@@ -92,11 +114,26 @@ func New(cfg Config) *Scheduler {
 	if len(cfg.CatHours) == 0 {
 		cfg.CatHours = []int{1}
 	}
+	if len(cfg.RedeemHours) == 0 {
+		cfg.RedeemHours = []int{9}
+	}
+	if len(cfg.LotteryHours) == 0 {
+		cfg.LotteryHours = []int{21}
+	}
+	if len(cfg.MakeupHours) == 0 {
+		cfg.MakeupHours = []int{9}
+	}
 	// 0/缺省 = 1 条（兼容旧行为：每号每天 1 条上报点亮连登）。
 	if cfg.ActivityReportCount <= 0 {
 		cfg.ActivityReportCount = 1
 	}
-	return &Scheduler{cfg: cfg, adoptTried: make(map[string]string), rewardClaimed: make(map[string]string)}
+	return &Scheduler{
+		cfg:           cfg,
+		adoptTried:    make(map[string]string),
+		rewardClaimed: make(map[string]string),
+		taskLast:      make(map[TaskKey]time.Time),
+		taskBusy:      make(map[TaskKey]bool),
+	}
 }
 
 // checkinRefreshSkew 签到前判定"token 是否临近过期"的时间窗口（10 分钟）。
@@ -150,6 +187,9 @@ const (
 	taskKeepalive
 	taskSchool
 	taskCat
+	taskRedeem
+	taskLottery
+	taskMakeup
 )
 
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
@@ -179,6 +219,15 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	if !s.cfg.CatDisabled {
 		slots = append(slots, slot{nextFire(now, s.cfg.CatHours), taskCat})
 	}
+	if !s.cfg.RedeemDisabled {
+		slots = append(slots, slot{nextFire(now, s.cfg.RedeemHours), taskRedeem})
+	}
+	if !s.cfg.LotteryDisabled {
+		slots = append(slots, slot{nextFire(now, s.cfg.LotteryHours), taskLottery})
+	}
+	if !s.cfg.MakeupDisabled {
+		slots = append(slots, slot{nextFire(now, s.cfg.MakeupHours), taskMakeup})
+	}
 	var earliest time.Time
 	for _, sl := range slots {
 		if sl.at.IsZero() {
@@ -205,7 +254,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 	for {
 		next, kinds := s.nextWake(time.Now())
 		if next.IsZero() {
-			// 六类任务全部禁用：不空转，只等退出信号。
+			// 全部任务都禁用：不空转，只等退出信号。
 			<-ctx.Done()
 			return
 		}
@@ -243,6 +292,39 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 // 不影响其余任务继续执行（与现有各任务"单账号失败不阻断遍历"同口径）。
 // ctx 传导给带账号间限速的遍历（取消时立即放弃剩余账号），纯脚本类任务不感知。
 func (s *Scheduler) dispatch(ctx context.Context, k taskKind) {
+	if !s.beginTask(k) {
+		// 该任务已在执行（多为管理面板手动触发撞上定时点）：跳过本轮，不重复打上游。
+		log.Printf("scheduler: %s 正在执行，跳过本次定时触发", k.key())
+		return
+	}
+	defer s.endTask(k)
+	s.runTask(ctx, k)
+}
+
+// runTask 串行执行单类任务：全局互斥 + 日志归集。
+// 定时入口（dispatch）与手动触发（TriggerTask）都走这里，保证同一时刻只有一类任务在跑。
+func (s *Scheduler) runTask(ctx context.Context, k taskKind) {
+	s.runMu.Lock()
+	defer s.runMu.Unlock()
+	key := k.key()
+	taskSink.begin(key)
+	defer taskSink.end()
+
+	// 统一的起止标记：有些任务成功时本来一行都不打（保活就是），
+	// 面板上会显示成"0 行"，看不出到底跑没跑。有了这对标记，任何任务
+	// 都至少能回答"刚才那次执行了没有、花了多久"。
+	// defer 注册顺序：先 end 后 marker，LIFO 下 marker 先跑，保证结束行也入环。
+	start := time.Now()
+	log.Printf("%s: 开始执行", key)
+	defer func() {
+		log.Printf("%s: 执行结束（耗时 %.1fs）", key, time.Since(start).Seconds())
+	}()
+	s.runKind(ctx, k)
+}
+
+// runKind 执行单类任务，本身不含互斥——互斥由调用方经 beginTask/endTask 负责，
+// 定时入口（dispatch）与手动触发（TriggerTask）共用同一把锁。
+func (s *Scheduler) runKind(ctx context.Context, k taskKind) {
 	switch k {
 	case taskCheckin:
 		s.RunCheckinNow()
@@ -256,6 +338,12 @@ func (s *Scheduler) dispatch(ctx context.Context, k taskKind) {
 		s.RunSchoolNow()
 	case taskCat:
 		s.RunCatNow()
+	case taskRedeem:
+		s.RunRedeemNow()
+	case taskLottery:
+		s.RunLotteryNow()
+	case taskMakeup:
+		s.RunMakeupNow()
 	}
 }
 
@@ -588,15 +676,24 @@ func (s *Scheduler) markRewardClaimed(uid string) {
 // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
 // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
 func (s *Scheduler) RunKeepaliveNow() {
+	// 成功路径本来完全静默（只在失败时打 WARN），面板上会是一片空白。
+	// 统计后补一行汇总，至少能看出"刷了几个号、失败几个"。
+	okCnt, failCnt, skipCnt := 0, 0, 0
+	defer func() {
+		log.Printf("keepalive: 刷新成功 %d，失败 %d，跳过 %d", okCnt, failCnt, skipCnt)
+	}()
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
+			skipCnt++
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshToken == "" {
+			skipCnt++
 			continue
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
+			failCnt++
 			log.Printf("keepalive %s: %v", logfmt.UID8(st.UID), err)
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
@@ -611,5 +708,6 @@ func (s *Scheduler) RunKeepaliveNow() {
 		if err := a.SaveAtomic(); err != nil {
 			log.Printf("keepalive %s save: %v", logfmt.UID8(st.UID), err)
 		}
+		okCnt++
 	}
 }

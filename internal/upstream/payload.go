@@ -52,6 +52,13 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	// deepseek-only 的 sanitize 开关）。这是「让请求通过」的安全网——不完整配对的
 	// tool_calls/tool 结果会让上游对之后每条消息都返 400，必须先行剔除。
 	if msgs, ok := obj["messages"].([]any); ok {
+		// 先修顺序：把插在 assistant.tool_calls 与其结果之间的消息后移，
+		// 否则并行调用被打断会被上游判 11148（image_resize_notice 场景）。
+		if packed, ch := repackToolResultBlocks(msgs); ch {
+			obj["messages"] = packed
+			msgs = packed
+		}
+		// 再删残留：顺序修好后仍无法配对的条目（真正缺结果的调用 / 孤儿结果）。
 		if cleaned, ch := cleanupOrphanToolCalls(msgs); ch {
 			obj["messages"] = cleaned
 		}

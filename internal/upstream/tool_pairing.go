@@ -18,10 +18,111 @@ package upstream
 //   - 一批 assistant tool_calls 只有全部 id 都拿到结果才整体保留（部分保留会留下无结果的
 //     tool_call，上游照样拒绝）；
 //   - role:tool 只在对应 tool_call 被保留时才保留，否则删除整条消息；
-//   - 无任何工具流量 → 原 slice 原样返回，changed=false（零分配零改动）。
+//   - 无任何工具流量 -> 原 slice 原样返回，changed=false（零分配零改动）。
 //
 // 这是「让请求通过」的安全网：只要存在合法配对就整段保留这些字段，绝不吞掉正确配对。
 // 返回清理后的 slice（无改动时等于原 slice，勿依赖其是否新分配）及是否发生删除。
+// repackToolResultBlocks 把插在 assistant.tool_calls 与其 tool 结果之间的非 tool 消息
+// 挪到整组之后，保证同一批 tool_call 的结果在 wire 上连续。
+//
+// 背景：Codex 的 image_resize_notice 特性会把 <image_resize_notice> 作为一条 user/system
+// 消息插在 tool 输出后面（见 codex 二进制 features 表 images.resize_notice）。并行调用时
+// 它插在两份 tool 结果中间：
+//
+//	assistant tool_calls=[c00 c01]
+//	tool c00
+//	developer <image_resize_notice>   <- 插在中间
+//	tool c01
+//
+// OpenAI 兼容协议要求 tool 结果紧跟 assistant，中间插任何消息都算配对断裂，上游判
+// 11148 tool_call_sequence_broken 并顶死整条会话（实测真实会话 33 处并行调用里唯一
+// 被打断的那处正是会话卡死点）。这里只调顺序、不改内容：
+//
+//	assistant tool_calls=[c00 c01] | tool c00 | X | tool c01
+//	-> assistant tool_calls=[c00 c01] | tool c00 | tool c01 | X
+//
+// 结果顺序保持不变（同批 tool_call id 顺序 = 结果顺序），因此不引入新的顺序敏感问题。
+// 无插入消息时零改动零分配。
+func repackToolResultBlocks(messages []any) ([]any, bool) {
+	if len(messages) < 3 {
+		return messages, false
+	}
+	out := make([]any, 0, len(messages))
+	changed := false
+	i := 0
+	for i < len(messages) {
+		m, ok := messages[i].(map[string]any)
+		if !ok || m["role"] != "assistant" {
+			out = append(out, messages[i])
+			i++
+			continue
+		}
+		tcs, hasCalls := m["tool_calls"].([]any)
+		if !hasCalls || len(tcs) == 0 {
+			out = append(out, messages[i])
+			i++
+			continue
+		}
+		want := map[string]bool{}
+		for _, tci := range tcs {
+			if tc, ok := tci.(map[string]any); ok {
+				if id, _ := tc["id"].(string); id != "" {
+					want[id] = true
+				}
+			}
+		}
+		// 收集紧随其后（允许被其他消息打断）的同批 tool 结果，按原相对顺序
+		out = append(out, messages[i])
+		i++
+		var results []any
+		var between []any
+		sawNonTool := false
+		for i < len(messages) {
+			mm, ok := messages[i].(map[string]any)
+			if !ok {
+				break
+			}
+			role, _ := mm["role"].(string)
+			if role == "tool" {
+				id, _ := mm["tool_call_id"].(string)
+				if !want[id] {
+					break
+				}
+				results = append(results, messages[i])
+				if sawNonTool {
+					changed = true
+				}
+				i++
+				continue
+			}
+			if len(results) == 0 {
+				break // assistant 后没有结果：交由 cleanupOrphanToolCalls 处理
+			}
+			// 下一组 assistant.tool_calls 是新的组头，绝不能当插入物吞掉：收进
+			// between 它就被原样吐出，且永远不再被外层循环当作组头处理，它自己
+			// 那批结果也就永远得不到重排。真实会话 msg[181]（view_image ×2）正是
+			// 这样漏掉的——被上一组的收集循环吞进 between，于是 [183] 仍夹在
+			// [182]/[184] 两条 tool 结果中间，上游照旧判 11148。必须 break，把
+			// 组头交还外层循环。
+			if role == "assistant" {
+				if next, _ := mm["tool_calls"].([]any); len(next) > 0 {
+					break
+				}
+			}
+			// 同批结果尚未收齐时，中间消息视为插入物，暂存待后移
+			between = append(between, messages[i])
+			sawNonTool = true
+			i++
+		}
+		out = append(out, results...)
+		out = append(out, between...)
+	}
+	if !changed {
+		return messages, false
+	}
+	return out, true
+}
+
 func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 	if len(messages) == 0 {
 		return messages, false
@@ -66,7 +167,13 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 		}
 	}
 	changed := false
-	// 1) assistant.tool_calls：批内每个 id 都保留才整批保留，否则删掉整个 tool_calls 键。
+	// 1) assistant.tool_calls：按 keepCalls 过滤，只留有结果的调用；过滤后为空则删键。
+	//
+	// 历史实现是「批内每个 id 都齐才整批保留，否则删掉整个 tool_calls 键」。那会留下
+	// 无主结果：批 [c1,c2] 只回了 c1 时，调用侧整批被删，而 tool{c1} 仍按 id 命中
+	// keepCalls 得以保留 —— 出站载荷于是变成「无 tool_calls 的 assistant + 孤儿 tool」，
+	// 上游判 11148（tool calls and tool results do not match）并顶死整条会话。
+	// 现在两侧共用同一份 keepCalls 按 id 对称裁剪，任何输入都不会再产生半截配对。
 	for _, m := range messages {
 		msg, ok := m.(map[string]any)
 		if !ok {
@@ -79,23 +186,25 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 		if !ok || len(tcs) == 0 {
 			continue
 		}
-		allKept := true
+		keptCalls := make([]any, 0, len(tcs))
 		for _, tci := range tcs {
 			tc, ok := tci.(map[string]any)
 			if !ok {
-				allKept = false
-				break
+				continue
 			}
-			id, _ := tc["id"].(string)
-			if !keepCalls[id] {
-				allKept = false
-				break
+			if id, _ := tc["id"].(string); keepCalls[id] {
+				keptCalls = append(keptCalls, tc)
 			}
 		}
-		if !allKept {
+		if len(keptCalls) == len(tcs) {
+			continue // 整批齐全：零改动
+		}
+		changed = true
+		if len(keptCalls) == 0 {
 			delete(msg, "tool_calls")
-			changed = true
+			continue
 		}
+		msg["tool_calls"] = keptCalls
 	}
 	// 2) role:tool 结果：只有对应 tool_call 被保留才保留；孤儿结果整条删除。
 	kept := make([]any, 0, len(messages))

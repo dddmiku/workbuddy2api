@@ -48,7 +48,8 @@ func TestNextFireMergesSchedules(t *testing.T) {
 // TestNextWakeKeepaliveOnly 签到已过点时按保活整点唤醒。
 func TestNextWakeKeepaliveOnly(t *testing.T) {
 	s := New(Config{CheckinHours: []int{9}, KeepaliveHours: []int{22},
-		TravelDisabled: true, ActivityDisabled: true})
+		TravelDisabled: true, ActivityDisabled: true,
+		RedeemDisabled: true, LotteryDisabled: true, MakeupDisabled: true})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 20, 0, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, time.Local); !at.Equal(want) {
 		t.Errorf("next=%v want %v", at, want)
@@ -69,6 +70,9 @@ func TestNextWakeSameInstantFiresAll(t *testing.T) {
 		ActivityDisabled: true,
 		SchoolDisabled:   true,
 		CatDisabled:      true,
+		RedeemDisabled:   true,
+		LotteryDisabled:  true,
+		MakeupDisabled:   true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 21, 30, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, time.Local); !at.Equal(want) {
@@ -100,7 +104,8 @@ func TestNextWakeNothingScheduled(t *testing.T) {
 // TestNextWakeCheckinDisabled 显式禁用签到后，排程里不再有签到时点（保活照常）。
 func TestNextWakeCheckinDisabled(t *testing.T) {
 	s := New(Config{CheckinDisabled: true, CheckinHours: []int{9, 21}, KeepaliveHours: []int{22},
-		TravelDisabled: true, ActivityDisabled: true})
+		TravelDisabled: true, ActivityDisabled: true,
+		RedeemDisabled: true, LotteryDisabled: true, MakeupDisabled: true})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 20, 0, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, time.Local); !at.Equal(want) {
 		t.Errorf("next=%v want %v（不应再有 21 点签到）", at, want)
@@ -113,7 +118,8 @@ func TestNextWakeCheckinDisabled(t *testing.T) {
 // TestNextWakeKeepaliveDisabled 显式禁用保活后，排程里不再有保活时点（签到照常）。
 func TestNextWakeKeepaliveDisabled(t *testing.T) {
 	s := New(Config{KeepaliveDisabled: true, CheckinHours: []int{9, 21}, KeepaliveHours: []int{22},
-		TravelDisabled: true, ActivityDisabled: true})
+		TravelDisabled: true, ActivityDisabled: true,
+		RedeemDisabled: true, LotteryDisabled: true, MakeupDisabled: true})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 20, 0, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 21, 0, 0, 0, time.Local); !at.Equal(want) {
 		t.Errorf("next=%v want %v（不应再有 22 点保活）", at, want)
@@ -123,7 +129,7 @@ func TestNextWakeKeepaliveDisabled(t *testing.T) {
 	}
 }
 
-// TestNextWakeBothDisabledNothingScheduled 六类任务都显式禁用 → 无可唤醒时点。
+// TestNextWakeBothDisabledNothingScheduled 九类任务都显式禁用 → 无可唤醒时点。
 func TestNextWakeBothDisabledNothingScheduled(t *testing.T) {
 	s := New(Config{
 		CheckinDisabled:   true,
@@ -132,6 +138,9 @@ func TestNextWakeBothDisabledNothingScheduled(t *testing.T) {
 		KeepaliveDisabled: true,
 		SchoolDisabled:    true,
 		CatDisabled:       true,
+		RedeemDisabled:    true,
+		LotteryDisabled:   true,
+		MakeupDisabled:    true,
 		CheckinHours:      []int{9, 21},
 		KeepaliveHours:    []int{22},
 	})
@@ -141,7 +150,7 @@ func TestNextWakeBothDisabledNothingScheduled(t *testing.T) {
 	}
 }
 
-// TestRunAllDisabledNoSpinNoCalls 六类任务全禁用：Run 不空转（只等退出信号），
+// TestRunAllDisabledNoSpinNoCalls 九类任务全禁用：Run 不空转（只等退出信号），
 // 且不能触发任何上游请求。
 func TestRunAllDisabledNoSpinNoCalls(t *testing.T) {
 	var calls atomic.Int32
@@ -640,28 +649,28 @@ func TestCheckinAllReenablesCoolingAccount(t *testing.T) {
 // 老 CN 文件（空 domain，无 realm 键）→ cn；再次 refresh 不改变已补的标识（幂等）。
 func TestRunKeepaliveBackfillsRealm(t *testing.T) {
 	cases := []struct {
-		name       string
-		fixture    string
-		filename   string
-		wantRealm  string
+		name      string
+		fixture   string
+		filename  string
+		wantRealm string
 	}{
 		{
-			name: "老 global 落盘补 global",
-			fixture: `{"auth":{"accessToken":"old","refreshToken":"rt","expiresAt":1,"domain":"www.workbuddy.ai"},"account":{"uid":"g1"}}`,
-			filename:   "workbuddy-g1.json",
-			wantRealm:  "global",
+			name:      "老 global 落盘补 global",
+			fixture:   `{"auth":{"accessToken":"old","refreshToken":"rt","expiresAt":1,"domain":"www.workbuddy.ai"},"account":{"uid":"g1"}}`,
+			filename:  "workbuddy-g1.json",
+			wantRealm: "global",
 		},
 		{
-			name: "老 CN 空 domain 落盘补 cn",
-			fixture: `{"auth":{"accessToken":"old","refreshToken":"rt","expiresAt":1,"domain":""},"account":{"uid":"c1"}}`,
-			filename:   "workbuddy-c1.json",
-			wantRealm:  "cn",
+			name:      "老 CN 空 domain 落盘补 cn",
+			fixture:   `{"auth":{"accessToken":"old","refreshToken":"rt","expiresAt":1,"domain":""},"account":{"uid":"c1"}}`,
+			filename:  "workbuddy-c1.json",
+			wantRealm: "cn",
 		},
 		{
-			name: "已有 realm 不被覆盖——global domain 显式 cn 保持 cn",
-			fixture: `{"auth":{"accessToken":"old","refreshToken":"rt","expiresAt":1,"domain":"www.workbuddy.ai","realm":"cn"},"account":{"uid":"c2"}}`,
-			filename:   "workbuddy-c2.json",
-			wantRealm:  "cn",
+			name:      "已有 realm 不被覆盖——global domain 显式 cn 保持 cn",
+			fixture:   `{"auth":{"accessToken":"old","refreshToken":"rt","expiresAt":1,"domain":"www.workbuddy.ai","realm":"cn"},"account":{"uid":"c2"}}`,
+			filename:  "workbuddy-c2.json",
+			wantRealm: "cn",
 		},
 	}
 	for _, c := range cases {

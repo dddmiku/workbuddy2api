@@ -2,7 +2,7 @@
 //
 // 背景：school（12:00）与 cat（01:00 夜猫窗口）原由系统 crontab 调
 // scripts/school_open_day_cron.sh 执行——依赖外部系统 cron、容器重建可能丢失、
-// 不在 config 里配置。迁入后成为第五、第六类任务，时点由 schedule.school_hours /
+// 不在 config 里配置。迁入后成为独立任务，时点由 schedule.school_hours /
 // schedule.cat_hours 配置，school_open_day_cron.sh 保留为手动触发入口。
 package scheduler
 
@@ -49,7 +49,15 @@ type scriptRunner interface {
 type scriptCmd struct{ cmd *exec.Cmd }
 
 func (c *scriptCmd) SetDir(dir string) { c.cmd.Dir = dir }
-func (c *scriptCmd) Run() error        { return c.cmd.Run() }
+
+// Run 接管子脚本的 stdout/stderr 后执行。
+// 不接管时 exec.Cmd 会把子进程输出直接丢弃，开学季/夜猫子任务在容器日志里
+// 只剩一行 "school: ok"——脚本报了什么错、点了几个任务全看不见。
+func (c *scriptCmd) Run() error {
+	c.cmd.Stdout = scriptSink{}
+	c.cmd.Stderr = scriptSink{}
+	return c.cmd.Run()
+}
 
 // newScriptCmd 构建脚本子进程。包级变量便于测试注入 fake（installFakeExec 覆盖）。
 // 工作目录由调用方 SetDir 显式设置仓库根。

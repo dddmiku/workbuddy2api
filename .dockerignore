@@ -16,3 +16,7 @@ PLAN.md
 SPEC.md
 LOOP.md
 README.md
+# 真实会话测试载荷（仅本地回归用，不进镜像）
+real2.json
+replay_full.json
+combined.json

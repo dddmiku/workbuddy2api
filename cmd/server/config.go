@@ -26,6 +26,13 @@ type Config struct {
 		// （issue #41：截断的 JSON 让上游 unmarshal 报 unexpected EOF，网关却罚号）。
 		// 0/负数视为非法 → normalize 回落默认并记录。
 		MaxBodyMB int `json:"max_body_mb"`
+		// OutboundImageBudgetMB 出站请求体字节预算（单位 MB，默认 7）。
+		// 与 MaxBodyMB 是两件事：MaxBodyMB 决定网关「接不接收」，本项决定
+		// 「往上游发多大」。入站放宽到能收下大请求后，出站仍须守住上游能接受的
+		// 体积，否则上游拒绝且网关可能误罚账号。
+		// 超预算时从最旧的图片开始替换为文本占位（见 upstream/image_budget.go）。
+		// 0 或负数 = 关闭裁剪（不推荐）。
+		OutboundImageBudgetMB int `json:"outbound_image_budget_mb"`
 	} `json:"server"`
 
 	Cooldown struct {
@@ -152,6 +159,8 @@ func Default() *Config {
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
 	c.Server.MaxBodyMB = 8 // 请求体上限默认 8MB
+	// 出站预算默认 7MB：留在网关 8MB 入站边界之内；调整入站上限时须同步复核本值。
+	c.Server.OutboundImageBudgetMB = 7
 	// 排程段默认值由 internal/config 集中维护（cmd/server 与 cmd/activity 共用，
 	// 消除 issue #49 的默认值漂移）。
 	c.Schedule = config.DefaultSchedule()
@@ -216,6 +225,11 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_MAX_BODY_MB"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Server.MaxBodyMB = n
+		}
+	}
+	if v := os.Getenv("WB2A_OUTBOUND_IMAGE_BUDGET_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Server.OutboundImageBudgetMB = n
 		}
 	}
 	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {

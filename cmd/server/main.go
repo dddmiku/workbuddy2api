@@ -101,6 +101,8 @@ func main() {
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
 	up.SanitizeFingerprints = cfg.Features.SanitizeBlacklistFingerprints
+	// 出站图片预算：入站放宽后守住发往上游的体积上限（MB → 字节）。
+	up.OutboundImageBudgetBytes = cfg.Server.OutboundImageBudgetMB << 20
 	// 出站 UA（A 段）：非空才做显式覆盖，空 = 默认 WorkBuddy 三段式
 	// `WorkBuddy/<client_version> WorkBuddy/<client_version> CLI/<cli_version>`。
 	up.UserAgent = cfg.Upstream.UserAgent
@@ -128,6 +130,9 @@ func main() {
 		KeepaliveHours:      cfg.Schedule.KeepaliveHours,
 		SchoolHours:         cfg.Schedule.SchoolHours,
 		CatHours:            cfg.Schedule.CatHours,
+		RedeemHours:         cfg.Schedule.RedeemHours,
+		LotteryHours:        cfg.Schedule.LotteryHours,
+		MakeupHours:         cfg.Schedule.MakeupHours,
 		ActivityReportCount: cfg.Schedule.ActivityReportCount,
 		ExpiringSoonWindow:  cfg.ExpiringSoonDur, // 快过期积分优先消耗（issue:积分过期）
 		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
@@ -136,6 +141,9 @@ func main() {
 		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
 		SchoolDisabled:      !cfg.Schedule.SchoolEnabled,
 		CatDisabled:         !cfg.Schedule.CatEnabled,
+		RedeemDisabled:      !cfg.Schedule.RedeemEnabled,
+		LotteryDisabled:     !cfg.Schedule.LotteryEnabled,
+		MakeupDisabled:      !cfg.Schedule.MakeupEnabled,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -170,6 +178,21 @@ func main() {
 	} else {
 		log.Printf("夜猫子任务已启用：%v 点（task_runner.py ALL --yes --only black_cat）", cfg.Schedule.CatHours)
 	}
+	if !cfg.Schedule.RedeemEnabled {
+		log.Printf("连登兑换已禁用（schedule.redeem_enabled=false）")
+	} else {
+		log.Printf("连登兑换已启用：%v 点（growth_center.py ALL --redeem-only --yes）", cfg.Schedule.RedeemHours)
+	}
+	if !cfg.Schedule.LotteryEnabled {
+		log.Printf("成长抽奖已禁用（schedule.lottery_enabled=false）")
+	} else {
+		log.Printf("成长抽奖已启用：%v 点（growth_center.py ALL --lottery-only --yes）", cfg.Schedule.LotteryHours)
+	}
+	if !cfg.Schedule.MakeupEnabled {
+		log.Printf("补签已禁用（schedule.makeup_enabled=false）")
+	} else {
+		log.Printf("补签已启用：%v 点（growth_center.py ALL --makeup-only --yes）", cfg.Schedule.MakeupHours)
+	}
 
 	h := server.NewHandler(server.Config{
 		Pool:         p,
@@ -182,6 +205,7 @@ func main() {
 		PromptMode:   cfg.Prompt.Mode,
 		PromptText:   cfg.PromptText,
 		MaxBodyBytes: int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
+		Tasks:        sch,                               // /tasks 端点：排程自省 + 手动触发
 		// global realm 开关（handler 侧第三道闸：modelList 据此决定是否列 global 名单）。
 		GlobalEnabled: cfg.Global.Enabled,
 	})

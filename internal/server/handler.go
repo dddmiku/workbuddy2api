@@ -45,6 +45,9 @@ type Config struct {
 	// PromptText custom 模式下注入的系统提示词文本（来自 config.PromptText）。
 	PromptText string
 
+	// Tasks 排程任务控制器（可选；nil = /tasks 报 available=false，面板渲染说明态）。
+	Tasks TaskController
+
 	// GlobalEnabled global realm 路由开关（config global.enabled，缺省 true）。
 	// handler 侧第三道闸（与 main 注入 auth 开关、upstream.GlobalEnabled 呼应）：
 	// false（显式逃生门）时即便 auth realm=global 也不提供 global: 模型名
@@ -89,8 +92,14 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	// Responses API 兼容层（NarraFork / Codex 等客户端走这条）：内部委托 chatCompletions。
+	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
+	// 排程任务自省与手动触发（账户管理面板的「定时任务」页）。
+	h.mux.HandleFunc("GET /tasks", h.withAuth(h.tasks))
+	h.mux.HandleFunc("POST /tasks/{key}/run", h.withAuth(h.taskRun))
+	h.mux.HandleFunc("GET /tasks/{key}/log", h.withAuth(h.taskLog))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	return h
 }
@@ -673,6 +682,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = http.StatusBadRequest
 				return
 			}
+			if kind == upstream.ErrContextTooLong {
+				// 上下文超限：请求体本身超模型上限，换任何账号都是同一结果。
+				// 立即回客户端并透传上游原文（含真实 token 数与上限），不轮转、不罚账号。
+				// 让调用方看到 "prompt is too long: N tokens > M maximum" 自行压缩或开新会话。
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel)
+				fail(acct.UID)
+				// 不再额外加 "prompt is too long: " 前缀——上游 msg 本身就以它开头，
+				// 硬加会得到 "prompt is too long: prompt is too long: N tokens > M maximum"。
+				writeOpenAIError(w, http.StatusBadRequest, "context_length_exceeded",
+					upstream.ContextTooLongDetail(string(respBody)))
+				st.status = http.StatusBadRequest
+				return
+			}
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel)
 			fail(acct.UID)
@@ -829,6 +851,9 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 	case upstream.ErrServer:
 		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
 		h.cfg.Pool.NoteError(uid)
+	case upstream.ErrContextTooLong:
+		// 上下文超限：请求体问题非账号问题，不罚账号（无冷却/熔断/NoteError）。
+		// 轮转循环已在该 kind 上直接 return，不消耗其他账号。
 	case upstream.ErrContentBlocked:
 		// 内容策略拦截：内容问题非账号问题，不罚账号（无冷却/熔断/NoteError）。
 		// passthrough 首遇由 chatCompletions 内降级重试处理；最终仍拦则回 400
