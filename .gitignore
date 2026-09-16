@@ -20,6 +20,14 @@ config.json
 *.tmp
 __pycache__/
 
+# 真实会话测试载荷（私人对话内容，绝不入库）
+real2.json
+real_input.json
+replay_full.json
+combined.json
+*.bak-*
+build.log
+
 # Backups (contains auth tokens)
 backups/
 
