@@ -1,14 +1,14 @@
 <!--
   本仓库是二次开发版（fork）。
   上游：https://github.com/Sliverkiss/workbuddy2api （MIT，Copyright (c) 2026 Sliverkiss）
-  已 rebase 到上游 master 最新提交，本分支的改动叠在其上。
+  本分支从上游 master 的 5755fe3 起分叉，改动叠在其上。
   详见下方「本分支的改动」与「与上游的差异说明」两节。
   上游的 LICENSE 与版权声明原样保留。
 -->
 
 > **本仓库是 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的二次开发版本。**
 > 上游以 MIT 协议授权（Copyright (c) 2026 Sliverkiss），本分支保留其 LICENSE 与全部版权声明。
-> 已 rebase 到上游 `master` 最新提交，本分支的改动叠在其上。
+> 从上游 `master` 的 `5755fe3` 起分叉，本分支的改动叠在其上。
 > 主项目文档仍以上游 README 为准，本节只说明本分支的差异。
 
 ## 配套的账号管理台
@@ -62,7 +62,7 @@
 
 ### 与上游的差异说明
 
-本分支已 rebase 到上游 `master` 最新提交，上游的全部改动都在，本分支的改动叠在其上。
+本分支从上游 `master` 的 `5755fe3` 起分叉，该提交之前的全部上游改动都在，本分支的改动叠在其上。
 四个文件（`internal/upstream/client.go`、`internal/upstream/client_test.go`、
 `internal/scheduler/scheduler.go`、`internal/scheduler/tasks.go`）在上游也改过同名区域，
 冲突按下列口径合并：
