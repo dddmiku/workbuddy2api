@@ -11,6 +11,12 @@
 > 已 rebase 到上游 `master` 最新提交，本分支的改动叠在其上。
 > 主项目文档仍以上游 README 为准，本节只说明本分支的差异。
 
+## 配套的账号管理台
+
+[`dddmiku/workbuddy2api-panel`](https://github.com/dddmiku/workbuddy2api-panel) 是本分支配套的 Web 管理台：扫码加号、账号池总览、
+排程开关与手动触发、容器日志、在线改账密。单文件 Python 后端，只用标准库与 docker CLI，
+直接读本网关的 `/status`、`/tasks` 等接口。
+
 ## 本分支的改动
 
 ### Responses API 支持（`internal/server/responses.go`）
