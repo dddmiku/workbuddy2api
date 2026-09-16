@@ -5,6 +5,7 @@
 //
 // 一条上报同时点亮 growth 连登 + 解锁 first_buddy 任务（领养前置）。
 // 风控口径：每号每天 1 次即可（activity_hours 单时点），不做多时点高频上报。
+// 2026-09-16：计费与活跃上报统一以凭据快照构造域、请求体和请求头，消除并发刷新读取竞争。
 package upstream
 
 import (
@@ -24,6 +25,7 @@ const reportPath = "/v2/report"
 // 与 travel.go 的 growthJSON 对称（growth 域走 chatBase + BillingHeaders；billing 域走 billingBase）。
 // report/checkin 等 billing 端点共用：请求头统一 BillingHeaders，信封与错误语义同 doJSON。
 func (c *Client) billingJSON(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
+	a = a.Snapshot()
 	var rdr io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -91,6 +93,7 @@ type chatRequestEvent struct {
 // 后台按 growth 事件去重，不走 chat 后台的 X-Conversation-Request-ID 聚合——对齐
 // 官方 chat_request_send 事件形状（probe_active.py），刻意不复用聚合主键。
 func (c *Client) ReportChatActivity(a *auth.Auth, conversationID, requestID string) error {
+	a = a.Snapshot()
 	if requestID == "" {
 		requestID = conversationID
 	}

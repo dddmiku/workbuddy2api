@@ -1,3 +1,5 @@
+// ═══ 更新日志 ═══
+// 2026-09-16：废弃正文清洗并保留配置兼容，避免默认设置篡改业务数据。
 // config.go 加载 JSON 配置 + 环境变量覆盖。
 package main
 
@@ -15,10 +17,12 @@ import (
 
 // Config 顶层配置。
 type Config struct {
-	Listen    string `json:"listen"`     // ":7863"
-	APIKey    string `json:"api_key"`    // 空 = 不鉴权
-	AuthDir   string `json:"auth_dir"`   // ./auths
-	StateFile string `json:"state_file"` // ./data/state.json
+	Listen        string `json:"listen"`          // ":7863"
+	APIKey        string `json:"api_key"`         // 空 = 不鉴权
+	APIKeysFile   string `json:"api_keys_file"`   // 非空时启用多密钥管理，api_key 仅作首次迁移。
+	APIKeysSocket string `json:"api_keys_socket"` // 本机管理 socket，默认位于密钥文件同目录。
+	AuthDir       string `json:"auth_dir"`        // ./auths
+	StateFile     string `json:"state_file"`      // ./data/state.json
 
 	Server struct {
 		// MaxBodyMB 聊天请求体大小上限（单位 MB，默认 8）。
@@ -99,12 +103,12 @@ type Config struct {
 	} `json:"upstream"`
 
 	Features struct {
-		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
+		// SanitizeBlacklistFingerprints 兼容旧配置；已废弃，不再改写任何业务内容。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
 	} `json:"features"`
 
 	Prompt struct {
-		// Mode passthrough（默认）= 透传客户端原始 system（降级重试仍会切到 Degraded）；
+		// Mode passthrough（默认）= 保留客户端原始 system；上游拒绝时不自动替换。
 		// custom = 网关用自有系统提示词替换客户端 system/developer（显式配置仍可覆盖回替换）。
 		Mode string `json:"mode"` // "custom" / "passthrough"
 		// File 提示词文件路径；空 = 内置默认 defaultprompt.md；
@@ -175,7 +179,7 @@ func Default() *Config {
 	// （upstream.Client 的 attributionClientName 空值也回落 WorkBuddy，双保险）；
 	// 显式 client_name="SaaS" 还原旧行为。
 	c.Upstream.ClientName = "WorkBuddy"
-	c.Features.SanitizeBlacklistFingerprints = true
+	c.Features.SanitizeBlacklistFingerprints = false
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：默认透传客户端原始 system；显式配置 custom 仍可覆盖回替换
 	c.Pool.MaxInFlight = 3
 	c.Pool.BreakerThreshold = 3
@@ -366,7 +370,7 @@ func (c *Config) normalize() error {
 //
 // mode 非法（非 custom/passthrough）启动报错，避免静默回落到某一分支；
 // custom 模式下 file 非空但不可读 → 报错（fail fast），file 空 → 用内置默认。
-// passthrough 模式不加载文本（透传客户端原始 system，文本在降级时用 prompt.Degraded）。
+// passthrough 模式不加载替换文本，保留调用者提供的 system。
 func (c *Config) normalizePrompt() error {
 	switch m := strings.ToLower(strings.TrimSpace(c.Prompt.Mode)); m {
 	case "", "passthrough":

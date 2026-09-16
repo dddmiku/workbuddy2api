@@ -1,0 +1,220 @@
+{
+  "model": "cn:deepseek-v4.1-flash",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": "Summarize the sample invoices and preserve their identifiers exactly."
+    },
+    {
+      "type": "function_call",
+      "call_id": "synthetic-call-01",
+      "name": "exec_command",
+      "arguments": "{\"cmd\":\"ls\",\"workdir\":\".\"}"
+    },
+    {
+      "type": "function_call",
+      "call_id": "synthetic-call-02",
+      "name": "exec_command",
+      "arguments": "{\"cmd\":\"cat test_ledger.py\",\"workdir\":\".\"}"
+    },
+    {
+      "type": "function_call",
+      "call_id": "synthetic-call-03",
+      "name": "exec_command",
+      "arguments": "{\"cmd\":\"cat invoices.json\",\"workdir\":\".\"}"
+    },
+    {
+      "type": "function_call",
+      "call_id": "synthetic-call-04",
+      "name": "exec_command",
+      "arguments": "{\"cmd\":\"cat ledger.py\",\"workdir\":\".\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "synthetic-call-01",
+      "output": "invoices.json\nledger.py\ntest_ledger.py\n"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "synthetic-call-02",
+      "output": "assert summarize(rows)[\"invoice_ids\"] == [11128, 22229, 33330]\n"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "synthetic-call-03",
+      "output": "[{\"invoice_id\":11128,\"amount_cents\":1250},{\"invoice_id\":22229,\"amount_cents\":-200},{\"invoice_id\":33330,\"amount_cents\":450}]\n"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "synthetic-call-04",
+      "output": "def summarize(rows):\n    return {\"count\": len(rows), \"total_cents\": 0}\n"
+    },
+    {
+      "type": "function_call",
+      "call_id": "synthetic-call-05",
+      "name": "exec_command",
+      "arguments": "{\"cmd\":\"python update_ledger.py\",\"workdir\":\".\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "synthetic-call-05",
+      "output": "Updated ledger.py.\n"
+    },
+    {
+      "type": "function_call",
+      "call_id": "synthetic-call-06",
+      "name": "exec_command",
+      "arguments": "{\"cmd\":\"python -m unittest -q\",\"workdir\":\".\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "synthetic-call-06",
+      "output": "Ran 5 tests\nOK\n"
+    },
+    {
+      "type": "function_call",
+      "call_id": "synthetic-call-07",
+      "name": "exec_command",
+      "arguments": "{\"cmd\":\"python ledger.py invoices.json\",\"workdir\":\".\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "synthetic-call-07",
+      "output": "{\"count\":3,\"total_cents\":1500,\"invoice_ids\":[11128,22229,33330]}\n"
+    },
+    {
+      "type": "message",
+      "role": "assistant",
+      "content": "A previous draft incorrectly displayed the first invoice identifier as 11-128."
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": "Keep the original numeric identifier and add an invoice filter."
+    },
+    {
+      "type": "function_call",
+      "call_id": "synthetic-call-08",
+      "name": "exec_command",
+      "arguments": "{\"cmd\":\"python inspect_identifier.py\",\"workdir\":\".\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "synthetic-call-08",
+      "output": "Expected first_invoice_id: 11128\n"
+    },
+    {
+      "type": "function_call",
+      "call_id": "synthetic-call-09",
+      "name": "exec_command",
+      "arguments": "{\"cmd\":\"python check_totals.py\",\"workdir\":\".\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "synthetic-call-09",
+      "output": "All totals match.\n"
+    },
+    {
+      "type": "function_call",
+      "call_id": "synthetic-call-10",
+      "name": "exec_command",
+      "arguments": "{\"cmd\":\"python add_filter.py\",\"workdir\":\".\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "synthetic-call-10",
+      "output": "Updated invoice filtering.\n"
+    },
+    {
+      "type": "function_call",
+      "call_id": "synthetic-call-11",
+      "name": "exec_command",
+      "arguments": "{\"cmd\":\"python -m unittest -q\",\"workdir\":\".\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "synthetic-call-11",
+      "output": "Ran 8 tests\nOK\n"
+    },
+    {
+      "type": "function_call",
+      "call_id": "synthetic-call-12",
+      "name": "exec_command",
+      "arguments": "{\"cmd\":\"python ledger.py invoices.json --id 11128\",\"workdir\":\".\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "synthetic-call-12",
+      "output": "{\"count\":1,\"total_cents\":1250,\"invoice_ids\":[11128]}\n"
+    },
+    {
+      "type": "function_call",
+      "call_id": "synthetic-call-13",
+      "name": "exec_command",
+      "arguments": "{\"cmd\":\"python verify_filter.py\",\"workdir\":\".\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "synthetic-call-13",
+      "output": "Filter preserves invoice 11128.\n"
+    },
+    {
+      "type": "function_call",
+      "call_id": "synthetic-call-14",
+      "name": "exec_command",
+      "arguments": "{\"cmd\":\"python inspect_numeric_arguments.py\",\"workdir\":\".\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "synthetic-call-14",
+      "output": "{\"invoice_id\":11128,\"negative\":-11128,\"decimal\":11128.75,\"large_id\":9007199254740993}\n"
+    },
+    {
+      "type": "function_call",
+      "call_id": "synthetic-call-15",
+      "name": "exec_command",
+      "arguments": "{\"cmd\":\"python check_workspace.py\",\"workdir\":\".\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "synthetic-call-15",
+      "output": "No pending changes.\n"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "name": "exec_command",
+      "description": "Run a command in the synthetic example workspace.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "cmd": {
+            "type": "string"
+          },
+          "workdir": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "cmd",
+          "workdir"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "parallel_tool_calls": true,
+  "reasoning": {
+    "effort": "low",
+    "summary": "concise"
+  },
+  "store": false,
+  "stream": true,
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "prompt_cache_key": "synthetic-codex-cache-key"
+}

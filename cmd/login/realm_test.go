@@ -143,9 +143,9 @@ func TestBuildLoginOutputRealmAlwaysSet(t *testing.T) {
 	}{UID: "u1", Nickname: "n1"}
 
 	cases := []struct {
-		name     string
-		realm    string
-		domain   string
+		name      string
+		realm     string
+		domain    string
 		wantRealm string
 	}{
 		{name: "显式 global 优先", realm: "global", domain: "www.codebuddy.cn", wantRealm: "global"},

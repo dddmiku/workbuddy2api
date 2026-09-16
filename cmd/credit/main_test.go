@@ -183,6 +183,7 @@ func TestCollectEmptyTokenFileSkipped(t *testing.T) {
 		t.Errorf("accounts=%+v want 0（空 token 文件被 Parse 跳过）", accounts)
 	}
 }
+
 // TestCollectLoadsNonHyphenAuthFile (P2-10 RED)：collect 此前私用
 // workbuddy-*.json 窄 glob，不带连字符的文件被跳过；改为 auth.LoadAuthFiles
 // 后应与网关口径一致（宽侧 workbuddy*.json）。

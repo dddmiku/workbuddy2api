@@ -2,7 +2,10 @@ module workbuddy2api
 
 go 1.22.5
 
-require github.com/redis/go-redis/v9 v9.18.0
+require (
+	github.com/redis/go-redis/v9 v9.18.0
+	github.com/santhosh-tekuri/jsonschema/v5 v5.3.1
+)
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect

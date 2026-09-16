@@ -1,3 +1,5 @@
+// ═══ 更新日志 ═══
+// 2026-09-16：明确角色兼容测试独立于已弃用的指纹清洗配置，保持原有协议行为。
 package upstream
 
 import (
@@ -37,7 +39,7 @@ func TestNormalizeRoles(t *testing.T) {
 		{"混合消息仅 developer 被改写",
 			`{"messages":[{"role":"developer","content":"a"},{"role":"user","content":"b"},{"role":"developer","content":"c"}]}`,
 			[]string{"system", "user", "system"}},
-		{"sanitize=false 时仍归一（与脱敏解耦）",
+		{"旧 sanitize=false 配置下仍归一",
 			`{"messages":[{"role":"developer","content":"x"}]}`, []string{"system"}},
 		{"非对象消息元素跳过、其余正常处理",
 			`{"messages":["str",{"role":"developer","content":"x"},42]}`, []string{"system"}},
@@ -45,7 +47,7 @@ func TestNormalizeRoles(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			// 全程 sanitize=false：验证 role 归一与内容脱敏开关无关（D4）。
+			// 旧 sanitize=false 配置仍兼容；role 归一属于独立的协议适配。
 			out := PrepareBodyOptWithEfforts([]byte(c.body), false, nil)
 			var obj map[string]any
 			if err := json.Unmarshal(out, &obj); err != nil {

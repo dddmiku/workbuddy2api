@@ -8,9 +8,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
+	"workbuddy2api/internal/apikeys"
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/redisstore"
@@ -36,6 +38,16 @@ func main() {
 		}
 	}
 
+	var keyStore *apikeys.Store
+	if cfg.APIKeysFile != "" {
+		keyStore, err = apikeys.Open(cfg.APIKeysFile, cfg.APIKey)
+		if err != nil {
+			log.Fatalf("load API keys: %v", err)
+		}
+		if cfg.APIKeysSocket == "" {
+			cfg.APIKeysSocket = filepath.Join(filepath.Dir(cfg.APIKeysFile), "api_keys.sock")
+		}
+	}
 	auths, err := auth.LoadDir(cfg.AuthDir)
 	if err != nil {
 		log.Fatalf("load auths: %v", err)
@@ -198,6 +210,7 @@ func main() {
 		Pool:         p,
 		Upstream:     up,
 		APIKey:       cfg.APIKey,
+		APIKeys:      keyStore,
 		Session:      sessRouter,
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
@@ -212,6 +225,26 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	var adminServer *http.Server
+	if keyStore != nil {
+		listener, err := apikeys.ListenUnix(cfg.APIKeysSocket)
+		if err != nil {
+			log.Fatalf("listen API key admin socket: %v", err)
+		}
+		defer listener.Close()
+		mux := http.NewServeMux()
+		mux.Handle("/keys", keyStore.AdminHandler())
+		mux.Handle("/keys/", keyStore.AdminHandler())
+		mux.Handle("/", h.InternalHandler())
+		adminServer = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
+		defer adminServer.Close()
+		go func() {
+			if err := adminServer.Serve(listener); err != nil && err != http.ErrServerClosed {
+				log.Printf("[api-keys] admin server: %v", err)
+			}
+		}()
+		log.Printf("API key management enabled (%d keys)", len(keyStore.List()))
+	}
 	go sch.Run(ctx)
 
 	srv := &http.Server{
@@ -237,6 +270,9 @@ func main() {
 		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		if adminServer != nil {
+			_ = adminServer.Shutdown(shutdownCtx)
+		}
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 

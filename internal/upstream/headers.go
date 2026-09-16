@@ -1,5 +1,6 @@
 // Package headers 构造三类上游请求头（common / chat / billing / refresh）。
 // 规则来自 docs/api-reference.md §0/§4/§6。
+// 2026-09-16：所有请求头从同一独立凭据快照读取，避免刷新时拼出新旧混合的鉴权头。
 package upstream
 
 import (
@@ -102,6 +103,7 @@ func (c *Client) billingUA() string {
 // 为什么不放进 CommonHeaders：鉴权/刷新类头（refresh / FetchModels）给设备 token
 // 无意义且可能被上游风控误判为异常客户端；只在 chat/billing 业务请求注入。
 func (c *Client) resolveDeviceToken(a *auth.Auth) string {
+	a = a.Snapshot()
 	if a != nil && a.DeviceToken != "" {
 		return a.DeviceToken
 	}
@@ -151,6 +153,7 @@ func (c *Client) injectAccountStableHeaders(req *http.Request, a *auth.Auth) {
 
 // CommonHeaders 设置所有 API 共享的请求头。
 func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
+	a = a.Snapshot()
 	req.Header.Set("Content-Type", "application/json")
 	// Accept 非流式默认 application/json（D6：去掉宽松的 text/plain, */*）。
 	// chat 路径在 ChatHeaders 覆盖为流式 event-stream。
@@ -218,6 +221,7 @@ type ChatMeta struct {
 // PassthroughIP=false 或 clientIP 为空时不注入 IP 头。
 // meta 为会话头族元数据（CN/global 同构，纯新增，不改既有头），见 injectConversationHeaders。
 func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, meta ChatMeta) {
+	a = a.Snapshot()
 	c.CommonHeaders(req, a)
 	// chat 流式 Accept 覆盖 CommonHeaders 的非流式默认（D6）。
 	req.Header.Set("Accept", "application/json, text/event-stream")
@@ -392,6 +396,7 @@ func ExtractClientIP(r *http.Request) string {
 //     （官方 banner/check-in 显式覆写 UA 的形态，不带 CLI 段）；
 //  3. 显式 client_name="SaaS" → 不设置（Go 客户端自带默认 UA，还原旧行为）。
 func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
+	a = a.Snapshot()
 	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
@@ -419,6 +424,7 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 
 // RefreshHeaders refresh 端点专属头（X-Refresh-Token 只允许出现在这里）。
 func (c *Client) RefreshHeaders(req *http.Request, a *auth.Auth) {
+	a = a.Snapshot()
 	c.CommonHeaders(req, a)
 	req.Header.Set("X-Refresh-Token", a.RefreshToken)
 	if a.EnterpriseID != "" {

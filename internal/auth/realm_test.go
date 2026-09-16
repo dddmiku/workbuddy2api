@@ -187,6 +187,7 @@ func TestSaveAtomicWritesRealm(t *testing.T) {
 		t.Error("roundtrip global account IsGlobal()=false")
 	}
 }
+
 // TestBackfillRealmDomain CN/global 按原始 domain 推断（backfill 为导出空 realm 字段服务）。
 func TestBackfillRealmDomain(t *testing.T) {
 	t.Parallel() // 不触碰全局开关
@@ -259,12 +260,12 @@ func TestResolveRealm(t *testing.T) {
 	cases := []struct {
 		explicit, domain, want string
 	}{
-		{"global", "www.codebuddy.cn", "global"},   // 显式优先：cn domain 也写 global
-		{"cn", "www.workbuddy.ai", "cn"},           // 显式优先：global domain 也写 cn
-		{"", "www.workbuddy.ai", "global"},         // 缺省按 domain 推断
+		{"global", "www.codebuddy.cn", "global"}, // 显式优先：cn domain 也写 global
+		{"cn", "www.workbuddy.ai", "cn"},         // 显式优先：global domain 也写 cn
+		{"", "www.workbuddy.ai", "global"},       // 缺省按 domain 推断
 		{"", "workbuddy.ai", "global"},
 		{"", "codebuddy.cn", "cn"},
-		{"", "", "cn"},                             // 空 domain → cn（老 CN 凭证零回归）
+		{"", "", "cn"}, // 空 domain → cn（老 CN 凭证零回归）
 	}
 	for _, c := range cases {
 		if got := ResolveRealm(c.explicit, c.domain); got != c.want {

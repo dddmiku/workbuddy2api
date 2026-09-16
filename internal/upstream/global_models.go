@@ -1,7 +1,8 @@
-// global 模型名目录探测：只产模型名，不产倍率（PLAN §3.D2「模型名目录 ≠ 倍率表」）。
-//
-// credits 数值一律不进入本包实现——探测端点即便返回倍率字段也忽略，名单只喂
-// /v1/models 的 global: 前缀输出，不注入 costTier、不参与选号。
+// ═══ 更新日志 ═══
+// 2026-09-17：保留动态目录并集及完整模型字段，在并发探测前固定凭据快照以避免跨代混用。
+// global 模型目录探测：同时返回模型名与上游实际下发的完整模型字段。
+// credits 仅作为展示字段透出，不注入 costTier、不参与选号；成本仍以实际 usage 为准。
+// 2026-09-16：模型探测及回退路径共享一致凭据快照，避免刷新改变请求域与鉴权的对应关系。
 package upstream
 
 import (
@@ -99,6 +100,7 @@ func (c *Client) FetchGlobalModelInfos(a *auth.Auth) []ModelInfo {
 // 纯动态：成功 = 探测结果去重（不与任何静态名单合并）；一切失败 = nil（不回落静态）。
 // infos 仅对象形态成功探测时非 nil。
 func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []ModelInfo) {
+	a = a.Snapshot()
 	if !c.globalOn(a) {
 		// 逃生门兜底：账号不路由 global 上游 → 不探测（零上游调用）。
 		return nil, nil
@@ -164,6 +166,8 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 // 稳定（v3 原序在前、企业端点补充项在后）。两路全失败才返回错误（等价原「家族端点全
 // 非 2xx」负缓存语义）；单路失败降级为另一路结果 + warn 日志，互不拖累。
 func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, err error) {
+	// 包括企业端点回退在内，整个并发探测只使用这一代凭据。
+	a = a.Snapshot()
 	type probeResult struct {
 		names    []string
 		infos    []ModelInfo
@@ -292,6 +296,7 @@ func mergeEffortDefaults(primary, secondary map[string]string) map[string]string
 
 // globalModelsOnce 单端点探测。2xx + 解析出非空名单 → (names, infos, efforts, defaults, nil)；否则 (nil,...,err)。
 func (c *Client) globalModelsOnce(a *auth.Auth, path string) ([]string, []ModelInfo, map[string][]string, map[string]string, error) {
+	a = a.Snapshot()
 	url := c.chatBase(a) + path // 按 realm 切 base：global 账号 → global base
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {

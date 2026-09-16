@@ -1,9 +1,15 @@
 // sse.go 处理上游 SSE 流：聚合成单个 OpenAI 响应，或透传给客户端。
+// ═══ 更新日志 ═══
+// 2026-09-16：统一 SSE 事件解析与结束校验，保留上游错误并防止断流和残缺工具参数伪装成功。
+// 2026-09-16：将完整消息快照转成缺失增量并核对已有输出，区分工具参数暂缺、显式空串和类型错误。
+// 2026-09-17：合并 fork 的错误信封透传，保留完整诊断字段与数字字面量，同时维持 typed 失败终态。
 package upstream
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,111 +18,503 @@ import (
 	"time"
 )
 
-// Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
-// 分片/半行由 bufio.Reader.ReadString 处理；遇到 "data: [DONE]" 结束。
-// tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
-func Aggregate(r io.Reader) (map[string]any, error) {
+// StreamError 表示上游数据或传输失败；与客户端写出失败区分，供 handler 记录真实结果。
+// Upstream 保留上游 error 对象（包括厂商 code/details）；Cause 可由 errors.Is/As 检查。
+// Stream 已经发出 ErrorObject 及 [DONE] 时仍返回此错误，调用方不得再合成成功终态。
+type StreamError struct {
+	Code     string
+	Message  string
+	Upstream map[string]any
+	Cause    error
+	// 合法 error 对象的原始 JSON 信封，仅 Stream 使用；保留信封外的 requestId 等诊断字段。
+	rawFrame json.RawMessage
+}
+
+func (e *StreamError) Error() string { return e.Message }
+func (e *StreamError) Unwrap() error { return e.Cause }
+
+// ErrorObject 返回 OpenAI SSE error 字段的值；上游对象不做字段删改。
+func (e *StreamError) ErrorObject() map[string]any {
+	if e.Upstream != nil {
+		return e.Upstream
+	}
+	return map[string]any{"code": e.Code, "message": e.Message, "type": "upstream_error"}
+}
+
+type sseEvent struct {
+	name string
+	data string
+}
+
+// readSSE 按空行分隔事件，data: 可无空格、多行 data 按 SSE 规范用换行连接。
+// 保留最后一个没有空行但数据完整的 EOF 事件，兼容只发 finish_reason 的上游。
+// 非 EOF 读错误始终保留；done 由 consume 显式返回，之后不再消费任何数据。
+func readSSE(r io.Reader, consume func(sseEvent) (bool, error), comment func(string) error) error {
 	br := bufio.NewReaderSize(r, 64*1024)
-	var (
-		id, model     string
-		created       float64
-		content       strings.Builder
-		reasoning     strings.Builder
-		role          = "assistant"
-		finishReason  = "stop"
-		usage         map[string]any
-		gotAnyContent bool
-		validEvents   int
-		toolCalls     = map[int]map[string]any{}
-		toolOrder     []int
-	)
+	var data []string
+	eventName := ""
+	dispatch := func() (bool, error) {
+		if len(data) == 0 {
+			eventName = ""
+			return false, nil
+		}
+		ev := sseEvent{name: eventName, data: strings.Join(data, "\n")}
+		data = nil
+		eventName = ""
+		return consume(ev)
+	}
 	for {
 		line, err := br.ReadString('\n')
-		if err != nil && err != io.EOF {
+		line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+		if line == "" && err == nil {
+			if stop, consumeErr := dispatch(); consumeErr != nil || stop {
+				return consumeErr
+			}
+		} else if strings.HasPrefix(line, ":") {
+			if comment != nil {
+				if writeErr := comment(line); writeErr != nil {
+					return writeErr
+				}
+			}
+		} else if line != "" {
+			field, value, found := strings.Cut(line, ":")
+			if found {
+				value = strings.TrimPrefix(value, " ")
+			}
+			switch field {
+			case "data":
+				data = append(data, value)
+			case "event":
+				eventName = value
+			}
+		}
+		if err == io.EOF {
+			_, consumeErr := dispatch()
+			return consumeErr
+		}
+		if err != nil {
+			return &StreamError{Code: "upstream_read_error", Message: "upstream stream read failed", Cause: err}
+		}
+	}
+}
+
+func upstreamEventError(value any) *StreamError {
+	obj, ok := value.(map[string]any)
+	if !ok {
+		message, _ := value.(string)
+		if message == "" {
+			message = "upstream returned an error"
+		}
+		obj = map[string]any{"message": message, "type": "upstream_error"}
+	}
+	message, _ := obj["message"].(string)
+	if message == "" {
+		message = "upstream returned an error"
+	}
+	return &StreamError{Code: "upstream_error", Message: message, Upstream: obj}
+}
+
+func decodeSSEEvent(ev sseEvent) (obj map[string]any, done bool, err error) {
+	if ev.name != "error" && strings.TrimSpace(ev.data) == "[DONE]" {
+		return nil, true, nil
+	}
+	decodeErr := json.Unmarshal([]byte(ev.data), &obj)
+	if ev.name == "error" {
+		if decodeErr == nil && obj != nil {
+			if value, ok := obj["error"]; ok && value != nil {
+				failure := upstreamEventError(value)
+				if _, ok := value.(map[string]any); ok {
+					failure.rawFrame = json.RawMessage(ev.data)
+				}
+				return nil, false, failure
+			}
+			return nil, false, upstreamEventError(obj)
+		}
+		return nil, false, upstreamEventError(ev.data)
+	}
+	if decodeErr != nil || obj == nil {
+		return nil, false, &StreamError{Code: "upstream_parse", Message: "upstream stream contained invalid JSON data", Cause: decodeErr}
+	}
+	if value, ok := obj["error"]; ok && value != nil {
+		failure := upstreamEventError(value)
+		if _, ok := value.(map[string]any); ok {
+			failure.rawFrame = json.RawMessage(ev.data)
+		}
+		return nil, false, failure
+	}
+	return obj, false, nil
+}
+
+type streamText struct {
+	value strings.Builder
+	seen  bool
+}
+
+// append 返回尚未发送的内容；完整快照不能覆盖已经发送过的不同前缀。
+func (s *streamText) append(value string, snapshot bool) (string, error) {
+	addition := value
+	if snapshot {
+		previous := s.value.String()
+		if !strings.HasPrefix(value, previous) {
+			return "", &StreamError{Code: "upstream_parse", Message: "upstream message snapshot conflicts with streamed data"}
+		}
+		addition = value[len(previous):]
+	}
+	s.value.WriteString(addition)
+	s.seen = true
+	return addition, nil
+}
+
+type streamFunction struct {
+	name      string
+	arguments streamText
+}
+
+func (f *streamFunction) observe(raw map[string]any, snapshot bool) (map[string]any, error) {
+	out := map[string]any{}
+	if name, ok := raw["name"].(string); ok && name != "" {
+		if f.name != "" && name != f.name {
+			return nil, &StreamError{Code: "upstream_parse", Message: "upstream changed a streamed function name"}
+		}
+		if !snapshot || f.name == "" {
+			out["name"] = name
+		}
+		f.name = name
+	}
+	if value, exists := raw["arguments"]; exists {
+		args, ok := value.(string)
+		if !ok {
+			return nil, &StreamError{Code: "invalid_tool_arguments", Message: "upstream tool arguments must be a JSON string"}
+		}
+		seen := f.arguments.seen
+		addition, err := f.arguments.append(args, snapshot)
+		if err != nil {
 			return nil, err
 		}
-		line = strings.TrimRight(line, "\r\n")
-		if strings.HasPrefix(line, "data: ") {
-			payload := strings.TrimPrefix(line, "data: ")
-			if payload == "[DONE]" {
-				// 上游显式结束：停止读取，DONE 之后的任何数据一律忽略。
-				break
-			} else {
-				var chunk map[string]any
-				if json.Unmarshal([]byte(payload), &chunk) == nil {
-					// 有效事件计数：仅 JSON 解析成功的数据帧计入（解析失败沿用静默 continue）。
-					validEvents++
-					if v, ok := chunk["id"].(string); ok && id == "" {
-						id = v
-					}
-					if v, ok := chunk["model"].(string); ok && model == "" {
-						model = v
-					}
-					if v, ok := chunk["created"].(float64); ok && created == 0 {
-						created = v
-					}
-					if u, ok := chunk["usage"].(map[string]any); ok {
-						usage = u
-					}
-					if ch, ok := chunk["choices"].([]any); ok {
-						for _, ci := range ch {
-							c, _ := ci.(map[string]any)
-							if c == nil {
-								continue
-							}
-							if fr, ok := c["finish_reason"].(string); ok && fr != "" {
-								finishReason = fr
-							}
-							if delta, ok := c["delta"].(map[string]any); ok {
-								if r2, ok := delta["role"].(string); ok && r2 != "" {
-									role = r2
-								}
-								if txt, ok := delta["content"].(string); ok {
-									content.WriteString(txt)
-									gotAnyContent = true
-								}
-								if rc, ok := delta["reasoning_content"].(string); ok {
-									reasoning.WriteString(rc)
-								}
-								if tcs, ok := delta["tool_calls"].([]any); ok {
-									for _, tc := range tcs {
-										call, ok := tc.(map[string]any)
-										if !ok {
-											continue
-										}
-										idx := 0
-										if v, ok := call["index"].(float64); ok {
-											idx = int(v)
-										}
-										merged, seen := toolCalls[idx]
-										if !seen {
-											merged = map[string]any{"index": idx}
-											toolCalls[idx] = merged
-											toolOrder = append(toolOrder, idx)
-										}
-										mergeToolCallDelta(merged, call)
-									}
-								}
-							}
-							// 有的上游把完整消息放在 message 里（非 delta）
-							if msg, ok := c["message"].(map[string]any); ok && !gotAnyContent {
-								if txt, ok := msg["content"].(string); ok {
-									content.WriteString(txt)
-								}
-							}
+		if !snapshot || addition != "" || !seen {
+			out["arguments"] = addition
+		}
+	}
+	return out, nil
+}
+
+type streamToolCall struct {
+	id       string
+	typ      string
+	function streamFunction
+}
+
+type streamChoice struct {
+	output       bool
+	finishReason string
+	role         string
+	text         map[string]*streamText
+	tools        map[int]*streamToolCall
+	function     *streamFunction
+}
+
+type streamState struct {
+	choices map[int]*streamChoice
+	done    bool
+}
+
+func validFinishReason(reason string) bool {
+	switch reason {
+	case "stop", "length", "tool_calls", "content_filter", "function_call":
+		return true
+	}
+	return false
+}
+
+func (c *streamChoice) observeOutput(output map[string]any, wholeMessage bool) (map[string]any, error) {
+	normalized := map[string]any{}
+	if role, _ := output["role"].(string); role != "" {
+		if !wholeMessage || c.role == "" {
+			normalized["role"] = role
+		}
+		c.role = role
+	}
+	for _, key := range []string{"content", "reasoning_content", "refusal"} {
+		if value, ok := output[key].(string); ok {
+			if c.text == nil {
+				c.text = map[string]*streamText{}
+			}
+			if c.text[key] == nil {
+				c.text[key] = &streamText{}
+			}
+			addition, err := c.text[key].append(value, wholeMessage)
+			if err != nil {
+				return nil, err
+			}
+			normalized[key] = addition
+			if value != "" {
+				c.output = true
+			}
+		}
+	}
+	if calls, ok := output["tool_calls"].([]any); ok {
+		var normalizedCalls []any
+		for i, item := range calls {
+			call, ok := item.(map[string]any)
+			if !ok {
+				return nil, &StreamError{Code: "upstream_parse", Message: "upstream stream contained an invalid tool call"}
+			}
+			c.output = true
+			idx := 0
+			if wholeMessage {
+				idx = i
+			}
+			if value, ok := call["index"].(float64); ok {
+				idx = int(value)
+			}
+			if c.tools == nil {
+				c.tools = map[int]*streamToolCall{}
+			}
+			if wholeMessage {
+				if id, _ := call["id"].(string); id != "" {
+					for candidate, previous := range c.tools {
+						if previous.id == id {
+							idx = candidate
+							break
 						}
 					}
 				}
 			}
+			state := c.tools[idx]
+			if state == nil {
+				state = &streamToolCall{}
+				c.tools[idx] = state
+			}
+			next := map[string]any{"index": float64(idx)}
+			for _, field := range []struct {
+				key      string
+				previous *string
+			}{{"id", &state.id}, {"type", &state.typ}} {
+				if value, _ := call[field.key].(string); value != "" {
+					if *field.previous != "" && value != *field.previous {
+						return nil, &StreamError{Code: "upstream_parse", Message: "upstream changed a streamed tool call identity"}
+					}
+					if !wholeMessage || *field.previous == "" {
+						next[field.key] = value
+					}
+					*field.previous = value
+				}
+			}
+			if fn, ok := call["function"].(map[string]any); ok {
+				nextFn, err := state.function.observe(fn, wholeMessage)
+				if err != nil {
+					return nil, err
+				}
+				if len(nextFn) > 0 {
+					next["function"] = nextFn
+				}
+			} else if value, exists := call["function"]; exists && value != nil {
+				return nil, &StreamError{Code: "upstream_parse", Message: "upstream stream contained an invalid tool function"}
+			}
+			if len(next) > 1 {
+				normalizedCalls = append(normalizedCalls, next)
+			}
 		}
-		if err == io.EOF {
-			break
+		if len(normalizedCalls) > 0 {
+			normalized["tool_calls"] = normalizedCalls
 		}
 	}
-	if validEvents == 0 {
-		// 上游返回 200 但没有任何有效数据事件（空流/只有 [DONE]/只有注释行）：
-		// 不再合成空 content 的假成功响应，直接报错，由 handler 映射为 502 upstream_parse。
-		return nil, fmt.Errorf("upstream stream contained no valid data events")
+	if fn, ok := output["function_call"].(map[string]any); ok {
+		name, _ := fn["name"].(string)
+		args, _ := fn["arguments"].(string)
+		if value, exists := fn["arguments"]; exists {
+			if _, ok := value.(string); !ok {
+				return nil, &StreamError{Code: "invalid_tool_arguments", Message: "upstream function arguments must be a JSON string"}
+			}
+		}
+		// WorkBuddy 的空占位 function_call 不是一次工具调用，沿用原有剥除语义。
+		if c.function != nil || name != "" || args != "" {
+			if c.function == nil {
+				c.function = &streamFunction{}
+			}
+			c.output = true
+			next, err := c.function.observe(fn, wholeMessage)
+			if err != nil {
+				return nil, err
+			}
+			if len(next) > 0 {
+				normalized["function_call"] = next
+			}
+		}
+	} else if value, exists := output["function_call"]; exists && value != nil {
+		return nil, &StreamError{Code: "upstream_parse", Message: "upstream stream contained an invalid function call"}
+	}
+	return normalized, nil
+}
+
+func (c *streamChoice) validateArguments() error {
+	// length/content_filter 是明确的不完整响应，由协议转换层保留 incomplete 语义。
+	if c.finishReason == "length" || c.finishReason == "content_filter" {
+		return nil
+	}
+	for _, call := range c.tools {
+		if !call.function.arguments.seen || isTruncatedArguments(call.function.arguments.value.String()) {
+			return &StreamError{Code: "invalid_tool_arguments", Message: "upstream ended with incomplete or invalid tool arguments"}
+		}
+	}
+	if c.function != nil && (!c.function.arguments.seen || isTruncatedArguments(c.function.arguments.value.String())) {
+		return &StreamError{Code: "invalid_tool_arguments", Message: "upstream ended with incomplete or invalid function arguments"}
+	}
+	return nil
+}
+
+func (s *streamState) observe(obj map[string]any) error {
+	choices, _ := obj["choices"].([]any)
+	for _, item := range choices {
+		choice, ok := item.(map[string]any)
+		if !ok {
+			return &StreamError{Code: "upstream_parse", Message: "upstream stream contained an invalid choice"}
+		}
+		idx := 0
+		if value, ok := choice["index"].(float64); ok {
+			idx = int(value)
+		}
+		if s.choices == nil {
+			s.choices = map[int]*streamChoice{}
+		}
+		state := s.choices[idx]
+		if state == nil {
+			state = &streamChoice{}
+			s.choices[idx] = state
+		}
+		normalized := map[string]any{}
+		for _, key := range []string{"delta", "message"} {
+			if output, ok := choice[key].(map[string]any); ok {
+				delta, err := state.observeOutput(output, key == "message")
+				if err != nil {
+					return err
+				}
+				mergeOutputDelta(normalized, delta)
+			}
+		}
+		// 下游只处理一次统一增量，完整 message 不再走另一个丢字段/重复输出的旁路。
+		choice["delta"] = normalized
+		delete(choice, "message")
+		if reason, ok := choice["finish_reason"].(string); ok && reason != "" {
+			if !validFinishReason(reason) {
+				return &StreamError{Code: "upstream_parse", Message: "upstream stream contained an unknown finish_reason"}
+			}
+			state.finishReason = reason
+			// 成功 finish 帧写出之前就校验，不能先允许客户端执行工具、随后再报残参错误。
+			if err := state.validateArguments(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *streamState) end() error {
+	hasResponse := false
+	for _, choice := range s.choices {
+		if choice.output || choice.finishReason != "" {
+			hasResponse = true
+		}
+		if choice.output && !s.done && choice.finishReason == "" {
+			return &StreamError{Code: "upstream_truncated", Message: "upstream stream ended before a terminal marker"}
+		}
+		if err := choice.validateArguments(); err != nil {
+			return err
+		}
+	}
+	if !hasResponse {
+		return &StreamError{Code: "empty_upstream", Message: "upstream stream contained no valid data events"}
+	}
+	return nil
+}
+
+// Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
+// 分片/多行 SSE 由 readSSE 处理；只有合法结束才返回成功，异常流返回 *StreamError。
+// tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
+func Aggregate(r io.Reader) (map[string]any, error) {
+	var (
+		id, model    string
+		created      float64
+		content      strings.Builder
+		reasoning    strings.Builder
+		refusal      strings.Builder
+		role         = "assistant"
+		finishReason = "stop"
+		usage        map[string]any
+		toolCalls    = map[int]map[string]any{}
+		toolOrder    []int
+		functionCall map[string]any
+	)
+	state := &streamState{}
+	err := readSSE(r, func(ev sseEvent) (bool, error) {
+		chunk, done, err := decodeSSEEvent(ev)
+		if err != nil || done {
+			state.done = done
+			return true, err
+		}
+		if err := state.observe(chunk); err != nil {
+			return true, err
+		}
+		if value, ok := chunk["id"].(string); ok && id == "" {
+			id = value
+		}
+		if value, ok := chunk["model"].(string); ok && model == "" {
+			model = value
+		}
+		if value, ok := chunk["created"].(float64); ok && created == 0 {
+			created = value
+		}
+		if value, ok := chunk["usage"].(map[string]any); ok {
+			usage = value
+		}
+		choices, _ := chunk["choices"].([]any)
+		for _, item := range choices {
+			choice, _ := item.(map[string]any)
+			if reason, _ := choice["finish_reason"].(string); reason != "" {
+				finishReason = reason
+			}
+			delta, _ := choice["delta"].(map[string]any)
+			if value, _ := delta["role"].(string); value != "" {
+				role = value
+			}
+			if value, ok := delta["content"].(string); ok {
+				content.WriteString(value)
+			}
+			if value, ok := delta["reasoning_content"].(string); ok {
+				reasoning.WriteString(value)
+			}
+			if value, ok := delta["refusal"].(string); ok {
+				refusal.WriteString(value)
+			}
+			calls, _ := delta["tool_calls"].([]any)
+			for _, item := range calls {
+				call, _ := item.(map[string]any)
+				idx := 0
+				if value, ok := call["index"].(float64); ok {
+					idx = int(value)
+				}
+				merged, seen := toolCalls[idx]
+				if !seen {
+					merged = map[string]any{"index": idx}
+					toolCalls[idx] = merged
+					toolOrder = append(toolOrder, idx)
+				}
+				mergeToolCallDelta(merged, call)
+			}
+			if fn, ok := delta["function_call"].(map[string]any); ok {
+				if functionCall == nil {
+					functionCall = map[string]any{}
+				}
+				mergeFunctionDelta(functionCall, fn)
+			}
+		}
+		return false, nil
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := state.end(); err != nil {
+		return nil, err
 	}
 	if id == "" {
 		id = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
@@ -131,6 +529,16 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 	if reasoning.Len() > 0 {
 		message["reasoning_content"] = reasoning.String()
 	}
+	if refusal.Len() > 0 {
+		message["refusal"] = refusal.String()
+	}
+	if len(functionCall) > 0 {
+		args, present := functionCall["arguments"].(string)
+		incomplete := finishReason == "length" || finishReason == "content_filter"
+		if !incomplete || (present && !isTruncatedArguments(args)) {
+			message["function_call"] = functionCall
+		}
+	}
 	if len(toolOrder) > 0 {
 		sort.Ints(toolOrder)
 		calls := make([]map[string]any, 0, len(toolOrder))
@@ -140,7 +548,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		// P1b：finish_reason==length 且 tool_call 的 arguments 是残缺 JSON（解析失败）
 		// 时不把脏参数交给客户端——残留分片会被客户端解析成非法 JSON 卡死会话。
 		// 完整参数原样保留（正例零改动）；空参数（无参工具）不是截断，同样保留。
-		if finishReason == "length" {
+		if finishReason == "length" || finishReason == "content_filter" {
 			calls = dropTruncatedToolCalls(calls)
 		}
 		if len(calls) > 0 {
@@ -184,14 +592,40 @@ func mergeToolCallDelta(merged, delta map[string]any) {
 		mf = map[string]any{}
 		merged["function"] = mf
 	}
-	if v, ok := df["name"].(string); ok && v != "" {
-		mf["name"] = v
+	mergeFunctionDelta(mf, df)
+}
+
+func mergeFunctionDelta(merged, delta map[string]any) {
+	if value, ok := delta["name"].(string); ok && value != "" {
+		merged["name"] = value
 	}
-	if v, ok := df["arguments"].(string); ok && v != "" {
-		if prev, _ := mf["arguments"].(string); prev != "" {
-			mf["arguments"] = prev + v
-		} else {
-			mf["arguments"] = v
+	if value, ok := delta["arguments"].(string); ok {
+		previous, _ := merged["arguments"].(string)
+		merged["arguments"] = previous + value
+	}
+}
+
+func mergeOutputDelta(merged, delta map[string]any) {
+	for key, value := range delta {
+		switch key {
+		case "content", "reasoning_content", "refusal":
+			previous, _ := merged[key].(string)
+			addition, _ := value.(string)
+			merged[key] = previous + addition
+		case "tool_calls":
+			previous, _ := merged[key].([]any)
+			addition, _ := value.([]any)
+			merged[key] = append(previous, addition...)
+		case "function_call":
+			fn, _ := merged[key].(map[string]any)
+			if fn == nil {
+				fn = map[string]any{}
+				merged[key] = fn
+			}
+			addition, _ := value.(map[string]any)
+			mergeFunctionDelta(fn, addition)
+		default:
+			merged[key] = value
 		}
 	}
 }
@@ -209,7 +643,7 @@ func mergeToolCallDelta(merged, delta map[string]any) {
 //     键缺失是比空串更安全的形态：`??` 与 truthy 守卫对缺失键必然保留旧值，
 //     而对空串，`??` 会误判为重设并清空工具名。
 //
-// seen 记录每个 index 是否已发过首片（与 name 是否非空无关）；删除是幂等的。
+// seen 记录每个 index 是否已实际发过非空 name；仅收到 id/arguments 不能挡住后补的 name。
 // 只动 function.name 键，id/type/arguments 原样透传。
 func stripToolCallNames(obj map[string]any, seen map[int]bool) {
 	choices, _ := obj["choices"].([]any)
@@ -239,9 +673,13 @@ func stripToolCallNames(obj map[string]any, seen map[int]bool) {
 				}
 				continue
 			}
-			// 首现：保留 name 键原样（上游首片通常带非空 name；空 name 也照发，
-			// 与 OpenAI 对「首帧无 name」的容忍一致），随后分片统一删除。
-			seen[idx] = true
+			if fn, _ := tc["function"].(map[string]any); fn != nil {
+				if name, _ := fn["name"].(string); name != "" {
+					seen[idx] = true
+				} else {
+					delete(fn, "name")
+				}
+			}
 		}
 	}
 }
@@ -251,6 +689,9 @@ func stripToolCallNames(obj map[string]any, seen map[int]bool) {
 // 空占位 function_call、顶层未知字段），空 delta 键一律省略，
 // usage 缺失 → null，保证任意标准客户端按规范解析。
 func normalizeFrame(obj map[string]any) map[string]any {
+	if value, exists := obj["error"]; exists && value != nil {
+		return map[string]any{"error": value}
+	}
 	out := map[string]any{}
 	for _, k := range []string{"id", "object", "created", "model", "system_fingerprint", "service_tier"} {
 		if v, ok := obj[k]; ok && v != nil {
@@ -275,7 +716,11 @@ func normalizeFrame(obj map[string]any) map[string]any {
 				nc["index"] = idx
 			}
 			delta := map[string]any{}
-			if d, ok := c["delta"].(map[string]any); ok {
+			d, _ := c["delta"].(map[string]any)
+			if d == nil {
+				d, _ = c["message"].(map[string]any)
+			}
+			if d != nil {
 				if v, ok := d["role"].(string); ok && v != "" {
 					delta["role"] = v
 				}
@@ -324,9 +769,9 @@ func normalizeFrame(obj map[string]any) map[string]any {
 	return out
 }
 
-// Stream 透传上游 SSE 到 w（逐帧规范化后 flush），保证至少写一个 [DONE]。
-// 调用方必须先设置过 status 200；本函数自设 SSE headers。
-// 流式策略：逐帧透传（规范化已剥空 content 噪声），恢复与上游一致的平滑流式。
+// Stream 逐事件规范化并 flush；合法终态写唯一 [DONE]。
+// 上游错误/读错误/截断先发 error 再发 [DONE] 并返回 *StreamError。
+// [DONE] 只关闭传输，不覆盖已有 error；客户端写失败直接返回原始错误。
 func Stream(w http.ResponseWriter, r io.Reader) error {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
@@ -344,8 +789,7 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 	// 一律补 chatcmpl-wb2api 哨兵，造成同流 id 分裂）。全流无真实 id → 才出现哨兵。
 	firstID := ""
 
-	// writeRaw 原样写出一帧（绕过 normalizeFrame）并 flush。上游 error 帧（error-passthrough）
-	// 与空流错误帧需保留 error 字段，不能被白名单剥掉，故经此写出。
+	// 正常帧和错误帧共享一个写出口，任何客户端断开均向上传递。
 	writeRaw := func(payload string) error {
 		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
 			return werr
@@ -356,97 +800,65 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 		return nil
 	}
 
-	// writeFrame 把 payload 按规范白名单重建后以 data: 帧写出并 flush。
-	// 仅 JSON 解析成功时计数记为一次有效转发（JSON 解析失败照常降级原样写出，但不计数）。
-	writeFrame := func(payload string) (int, error) {
-		var obj map[string]any
-		valid := 0
-		if json.Unmarshal([]byte(payload), &obj) == nil {
-			// 上游错误帧透传（error-passthrough）：带 error 键的帧**原样写出**，不走
-			// normalizeFrame 白名单——白名单会剥掉 error 字段，客户端就看不到上游
-			// code/msg/requestId。error.message 即上游原文（如 6004 限流、审核拦截），
-			// 计入有效帧（避免误判空流补写 "empty upstream stream"）。
-			if _, hasErr := obj["error"]; hasErr {
-				if werr := writeRaw(payload); werr != nil {
-					return 0, werr
-				}
-				return 1, nil
-			}
-			// 先按 index 收敛 tool_calls name（每 index 仅首片保留，后续分片删 name 键），再规范化透传。
-			stripToolCallNames(obj, toolCallSeen)
-			// id 续传：首帧非空真实 id 缓存；后续帧缺 id / 空 id 一律用缓存值，
-			// 有自己 id 的帧保持原样（不同流分裂的帧允许各自 id）。
-			if firstID == "" {
-				if v, ok := obj["id"].(string); ok && v != "" {
-					firstID = v
-				}
-			} else {
-				if v, ok := obj["id"].(string); !ok || v == "" {
-					obj["id"] = firstID
-				}
-			}
-			if raw, err := json.Marshal(normalizeFrame(obj)); err == nil {
-				payload = string(raw)
-			}
-			valid = 1
+	state := &streamState{}
+	err := readSSE(r, func(ev sseEvent) (bool, error) {
+		obj, done, err := decodeSSEEvent(ev)
+		if err != nil || done {
+			state.done = done
+			return true, err
 		}
-		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
-			return 0, werr
+		if err := state.observe(obj); err != nil {
+			return true, err
+		}
+		stripToolCallNames(obj, toolCallSeen)
+		if firstID == "" {
+			if value, ok := obj["id"].(string); ok && value != "" {
+				firstID = value
+			}
+		} else if value, ok := obj["id"].(string); !ok || value == "" {
+			obj["id"] = firstID
+		}
+		raw, err := json.Marshal(normalizeFrame(obj))
+		if err != nil {
+			return true, &StreamError{Code: "upstream_parse", Message: "upstream frame could not be encoded", Cause: err}
+		}
+		return false, writeRaw(string(raw))
+	}, func(line string) error {
+		if _, err := io.WriteString(w, line+"\n\n"); err != nil {
+			return err
 		}
 		if fl != nil {
 			fl.Flush()
 		}
-		return valid, nil
+		return nil
+	})
+	if err == nil {
+		err = state.end()
 	}
-
-	br := bufio.NewReaderSize(r, 64*1024)
-	validFrames := 0
-readLoop:
-	for {
-		line, err := br.ReadString('\n')
-		trimmed := strings.TrimRight(line, "\r\n")
-		switch {
-		case strings.HasPrefix(trimmed, "data: [DONE]"):
-			// 上游显式结束：停止读取，DONE 之后的任何数据（含垃圾帧）一律不再透传。
-			// [DONE] 统一在循环结束后写出，保证恰好一个。
-			break readLoop
-		case strings.HasPrefix(trimmed, "data: "):
-			n, werr := writeFrame(strings.TrimPrefix(trimmed, "data: "))
-			validFrames += n
-			if werr != nil {
-				return werr
-			}
-		case trimmed != "":
-			// 注释/其他行：原样透传
-			if _, werr := io.WriteString(w, line); werr != nil {
-				return werr
-			}
-			if fl != nil {
-				fl.Flush()
-			}
-		}
-		// 空行（帧分隔）吞掉：本函数自产 "\n\n"
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
+	if err != nil {
+		var streamErr *StreamError
+		if !errors.As(err, &streamErr) {
 			return err
 		}
+		var raw []byte
+		var marshalErr error
+		if len(streamErr.rawFrame) > 0 {
+			// 多行 SSE 的 JSON 收成一行，仅去格式空白，不重新解析数字或删诊断字段。
+			var compact bytes.Buffer
+			marshalErr = json.Compact(&compact, streamErr.rawFrame)
+			raw = compact.Bytes()
+		} else {
+			raw, marshalErr = json.Marshal(map[string]any{"error": streamErr.ErrorObject()})
+		}
+		if marshalErr != nil {
+			return errors.Join(err, marshalErr)
+		}
+		if writeErr := writeRaw(string(raw)); writeErr != nil {
+			return errors.Join(err, writeErr)
+		}
 	}
-	// 空流（0 有效帧）：先写一帧 error（绕过 normalizeFrame 原样保留 error 字段），
-	// 再补 [DONE] 保证客户端能正常收尾，并返回非 nil error 供调用方记录。
-	if validFrames == 0 {
-		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error"}}`)
+	if writeErr := writeRaw("[DONE]"); writeErr != nil {
+		return errors.Join(err, writeErr)
 	}
-	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
-	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
-		return err
-	}
-	if fl != nil {
-		fl.Flush()
-	}
-	if validFrames == 0 {
-		return fmt.Errorf("upstream stream contained no valid data events")
-	}
-	return nil
+	return err
 }

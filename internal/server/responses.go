@@ -3,7 +3,16 @@
 //   网关此前只实现 /v1/chat/completions，客户端拿到 Go 默认的 "404 page not found"。
 //   本文件把 Responses 请求翻译成 chat completions 后复用 chatCompletions（轮转、租约、
 //   粘性、错误策略全部沿用，零重复），再把输出翻译回 Responses 形状（对象 / SSE 事件）。
+// 2026-09-16: 补 custom 型工具桥接（Codex 的 exec / apply_patch 走的正是 custom）。
+//   此前 responsesTools 只留 type=="function"，custom 被静默丢弃 → 模型拿到的是「没有
+//   这些工具」的世界，于是把补丁当正文吐出来、只叙述不调用（实测 10:16 会话 7 次空转收尾）。
+//   对齐参考仓库 responses.js:102-129 的等价语义：入站 custom → function{input}，
+//   出站按 customNames 还原 custom_tool_call（input 字段）+ 历史项互逆折回，
+//   流式侧 custom 不发 arguments.delta / arguments.done（Responses 无对应事件）。
 
+// 2026-09-16：保留真实 Codex 参数并校验结构化输出，错误与截断使用真实终态。
+// 2026-09-16：缓存迟到工具元数据与参数，保留 refusal/legacy 调用，并在终态确定后收口输出。
+// 2026-09-17：合并 fork 的 Responses/图片工具兼容，保留严格终态、schema控制与数字保真扩展。
 package server
 
 import (
@@ -14,40 +23,102 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
+	"workbuddy2api/internal/jsonutil"
 )
 
 // responsesRequest 是 Responses API 请求体里网关需要理解的字段子集。
-// 其余字段（store / previous_response_id / truncation / text.format 等）网关无状态，一律忽略：
+// 输出格式与推理、工具控制明确映射；不支持的服务端存储与续接返回错误。
 // 客户端每轮自带完整 input，不依赖服务端会话。
 type responsesRequest struct {
-	Model           string          `json:"model"`
-	Input           json.RawMessage `json:"input"`
-	Instructions    string          `json:"instructions"`
-	Stream          bool            `json:"stream"`
-	MaxOutputTokens *int            `json:"max_output_tokens"`
-	Temperature     *float64        `json:"temperature"`
-	TopP            *float64        `json:"top_p"`
-	Tools           []any           `json:"tools"`
-	ToolChoice      json.RawMessage `json:"tool_choice"`
-	Metadata        json.RawMessage `json:"metadata"`
+	Model              string          `json:"model"`
+	Input              json.RawMessage `json:"input"`
+	Instructions       string          `json:"instructions"`
+	Stream             bool            `json:"stream"`
+	MaxOutputTokens    *int            `json:"max_output_tokens"`
+	Temperature        *float64        `json:"temperature"`
+	TopP               *float64        `json:"top_p"`
+	Tools              []any           `json:"tools"`
+	ToolChoice         json.RawMessage `json:"tool_choice"`
+	Metadata           json.RawMessage `json:"metadata"`
+	Reasoning          map[string]any  `json:"reasoning"`
+	Text               json.RawMessage `json:"text"`
+	ParallelToolCalls  *bool           `json:"parallel_tool_calls"`
+	PromptCacheKey     string          `json:"prompt_cache_key"`
+	ConversationID     string          `json:"conversation_id"`
+	ConversationCamel  string          `json:"conversationId"`
+	PreviousResponseID string          `json:"previous_response_id"`
+	Store              *bool           `json:"store"`
+	output             *outputContract
+
+	// customTools 记录被桥接成 function 的 custom 工具名（非 JSON 字段，翻译时填充）。
+	// 出站还原 custom_tool_call 时按它判定，客户端才认得出这是自定义工具调用。
+	customTools map[string]bool
 }
 
 // responsesToChat 把 Responses 请求体翻译成 chat completions 请求体。
 func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(body, &object); err != nil || object == nil {
+		return nil, nil, fmt.Errorf("request body must be a JSON object")
+	}
 	var req responsesRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := jsonutil.Decode(body, &req); err != nil {
 		return nil, nil, fmt.Errorf("invalid JSON body: %w", err)
+	}
+	if err := validateResponsesOptions(object, &req); err != nil {
+		return nil, nil, err
+	}
+	if req.PreviousResponseID != "" {
+		return nil, nil, fmt.Errorf("previous_response_id is not supported; include the complete input history")
+	}
+	if req.Store != nil && *req.Store {
+		return nil, nil, fmt.Errorf("store=true is not supported; responses are not stored on this gateway")
+	}
+	var outputErr error
+	req.output, outputErr = parseOutputContract(req.Text)
+	if outputErr != nil {
+		return nil, nil, outputErr
 	}
 	msgs, err := responsesMessages(req.Input, req.Instructions)
 	if err != nil {
 		return nil, nil, err
 	}
+	if instruction := req.output.instruction(); instruction != "" {
+		msgs = append([]any{map[string]any{"role": "system", "content": instruction}}, msgs...)
+	}
 	chat := map[string]any{
 		"model":    req.Model,
 		"messages": msgs,
 		"stream":   req.Stream,
+	}
+	if req.output != nil && req.output.chatFormat != nil {
+		chat["response_format"] = req.output.chatFormat
+	}
+	if req.Reasoning != nil {
+		for source, target := range map[string]string{"effort": "reasoning_effort", "summary": "reasoning_summary"} {
+			if value, present := req.Reasoning[source]; present {
+				text, ok := value.(string)
+				if !ok || strings.TrimSpace(text) == "" {
+					return nil, nil, fmt.Errorf("reasoning.%s must be a nonempty string", source)
+				}
+				chat[target] = text
+			}
+		}
+	}
+	if req.ParallelToolCalls != nil {
+		chat["parallel_tool_calls"] = *req.ParallelToolCalls
+	}
+	if req.PromptCacheKey != "" {
+		chat["prompt_cache_key"] = req.PromptCacheKey
+	}
+	if req.ConversationID != "" {
+		chat["conversation_id"] = req.ConversationID
+	}
+	if req.ConversationCamel != "" {
+		chat["conversationId"] = req.ConversationCamel
 	}
 	if req.MaxOutputTokens != nil {
 		chat["max_tokens"] = *req.MaxOutputTokens
@@ -58,8 +129,10 @@ func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
 	if req.TopP != nil {
 		chat["top_p"] = *req.TopP
 	}
-	if tools := responsesTools(req.Tools); len(tools) > 0 {
+	customNames := map[string]bool{}
+	if tools := responsesTools(req.Tools, customNames); len(tools) > 0 {
 		chat["tools"] = tools
+		req.customTools = customNames
 		if tc := responsesToolChoice(req.ToolChoice); tc != nil {
 			chat["tool_choice"] = tc
 		}
@@ -79,8 +152,8 @@ func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
 // responsesMessages 把 Responses 的 input（字符串或 item 数组）+ instructions 折成 chat messages。
 func responsesMessages(input json.RawMessage, instructions string) ([]any, error) {
 	msgs := []any{}
-	if s := strings.TrimSpace(instructions); s != "" {
-		msgs = append(msgs, map[string]any{"role": "system", "content": s})
+	if strings.TrimSpace(instructions) != "" {
+		msgs = append(msgs, map[string]any{"role": "system", "content": instructions})
 	}
 	raw := strings.TrimSpace(string(input))
 	if raw == "" || raw == "null" {
@@ -109,7 +182,7 @@ func responsesMessages(input json.RawMessage, instructions string) ([]any, error
 	}
 	for _, it := range items {
 		var m map[string]any
-		if json.Unmarshal(it, &m) != nil {
+		if jsonutil.Decode(it, &m) != nil {
 			continue
 		}
 		typ, _ := m["type"].(string)
@@ -127,6 +200,33 @@ func responsesMessages(input json.RawMessage, instructions string) ([]any, error
 			})
 			continue
 		case "function_call_output":
+			flush()
+			callID, _ := m["call_id"].(string)
+			msgs = append(msgs, map[string]any{
+				"role": "tool", "tool_call_id": callID, "content": responsesToolOutput(m["output"]),
+			})
+			continue
+		case "custom_tool_call":
+			// 桥接的反向：custom 调用在历史里带 input 字段，还原成 chat 的
+			// function 调用 + {"input": "..."} 参数，与出站桥接严格互逆。
+			// 不处理的话，客户端把上一轮的 custom 调用写回历史时会被整条丢掉，
+			// 模型看不到自己刚做过什么，于是重复劳动或空转。
+			name, _ := m["name"].(string)
+			input, _ := m["input"].(string)
+			callID, _ := m["call_id"].(string)
+			if callID == "" {
+				callID, _ = m["id"].(string)
+			}
+			args, err := json.Marshal(map[string]any{"input": input})
+			if err != nil {
+				args = []byte("{}")
+			}
+			pending = append(pending, map[string]any{
+				"id": callID, "type": "function",
+				"function": map[string]any{"name": name, "arguments": string(args)},
+			})
+			continue
+		case "custom_tool_call_output":
 			flush()
 			callID, _ := m["call_id"].(string)
 			msgs = append(msgs, map[string]any{
@@ -280,14 +380,34 @@ func responsesToolOutput(v any) any {
 }
 
 // responsesTools 把 Responses 的扁平工具定义转成 chat 的嵌套定义。
-func responsesTools(tools []any) []any {
+//
+// custom 型工具（Codex 的 exec / apply_patch）必须桥接成 function 而不是丢弃：
+// 上游认不出 custom，丢掉等于把工具从模型视野里删掉——模型于是只能把补丁当正文吐出来，
+// 表现为「说了要调用却不调用」的空转回合。桥接语义对齐参考仓库 responses.js:102-129：
+// custom -> function，参数固定为 {input: string}，原始输入装在这个字段里往返。
+// customNames 回填被桥接的工具名，供出站还原 custom_tool_call 时判定。
+//
+// 其余非 function 类型（web_search / file_search / mcp）网关侧确无对应实现，仍丢弃。
+func responsesTools(tools []any, customNames map[string]bool) []any {
 	out := make([]any, 0, len(tools))
 	for _, t := range tools {
 		tm, ok := t.(map[string]any)
 		if !ok {
 			continue
 		}
-		if typ, _ := tm["type"].(string); typ != "function" {
+		typ, _ := tm["type"].(string)
+		if typ == "custom" {
+			if fn := customToolToFunction(tm); fn != nil {
+				out = append(out, fn)
+				if customNames != nil {
+					if name, _ := fn["function"].(map[string]any)["name"].(string); name != "" {
+						customNames[name] = true
+					}
+				}
+			}
+			continue
+		}
+		if typ != "function" {
 			continue // web_search / file_search / mcp 等网关侧无对应实现，丢弃
 		}
 		if fn, ok := tm["function"].(map[string]any); ok && fn != nil {
@@ -303,6 +423,55 @@ func responsesTools(tools []any) []any {
 		out = append(out, map[string]any{"type": "function", "function": fn})
 	}
 	return out
+}
+
+// customToolToFunction 把一条 custom 工具定义桥接成 chat 的 function 形状。
+// 参数固定为单字段 input（原始自定义输入），与参考仓库 flattenResponseTool 一致。
+func customToolToFunction(tm map[string]any) map[string]any {
+	name, _ := tm["name"].(string)
+	if name == "" {
+		return nil
+	}
+	desc, _ := tm["description"].(string)
+	return map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        name,
+			"description": desc,
+			"parameters": map[string]any{
+				"type":                 "object",
+				"additionalProperties": false,
+				"properties": map[string]any{
+					"input": map[string]any{
+						"type":        "string",
+						"description": "Raw custom tool input.",
+					},
+				},
+				"required": []any{"input"},
+			},
+		},
+	}
+}
+
+// customInputFromArgs 从桥接后的 {"input": "..."} 参数里取出原始自定义输入。
+// 解析不出对象时原样返回参数字符串，绝不丢内容。
+func customInputFromArgs(args string) string {
+	trimmed := strings.TrimSpace(args)
+	if trimmed == "" {
+		return ""
+	}
+	var m map[string]any
+	if jsonutil.Decode([]byte(trimmed), &m) == nil {
+		if v, ok := m["input"]; ok && v != nil {
+			if s, ok := v.(string); ok {
+				return s
+			}
+			if b, err := json.Marshal(v); err == nil {
+				return string(b)
+			}
+		}
+	}
+	return args
 }
 
 // responsesToolChoice 把 Responses 的 tool_choice 转成 chat 形状。
@@ -368,32 +537,38 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 // ─────────────────────────── 写出口翻译 ───────────────────────────
 
 const (
-	evCreated     = "response.created"
-	evInProgress  = "response.in_progress"
-	evItemAdded   = "response.output_item.added"
-	evItemDone    = "response.output_item.done"
-	evPartAdded   = "response.content_part.added"
-	evPartDone    = "response.content_part.done"
-	evTextDelta   = "response.output_text.delta"
-	evTextDone    = "response.output_text.done"
-	evRsPartAdded = "response.reasoning_summary_part.added"
-	evRsPartDone  = "response.reasoning_summary_part.done"
-	evRsDelta     = "response.reasoning_summary_text.delta"
-	evRsDone      = "response.reasoning_summary_text.done"
-	evArgsDelta   = "response.function_call_arguments.delta"
-	evArgsDone    = "response.function_call_arguments.done"
-	evCompleted   = "response.completed"
-	evFailed      = "response.failed"
+	evCreated      = "response.created"
+	evInProgress   = "response.in_progress"
+	evItemAdded    = "response.output_item.added"
+	evItemDone     = "response.output_item.done"
+	evPartAdded    = "response.content_part.added"
+	evPartDone     = "response.content_part.done"
+	evTextDelta    = "response.output_text.delta"
+	evTextDone     = "response.output_text.done"
+	evRefusalDelta = "response.refusal.delta"
+	evRefusalDone  = "response.refusal.done"
+	evRsPartAdded  = "response.reasoning_summary_part.added"
+	evRsPartDone   = "response.reasoning_summary_part.done"
+	evRsDelta      = "response.reasoning_summary_text.delta"
+	evRsDone       = "response.reasoning_summary_text.done"
+	evArgsDelta    = "response.function_call_arguments.delta"
+	evArgsDone     = "response.function_call_arguments.done"
+	evCompleted    = "response.completed"
+	evIncomplete   = "response.incomplete"
+	evFailed       = "response.failed"
 )
 
 // respToolCall 聚合一条流式 function_call。
 type respToolCall struct {
-	outIdx int
-	id     string
-	callID string
-	name   string
-	args   strings.Builder
-	opened bool
+	outIdx        int
+	id            string
+	callID        string
+	name          string
+	args          strings.Builder
+	sentArgs      int
+	argumentsSeen bool
+	opened        bool
+	custom        bool // 由 custom 工具桥接而来：出站还原成 custom_tool_call
 }
 
 // responsesWriter 拦截 chatCompletions 的写出并翻译成 Responses 形状。
@@ -420,16 +595,22 @@ type responsesWriter struct {
 	msgOutIdx int
 
 	text         strings.Builder
+	refusal      strings.Builder
+	messageParts []string
+	legacyCallID string
 	reason       strings.Builder
 	calls        map[int]*respToolCall
 	order        []int
 	usage        map[string]any
 	finishReason string
 
-	msgOpen   bool
-	rsOpen    bool
-	rsPart    bool
-	streamErr map[string]any
+	msgOpen        bool
+	rsOpen         bool
+	rsPart         bool
+	streamErr      map[string]any
+	writeErr       error
+	terminalStatus string
+	sawDone        bool
 }
 
 func newResponsesWriter(w http.ResponseWriter, req *responsesRequest) *responsesWriter {
@@ -439,7 +620,7 @@ func newResponsesWriter(w http.ResponseWriter, req *responsesRequest) *responses
 	}
 	return &responsesWriter{
 		inner: w, req: req, mode: mode,
-		hdr: http.Header{}, calls: map[int]*respToolCall{},
+		hdr: http.Header{}, calls: map[int]*respToolCall{}, status: http.StatusOK,
 	}
 }
 
@@ -453,6 +634,9 @@ func (rw *responsesWriter) WriteHeader(code int) {
 }
 
 func (rw *responsesWriter) Write(p []byte) (int, error) {
+	if rw.writeErr != nil {
+		return 0, rw.writeErr
+	}
 	switch rw.mode {
 	case 3:
 		rw.buf = append(rw.buf, p...)
@@ -477,6 +661,9 @@ func (rw *responsesWriter) Write(p []byte) (int, error) {
 			return len(p), nil
 		}
 		rw.buf = append(rw.buf, p...)
+	}
+	if rw.writeErr != nil {
+		return 0, rw.writeErr
 	}
 	return len(p), nil
 }
@@ -519,12 +706,22 @@ func (rw *responsesWriter) finishJSON() {
 	var chat map[string]any
 	if json.Unmarshal(rw.buf, &chat) != nil {
 		// 解析不了就原样透传，别把本来能用的响应弄坏。
-		rw.inner.Header().Set("Content-Type", "application/json")
-		rw.inner.WriteHeader(http.StatusOK)
-		_, _ = rw.inner.Write(rw.buf)
+		writeOpenAIError(rw.inner, http.StatusBadGateway, "upstream_parse", "upstream response is not valid JSON")
 		return
 	}
-	raw, _ := json.Marshal(chatToResponses(chat, rw.resolvedModel()))
+	var customNames map[string]bool
+	if rw.req != nil {
+		customNames = rw.req.customTools
+	}
+	result := chatToResponses(chat, rw.resolvedModel(), customNames)
+	if rw.req != nil {
+		rw.req.applyEcho(result)
+		if err := rw.validateJSONCompletion(chat, result); err != nil {
+			writeOpenAIError(rw.inner, http.StatusBadGateway, "response_contract_violation", err.Error())
+			return
+		}
+	}
+	raw, _ := json.Marshal(result)
 	rw.inner.Header().Set("Content-Type", "application/json")
 	rw.inner.WriteHeader(http.StatusOK)
 	_, _ = rw.inner.Write(raw)
@@ -560,7 +757,7 @@ func (rw *responsesWriter) beginStream() {
 
 // produced 判断是否已经产出过实质内容（用于区分「真失败」与「只是没内容」）。
 func (rw *responsesWriter) produced() bool {
-	return rw.text.Len() > 0 || rw.reason.Len() > 0 || len(rw.order) > 0
+	return rw.text.Len() > 0 || rw.refusal.Len() > 0 || rw.reason.Len() > 0 || len(rw.order) > 0
 }
 
 func (rw *responsesWriter) emit(evType string, payload map[string]any) {
@@ -571,7 +768,10 @@ func (rw *responsesWriter) emit(evType string, payload map[string]any) {
 	if err != nil {
 		return
 	}
-	_, _ = fmt.Fprintf(rw.inner, "event: %s\ndata: %s\n\n", evType, raw)
+	if rw.writeErr != nil {
+		return
+	}
+	_, rw.writeErr = fmt.Fprintf(rw.inner, "event: %s\ndata: %s\n\n", evType, raw)
 	if fl, ok := rw.inner.(http.Flusher); ok {
 		fl.Flush()
 	}
@@ -592,6 +792,9 @@ func (rw *responsesWriter) feed(p []byte) {
 }
 
 func (rw *responsesWriter) handleFrame(frame string) {
+	if rw.sawDone {
+		return
+	}
 	for _, line := range strings.Split(frame, "\n") {
 		line = strings.TrimRight(line, "\r")
 		if !strings.HasPrefix(line, "data: ") {
@@ -599,10 +802,12 @@ func (rw *responsesWriter) handleFrame(frame string) {
 		}
 		payload := strings.TrimPrefix(line, "data: ")
 		if payload == "[DONE]" {
+			rw.sawDone = true
 			return // 收尾统一在 finishStream 做，避免与 finish 重复
 		}
 		var chunk map[string]any
 		if json.Unmarshal([]byte(payload), &chunk) != nil {
+			rw.streamErr = map[string]any{"code": "upstream_parse", "message": "invalid upstream event"}
 			continue
 		}
 		if e, ok := chunk["error"].(map[string]any); ok {
@@ -614,6 +819,9 @@ func (rw *responsesWriter) handleFrame(frame string) {
 }
 
 func (rw *responsesWriter) handleChunk(chunk map[string]any) {
+	if rw.streamErr != nil {
+		return
+	}
 	if v, ok := chunk["id"].(string); ok && v != "" && rw.respID == "" {
 		rw.respID = "resp_" + v
 	}
@@ -648,8 +856,18 @@ func (rw *responsesWriter) handleChunk(chunk map[string]any) {
 		if s, ok := delta["content"].(string); ok && s != "" {
 			rw.textDelta(s)
 		}
-		if tcs, ok := delta["tool_calls"].([]any); ok {
+		if s, ok := delta["refusal"].(string); ok && s != "" {
+			rw.refusalDelta(s)
+		}
+		if tcs, ok := delta["tool_calls"].([]any); ok && len(tcs) > 0 {
+			if rw.legacyCallID != "" {
+				rw.failOutput("upstream_parse", "upstream mixed legacy and modern tool calls")
+				return
+			}
 			rw.toolCallDelta(tcs)
+		}
+		if fn, ok := delta["function_call"].(map[string]any); ok {
+			rw.legacyFunctionDelta(fn)
 		}
 	}
 }
@@ -670,7 +888,7 @@ func (rw *responsesWriter) closeReasoning() {
 		rw.rsPart = false
 	}
 	rw.emit(evItemDone, map[string]any{
-		"output_index": rw.rsOutIdx, "item": rw.reasoningItem("completed"),
+		"output_index": rw.rsOutIdx, "item": rw.reasoningItem(rw.itemStatus()),
 	})
 	rw.rsOpen = false
 }
@@ -697,7 +915,7 @@ func (rw *responsesWriter) reasoningDelta(s string) {
 	})
 }
 
-// openMessage 打开正文条目。此时先收口推理条目，保证 output 顺序为 推理 → 正文。
+// openMessage 打开正文条目；正文与拒绝共享消息，在响应终态确定后统一收口。
 func (rw *responsesWriter) openMessage() {
 	if rw.msgOpen {
 		return
@@ -708,90 +926,181 @@ func (rw *responsesWriter) openMessage() {
 	rw.emit(evItemAdded, map[string]any{
 		"output_index": rw.msgOutIdx, "item": rw.messageItem("in_progress"),
 	})
-	rw.emit(evPartAdded, map[string]any{
-		"item_id": rw.msgID, "output_index": rw.msgOutIdx, "content_index": 0,
-		"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
-	})
 	rw.msgOpen = true
+}
+
+func (rw *responsesWriter) ensureMessagePart(kind string) int {
+	rw.openMessage()
+	for index, existing := range rw.messageParts {
+		if existing == kind {
+			return index
+		}
+	}
+	index := len(rw.messageParts)
+	rw.messageParts = append(rw.messageParts, kind)
+	part := map[string]any{"type": "refusal", "refusal": ""}
+	if kind == "output_text" {
+		part = map[string]any{"type": "output_text", "text": "", "annotations": []any{}}
+	}
+	rw.emit(evPartAdded, map[string]any{
+		"item_id": rw.msgID, "output_index": rw.msgOutIdx, "content_index": index, "part": part,
+	})
+	return index
+}
+
+func (rw *responsesWriter) messageContent() []any {
+	content := []any{}
+	for _, kind := range rw.messageParts {
+		if kind == "refusal" {
+			content = append(content, map[string]any{"type": "refusal", "refusal": rw.refusal.String()})
+		} else {
+			content = append(content, map[string]any{"type": "output_text", "text": rw.text.String(), "annotations": []any{}})
+		}
+	}
+	return content
 }
 
 func (rw *responsesWriter) closeMessage() {
 	if !rw.msgOpen {
 		return
 	}
-	txt := rw.text.String()
-	rw.emit(evTextDone, map[string]any{
-		"item_id": rw.msgID, "output_index": rw.msgOutIdx, "content_index": 0, "text": txt,
-	})
-	rw.emit(evPartDone, map[string]any{
-		"item_id": rw.msgID, "output_index": rw.msgOutIdx, "content_index": 0,
-		"part": map[string]any{"type": "output_text", "text": txt, "annotations": []any{}},
-	})
-	rw.emit(evItemDone, map[string]any{
-		"output_index": rw.msgOutIdx, "item": rw.messageItem("completed"),
-	})
+	for index, part := range rw.messageContent() {
+		p := part.(map[string]any)
+		if p["type"] == "refusal" {
+			rw.emit(evRefusalDone, map[string]any{"item_id": rw.msgID, "output_index": rw.msgOutIdx, "content_index": index, "refusal": p["refusal"]})
+		} else {
+			rw.emit(evTextDone, map[string]any{"item_id": rw.msgID, "output_index": rw.msgOutIdx, "content_index": index, "text": p["text"]})
+		}
+		rw.emit(evPartDone, map[string]any{"item_id": rw.msgID, "output_index": rw.msgOutIdx, "content_index": index, "part": part})
+	}
+	rw.emit(evItemDone, map[string]any{"output_index": rw.msgOutIdx, "item": rw.messageItem(rw.itemStatus())})
 	rw.msgOpen = false
 }
 
 func (rw *responsesWriter) textDelta(s string) {
-	rw.openMessage()
+	index := rw.ensureMessagePart("output_text")
 	rw.text.WriteString(s)
-	rw.emit(evTextDelta, map[string]any{
-		"item_id": rw.msgID, "output_index": rw.msgOutIdx, "content_index": 0, "delta": s,
-	})
+	rw.emit(evTextDelta, map[string]any{"item_id": rw.msgID, "output_index": rw.msgOutIdx, "content_index": index, "delta": s})
 }
 
-// openCall 惰性开出 function_call 条目（首个分片到达时）。
+func (rw *responsesWriter) refusalDelta(s string) {
+	index := rw.ensureMessagePart("refusal")
+	rw.refusal.WriteString(s)
+	rw.emit(evRefusalDelta, map[string]any{"item_id": rw.msgID, "output_index": rw.msgOutIdx, "content_index": index, "delta": s})
+}
+
+// openCall 等名称与 call_id 确定后开出条目，避免 custom 工具在 added 后才改变类型。
 func (rw *responsesWriter) openCall(call *respToolCall) {
-	if call.opened {
+	if call.opened || call.name == "" || call.callID == "" {
 		return
 	}
 	call.opened = true
-	call.id = newRespID("fc_")
-	rw.emit(evItemAdded, map[string]any{
-		"output_index": call.outIdx, "item": rw.callItem(call, "in_progress"),
-	})
+	prefix := "fc_"
+	if call.custom {
+		prefix = "ctc_"
+	}
+	call.id = newRespID(prefix)
+	rw.emit(evItemAdded, map[string]any{"output_index": call.outIdx, "item": rw.callItem(call, "in_progress")})
+}
+
+func (rw *responsesWriter) failOutput(code, message string) {
+	if rw.streamErr == nil {
+		rw.streamErr = map[string]any{"code": code, "message": message}
+	}
+}
+
+// flushReadyCalls 按首次出现顺序开出工具；早到的参数仅发送一次，custom 参数留到 input 收尾。
+func (rw *responsesWriter) flushReadyCalls() {
+	if rw.streamErr != nil {
+		return
+	}
+	for _, index := range rw.order {
+		call := rw.calls[index]
+		if !call.opened {
+			if call.name == "" || call.callID == "" {
+				return
+			}
+			rw.openCall(call)
+		}
+		if call.custom {
+			continue
+		}
+		args := call.args.String()
+		if call.sentArgs < len(args) {
+			rw.emit(evArgsDelta, map[string]any{"item_id": call.id, "output_index": call.outIdx, "delta": args[call.sentArgs:]})
+			call.sentArgs = len(args)
+		}
+	}
 }
 
 func (rw *responsesWriter) toolCallDelta(tcs []any) {
-	for _, t := range tcs {
-		tm, ok := t.(map[string]any)
+	if rw.streamErr != nil {
+		return
+	}
+	for _, item := range tcs {
+		tm, ok := item.(map[string]any)
 		if !ok {
-			continue
+			rw.failOutput("upstream_parse", "upstream contained an invalid tool call")
+			return
 		}
-		idx := 0
-		if v, ok := tm["index"].(float64); ok {
-			idx = int(v)
+		index := 0
+		if value, ok := tm["index"].(float64); ok {
+			index = int(value)
 		}
-		call, seen := rw.calls[idx]
-		if !seen {
+		call := rw.calls[index]
+		if call == nil {
 			rw.closeReasoning()
-			rw.closeMessage()
 			call = &respToolCall{outIdx: rw.nextIdx}
 			rw.nextIdx++
-			rw.calls[idx] = call
-			rw.order = append(rw.order, idx)
+			rw.calls[index] = call
+			rw.order = append(rw.order, index)
 		}
-		if v, ok := tm["id"].(string); ok && v != "" {
-			call.callID = v
+		if value, ok := tm["id"].(string); ok && value != "" {
+			if call.callID != "" && call.callID != value {
+				rw.failOutput("upstream_parse", "upstream changed a streamed tool call identity")
+				return
+			}
+			call.callID = value
 		}
 		if fn, ok := tm["function"].(map[string]any); ok {
-			if v, ok := fn["name"].(string); ok && v != "" {
-				call.name = v
+			if value, ok := fn["name"].(string); ok && value != "" {
+				if call.name != "" && call.name != value {
+					rw.failOutput("upstream_parse", "upstream changed a streamed tool name")
+					return
+				}
+				call.name = value
+				call.custom = rw.req != nil && rw.req.customTools[value]
 			}
-			if v, ok := fn["arguments"].(string); ok && v != "" {
-				rw.openCall(call)
-				call.args.WriteString(v)
-				rw.emit(evArgsDelta, map[string]any{
-					"item_id": call.id, "output_index": call.outIdx, "delta": v,
-				})
+			if value, present := fn["arguments"]; present {
+				args, ok := value.(string)
+				if !ok {
+					rw.failOutput("invalid_tool_arguments", "upstream tool arguments must be a JSON string")
+					return
+				}
+				call.argumentsSeen = true
+				call.args.WriteString(args)
 			}
-		}
-		// 只有 id/name 尚无参数分片时也要把条目开出来，否则收尾无处可挂。
-		if call.name != "" || call.callID != "" {
-			rw.openCall(call)
 		}
 	}
+	rw.flushReadyCalls()
+}
+
+func (rw *responsesWriter) legacyFunctionDelta(fn map[string]any) {
+	name, _ := fn["name"].(string)
+	args, _ := fn["arguments"].(string)
+	if rw.legacyCallID == "" && name == "" && args == "" {
+		if value, present := fn["arguments"]; !present || value == "" {
+			return
+		}
+	}
+	if rw.legacyCallID == "" {
+		if len(rw.order) > 0 {
+			rw.failOutput("upstream_parse", "upstream mixed legacy and modern tool calls")
+			return
+		}
+		rw.legacyCallID = newRespID("call_")
+	}
+	rw.toolCallDelta([]any{map[string]any{"index": float64(-1), "id": rw.legacyCallID, "type": "function", "function": fn}})
 }
 
 func (rw *responsesWriter) closeCalls() {
@@ -802,27 +1111,163 @@ func (rw *responsesWriter) closeCalls() {
 		if !call.opened {
 			continue
 		}
-		rw.emit(evArgsDone, map[string]any{
-			"item_id": call.id, "output_index": call.outIdx, "arguments": call.args.String(),
-		})
+		// Codex 可把 output_item.done 当作工具执行信号；失败/截断只在最终响应保留 incomplete 项。
+		if rw.itemStatus() != "completed" {
+			call.opened = false
+			continue
+		}
+		if !call.custom {
+			rw.emit(evArgsDone, map[string]any{
+				"item_id": call.id, "output_index": call.outIdx, "arguments": call.args.String(),
+			})
+		}
 		rw.emit(evItemDone, map[string]any{
-			"output_index": call.outIdx, "item": rw.callItem(call, "completed"),
+			"output_index": call.outIdx, "item": rw.callItem(call, rw.itemStatus()),
 		})
 		call.opened = false
 	}
 }
 
 func (rw *responsesWriter) finishStream() {
-	if rw.streamErr != nil && !rw.produced() {
-		rw.emit(evFailed, map[string]any{"response": rw.responseObject("failed")})
-		return
-	}
-	rw.closeCalls()
+	_ = rw.CompletionError()
 	status := "completed"
-	if rw.finishReason == "length" {
+	if rw.finishReason == "length" || rw.finishReason == "content_filter" {
 		status = "incomplete"
 	}
-	rw.emit(evCompleted, map[string]any{"response": rw.responseObject(status)})
+	if rw.streamErr != nil {
+		status = "failed"
+	}
+	rw.terminalStatus = status
+	rw.closeCalls()
+	event := evCompleted
+	if status == "failed" {
+		event = evFailed
+	} else if status == "incomplete" {
+		event = evIncomplete
+	}
+	rw.emit(event, map[string]any{"response": rw.responseObject(status)})
+}
+
+func (rw *responsesWriter) itemStatus() string {
+	if rw.terminalStatus == "failed" || rw.terminalStatus == "incomplete" {
+		return "incomplete"
+	}
+	return "completed"
+}
+
+// CompletionError 可在 handler 计成功前调用；工具与格式校验先于任何 completed 工具事件。
+func (rw *responsesWriter) CompletionError() error {
+	if rw.writeErr != nil {
+		return rw.writeErr
+	}
+	if rw.streamErr == nil && !rw.sawDone && rw.finishReason == "" {
+		rw.failOutput("upstream_truncated", "upstream stream ended without a completion marker")
+	}
+	if rw.streamErr == nil && rw.finishReason != "length" && rw.finishReason != "content_filter" {
+		if rw.req != nil && rw.req.ParallelToolCalls != nil && !*rw.req.ParallelToolCalls && len(rw.order) > 1 {
+			rw.failOutput("parallel_tool_calls_violation", "model returned parallel tool calls despite parallel_tool_calls=false")
+		}
+		for _, index := range rw.order {
+			call := rw.calls[index]
+			if err := validateResponseToolCall(call.name, call.args.String(), call.argumentsSeen); err != nil {
+				rw.failOutput("invalid_tool_call", err.Error())
+				break
+			}
+		}
+		if rw.streamErr == nil && len(rw.order) == 0 && rw.refusal.Len() == 0 && rw.req != nil {
+			if err := rw.req.output.validate(rw.text.String()); err != nil {
+				rw.failOutput("response_format_violation", err.Error())
+			}
+		}
+		if rw.streamErr == nil {
+			for _, index := range rw.order {
+				if call := rw.calls[index]; call.callID == "" {
+					call.callID = newRespID("call_")
+				}
+			}
+			rw.flushReadyCalls()
+		}
+	}
+	if rw.streamErr != nil {
+		return fmt.Errorf("%v: %v", rw.streamErr["code"], rw.streamErr["message"])
+	}
+	return rw.writeErr
+}
+
+func validateResponseToolCall(name, args string, argumentsSeen bool) error {
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("upstream ended with a tool call without a name")
+	}
+	if !argumentsSeen {
+		return fmt.Errorf("upstream tool arguments must be a JSON string")
+	}
+	if strings.TrimSpace(args) != "" && !json.Valid([]byte(args)) {
+		return fmt.Errorf("upstream ended with incomplete or invalid tool arguments")
+	}
+	return nil
+}
+
+func (rw *responsesWriter) ValidateCompletion(chat map[string]any) error {
+	if rw.req == nil {
+		return nil
+	}
+	return rw.validateJSONCompletion(chat, chatToResponses(chat, rw.resolvedModel(), rw.req.customTools))
+}
+
+func (rw *responsesWriter) validateJSONCompletion(chat, result map[string]any) error {
+	if result["status"] != "completed" {
+		return nil
+	}
+	choices := responseArray(chat["choices"])
+	if len(choices) == 0 {
+		return fmt.Errorf("upstream response contains no choices")
+	}
+	choice, _ := choices[0].(map[string]any)
+	message, _ := choice["message"].(map[string]any)
+	if len(responseArray(message["tool_calls"])) > 0 && legacyResponseFunction(message) != nil {
+		return fmt.Errorf("upstream mixed legacy and modern tool calls")
+	}
+	calls := responseToolCalls(message)
+	if rw.req.ParallelToolCalls != nil && !*rw.req.ParallelToolCalls && len(calls) > 1 {
+		return fmt.Errorf("model returned parallel tool calls despite parallel_tool_calls=false")
+	}
+	for _, value := range calls {
+		call, _ := value.(map[string]any)
+		fn, _ := call["function"].(map[string]any)
+		name, _ := fn["name"].(string)
+		args, ok := fn["arguments"].(string)
+		if err := validateResponseToolCall(name, args, ok); err != nil {
+			return err
+		}
+	}
+	if len(calls) > 0 {
+		return nil
+	}
+	if refusal, _ := message["refusal"].(string); refusal != "" {
+		return nil
+	}
+	text, _ := message["content"].(string)
+	return rw.req.output.validate(text)
+}
+
+func legacyResponseFunction(message map[string]any) map[string]any {
+	fn, _ := message["function_call"].(map[string]any)
+	name, _ := fn["name"].(string)
+	args, _ := fn["arguments"].(string)
+	if name == "" && args == "" {
+		return nil
+	}
+	return fn
+}
+
+func responseToolCalls(message map[string]any) []any {
+	if calls := responseArray(message["tool_calls"]); len(calls) > 0 {
+		return calls
+	}
+	if fn := legacyResponseFunction(message); fn != nil {
+		return []any{map[string]any{"type": "function", "function": fn}}
+	}
+	return nil
 }
 
 // ─────────────────────────── 对象构造 ───────────────────────────
@@ -839,10 +1284,8 @@ func (rw *responsesWriter) reasoningItem(status string) map[string]any {
 
 func (rw *responsesWriter) messageItem(status string) map[string]any {
 	content := []any{}
-	if status == "completed" {
-		content = append(content, map[string]any{
-			"type": "output_text", "text": rw.text.String(), "annotations": []any{},
-		})
+	if status != "in_progress" {
+		content = rw.messageContent()
 	}
 	return map[string]any{
 		"id": rw.msgID, "type": "message", "status": status,
@@ -851,28 +1294,49 @@ func (rw *responsesWriter) messageItem(status string) map[string]any {
 }
 
 func (rw *responsesWriter) callItem(call *respToolCall, status string) map[string]any {
-	callID := call.callID
-	if callID == "" {
-		callID = call.id
+	if call.custom {
+		input := ""
+		if status != "in_progress" {
+			input = customInputFromArgs(call.args.String())
+		}
+		return map[string]any{
+			"id": call.id, "type": "custom_tool_call", "status": status,
+			"call_id": call.callID, "name": call.name, "input": input,
+		}
+	}
+	args := ""
+	if status != "in_progress" {
+		args = call.args.String()
 	}
 	return map[string]any{
 		"id": call.id, "type": "function_call", "status": status,
-		"call_id": callID, "name": call.name, "arguments": call.args.String(),
+		"call_id": call.callID, "name": call.name, "arguments": args,
 	}
 }
 
-// outputItems 汇总当前产出的 output 条目。推理 → 正文 → 工具调用的次序由 nextIdx
-// 分配顺序保证，因此直接按此顺序追加即为 output_index 升序。
+// outputItems 按已分配的 output_index 排列；尚无名称、从未开出的工具不能伪装成输出项。
 func (rw *responsesWriter) outputItems() []any {
-	items := []any{}
+	type indexedItem struct {
+		index int
+		value any
+	}
+	ordered := []indexedItem{}
 	if rw.rsOpen || rw.reason.Len() > 0 {
-		items = append(items, rw.reasoningItem("completed"))
+		ordered = append(ordered, indexedItem{rw.rsOutIdx, rw.reasoningItem(rw.itemStatus())})
 	}
-	if rw.msgOpen || rw.text.Len() > 0 {
-		items = append(items, rw.messageItem("completed"))
+	if rw.msgOpen || rw.text.Len() > 0 || rw.refusal.Len() > 0 {
+		ordered = append(ordered, indexedItem{rw.msgOutIdx, rw.messageItem(rw.itemStatus())})
 	}
-	for _, idx := range rw.order {
-		items = append(items, rw.callItem(rw.calls[idx], "completed"))
+	for _, index := range rw.order {
+		call := rw.calls[index]
+		if call.id != "" {
+			ordered = append(ordered, indexedItem{call.outIdx, rw.callItem(call, rw.itemStatus())})
+		}
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].index < ordered[j].index })
+	items := make([]any, 0, len(ordered))
+	for _, item := range ordered {
+		items = append(items, item.value)
 	}
 	return items
 }
@@ -910,7 +1374,14 @@ func (rw *responsesWriter) responseObject(status string) map[string]any {
 		}
 	}
 	if status == "incomplete" {
-		obj["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+		reason := "max_output_tokens"
+		if rw.finishReason == "content_filter" {
+			reason = "content_filter"
+		}
+		obj["incomplete_details"] = map[string]any{"reason": reason}
+	}
+	if rw.req != nil {
+		rw.req.applyEcho(obj)
 	}
 	return obj
 }
@@ -942,7 +1413,7 @@ func (rw *responsesWriter) usageObject() map[string]any {
 }
 
 // chatToResponses 把一次完整的 chat completion 翻成 Responses 对象（非流式路径）。
-func chatToResponses(chat map[string]any, model string) map[string]any {
+func chatToResponses(chat map[string]any, model string, customNames map[string]bool) map[string]any {
 	respID := newRespID("resp_")
 	created := time.Now().Unix()
 	if v, ok := chat["created"].(float64); ok && v > 0 {
@@ -956,40 +1427,64 @@ func chatToResponses(chat map[string]any, model string) map[string]any {
 	}
 	items := []any{}
 	var msg map[string]any
+	status := "completed"
+	var incomplete any
 	if chs, ok := chat["choices"].([]any); ok && len(chs) > 0 {
 		if c, ok := chs[0].(map[string]any); ok {
 			msg, _ = c["message"].(map[string]any)
+			if c["finish_reason"] == "length" {
+				status = "incomplete"
+				incomplete = map[string]any{"reason": "max_output_tokens"}
+			} else if c["finish_reason"] == "content_filter" {
+				status = "incomplete"
+				incomplete = map[string]any{"reason": "content_filter"}
+			}
 		}
 	}
 	if msg != nil {
 		if r, ok := msg["reasoning_content"].(string); ok && r != "" {
 			items = append(items, map[string]any{
-				"id": newRespID("rs_"), "type": "reasoning", "status": "completed",
+				"id": newRespID("rs_"), "type": "reasoning", "status": status,
 				"summary": []any{map[string]any{"type": "summary_text", "text": r}},
 			})
 		}
 		txt, _ := msg["content"].(string)
+		refusal, _ := msg["refusal"].(string)
+		content := []any{}
+		if txt != "" || refusal == "" {
+			content = append(content, map[string]any{"type": "output_text", "text": txt, "annotations": []any{}})
+		}
+		if refusal != "" {
+			content = append(content, map[string]any{"type": "refusal", "refusal": refusal})
+		}
 		items = append(items, map[string]any{
-			"id": newRespID("msg_"), "type": "message", "status": "completed",
-			"role": "assistant",
-			"content": []any{map[string]any{
-				"type": "output_text", "text": txt, "annotations": []any{},
-			}},
+			"id": newRespID("msg_"), "type": "message", "status": status,
+			"role": "assistant", "content": content,
 		})
-		if tcs, ok := msg["tool_calls"].([]any); ok {
+		if tcs := responseToolCalls(msg); len(tcs) > 0 {
 			for _, t := range tcs {
 				tm, ok := t.(map[string]any)
 				if !ok {
 					continue
 				}
 				callID, _ := tm["id"].(string)
+				if callID == "" {
+					callID = newRespID("call_")
+				}
 				name, args := "", ""
 				if fn, ok := tm["function"].(map[string]any); ok {
 					name, _ = fn["name"].(string)
 					args, _ = fn["arguments"].(string)
 				}
+				if customNames[name] {
+					items = append(items, map[string]any{
+						"id": newRespID("ctc_"), "type": "custom_tool_call", "status": status,
+						"call_id": callID, "name": name, "input": customInputFromArgs(args),
+					})
+					continue
+				}
 				items = append(items, map[string]any{
-					"id": newRespID("fc_"), "type": "function_call", "status": "completed",
+					"id": newRespID("fc_"), "type": "function_call", "status": status,
 					"call_id": callID, "name": name, "arguments": args,
 				})
 			}
@@ -1021,9 +1516,9 @@ func chatToResponses(chat map[string]any, model string) map[string]any {
 	}
 	return map[string]any{
 		"id": respID, "object": "response", "created_at": created,
-		"status": "completed", "model": model, "output": items,
+		"status": status, "model": model, "output": items,
 		"parallel_tool_calls": true, "tool_choice": "auto", "tools": []any{},
-		"error": nil, "incomplete_details": nil, "instructions": nil,
+		"error": nil, "incomplete_details": incomplete, "instructions": nil,
 		"max_output_tokens": nil, "metadata": map[string]any{},
 		"previous_response_id": nil, "reasoning": nil, "store": false,
 		"temperature": nil, "text": map[string]any{"format": map[string]any{"type": "text"}},
@@ -1043,6 +1538,21 @@ func intOf(v any) int {
 		return int(n)
 	}
 	return 0
+}
+
+func responseArray(v any) []any {
+	switch values := v.(type) {
+	case []any:
+		return values
+	case []map[string]any:
+		result := make([]any, len(values))
+		for i, value := range values {
+			result[i] = value
+		}
+		return result
+	default:
+		return nil
+	}
 }
 
 func newRespID(prefix string) string {

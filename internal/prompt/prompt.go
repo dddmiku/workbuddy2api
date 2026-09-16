@@ -1,10 +1,6 @@
-// Package prompt 提供网关自有系统提示词：内置默认 + 文件覆盖 + 降级中性提示词。
-//
-// 背景：客户端（Claude Code/Codex 等 CLI）在 system prompt 注入固定模板句，
-// 上游内容审核按逐字精确匹配误杀合法流量（issue #36/PR39 的 11128）。
-// 方案：网关在出站前用自有系统提示词替换客户端 system/developer 消息，
-// 从源头消灭 system 来源的指纹误报（用户/assistant 消息里的指纹串仍由
-// internal/upstream/sanitize.go 清洗，两层叠加、互不替代）。
+// ═══ 更新日志 ═══
+// 2026-09-16：显式自定义提示词替换保留其余请求数字原值，避免 schema 与工具参数定义丢失精度。
+// Package prompt 提供网关自有系统提示词加载及显式 custom 模式的系统消息替换。
 package prompt
 
 import (
@@ -12,6 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+
+	"workbuddy2api/internal/jsonutil"
 )
 
 //go:embed defaultprompt.md
@@ -53,7 +51,7 @@ func Rewrite(body []byte, systemPrompt string) []byte {
 		return body
 	}
 	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil {
+	if err := jsonutil.Decode(body, &obj); err != nil || obj == nil {
 		return body
 	}
 	msgs, ok := obj["messages"].([]any)

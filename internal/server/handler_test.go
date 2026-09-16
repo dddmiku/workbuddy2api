@@ -1,3 +1,6 @@
+// ═══ 更新日志 ═══
+// 2026-09-17：保留上游诊断断言并将参数错误契约更新为400且仅请求一次。
+// 2026-09-16：纠正参数错误轮转、跨会话自动降级和改写用户正文的旧预期，保留账号与显式 custom 断言。
 package server
 
 import (
@@ -222,10 +225,8 @@ func TestChatOversizedBodyDefaultLimit(t *testing.T) {
 	}
 }
 
-// TestChatBadParamsRotatesWithoutPenalty 上游 400 + Unmarshal chat params failed（11101）
-// → 该类归 ErrBadParams：不罚账号（无冷却/无禁用/无熔断计数/无 errTotal），但**仍然轮转**
-// （换号重试可能命中不同权限的账号）。端到端断言 bad 失败、good 成功、账号完好。
-func TestChatBadParamsRotatesWithoutPenalty(t *testing.T) {
+// TestChatBadParamsReturns400WithoutRotation 参数错误返回 400，不换号重发同一个坏请求，账号不受罚。
+func TestChatBadParamsReturns400WithoutRotation(t *testing.T) {
 	calls := map[string]int{}
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		calls[authz]++
@@ -243,11 +244,11 @@ func TestChatBadParamsRotatesWithoutPenalty(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
-	if rec.Code != 200 {
-		t.Fatalf("code=%d body=%s (want 200 after rotate to good)", rec.Code, rec.Body)
+	if rec.Code != 400 {
+		t.Fatalf("code=%d body=%s (want 400 without rotating)", rec.Code, rec.Body)
 	}
-	if calls["Bearer at-bad"] != 1 || calls["Bearer at-good"] != 1 {
-		t.Errorf("calls=%v want bad/good 各 1 次", calls)
+	if calls["Bearer at-bad"] != 1 || calls["Bearer at-good"] != 0 {
+		t.Errorf("calls=%v want bad 1 次、good 0 次", calls)
 	}
 	// 账号完好：无冷却、无禁用、无熔断计数、无 errTotal。
 	st, _ := p.Status("bad")
@@ -256,23 +257,26 @@ func TestChatBadParamsRotatesWithoutPenalty(t *testing.T) {
 	}
 }
 
-// TestChatAllBadParams503CarriesUpstreamBody 全部账号都 11101 时 503 文案必须包含
-// 上游原始 11101 信息（不再是空洞的 no_healthy_account）。
-// 现状即透传 lastErr.Error()（含上游 body），本测试把它锁定为回归。
-func TestChatAllBadParams503CarriesUpstreamBody(t *testing.T) {
+// TestChatBadParams400CarriesUpstreamBody 参数错误归为 400，仍保留帮助调用方定位参数的诊断信息。
+func TestChatBadParams400CarriesUpstreamBody(t *testing.T) {
+	calls := 0
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls++
 		return 400, `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF","requestId":"req-xyz-777"}`, false
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
-	if rec.Code != 503 {
-		t.Fatalf("code=%d body=%s (want 503)", rec.Code, rec.Body)
+	if rec.Code != 400 {
+		t.Fatalf("code=%d body=%s (want 400)", rec.Code, rec.Body)
+	}
+	if calls != 1 {
+		t.Fatalf("parameter errors must not retry: calls=%d", calls)
 	}
 	body := rec.Body.String()
 	if !strings.Contains(body, "11101") || !strings.Contains(body, "Unmarshal chat params failed") {
-		t.Errorf("503 message should carry upstream 11101 info: %s", body)
+		t.Errorf("400 message should carry upstream parameter diagnostics: %s", body)
 	}
 	if !strings.Contains(body, "req-xyz-777") {
 		t.Errorf("503 message should carry upstream requestId: %s", body)
@@ -285,7 +289,9 @@ func TestChatAllBadParams503CarriesUpstreamBody(t *testing.T) {
 // （任务书验收 2：透视可见真实上游错误）。
 func TestChatPassesThroughUpstreamErrorWithCodeMsgRequestID(t *testing.T) {
 	const raw = `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF","requestId":"req-xyz-777"}`
+	calls := 0
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls++
 		return 400, raw, false
 	})
 	h := NewHandler(Config{
@@ -294,8 +300,11 @@ func TestChatPassesThroughUpstreamErrorWithCodeMsgRequestID(t *testing.T) {
 	})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
-	if rec.Code != 503 {
-		t.Fatalf("code=%d body=%s (want 503)", rec.Code, rec.Body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s (want 400)", rec.Code, rec.Body)
+	}
+	if calls != 1 {
+		t.Fatalf("invalid params retried %d times", calls)
 	}
 	var e struct {
 		Error struct {
@@ -307,8 +316,11 @@ func TestChatPassesThroughUpstreamErrorWithCodeMsgRequestID(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
 		t.Fatalf("resp not json: %v body=%s", err, rec.Body)
 	}
-	// error.message 必须等于上游原文（原样，非固定文案/非重建 JSON）。
-	if e.Error.Message != raw {
+	// 参数错误返回400，诊断前缀后保留完整上游code/msg/requestId，不重建或丢失原文。
+	if e.Error.Code != "upstream_invalid_request" {
+		t.Errorf("error code=%q", e.Error.Code)
+	}
+	if e.Error.Message != "upstream rejected request params: "+raw {
 		t.Errorf("message=%q want raw upstream body passthrough %q", e.Error.Message, raw)
 	}
 	if !strings.Contains(e.Error.Message, "11101") ||
@@ -1097,7 +1109,7 @@ func TestChatHTTP4xxClientDoesNotPenalize(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
-	if rec.Code != 503 {
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"code":"upstream_invalid_request"`) {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 	st, _ := p.Status("u1")
@@ -1884,10 +1896,9 @@ func TestStatusRequiresAuth(t *testing.T) {
 	}
 }
 
-// TestContentBlockedTriggersDegradedRetry passthrough 模式下首请求 400（11128 文案）
-// → 降级重试（Degraded）→ 200，客户端无感。验证第二次出站 body 为 Degraded。
-func TestContentBlockedTriggersDegradedRetry(t *testing.T) {
-	// 记录每次出站请求体，断言第二次为 Degraded 文本。
+// TestContentBlockedPreservesPromptWithoutRetry passthrough 被拒绝后原样返回失败，不替换调用者指令重试。
+func TestContentBlockedPreservesPromptWithoutRetry(t *testing.T) {
+	// 即使模拟上游第二次可成功，也不能未经调用者同意改写指令后自动重试。
 	var bodies [][]byte
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -1916,46 +1927,64 @@ func TestContentBlockedTriggersDegradedRetry(t *testing.T) {
 		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"system","content":"原始指纹"},{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	if rec.Code != 200 {
-		t.Fatalf("code=%d body=%s (want 200 after degraded retry)", rec.Code, rec.Body)
+	if rec.Code != 400 {
+		t.Fatalf("code=%d body=%s (want explicit content-blocked failure)", rec.Code, rec.Body)
 	}
-	if len(bodies) != 2 {
-		t.Fatalf("want 2 upstream calls (first 400 + retry), got %d", len(bodies))
+	if len(bodies) != 1 {
+		t.Fatalf("want exactly 1 upstream call without prompt retry, got %d", len(bodies))
 	}
-	// 第二次出站 body 的 messages 头部 system 内容应为 Degraded 文本。
-	if !strings.Contains(string(bodies[1]), prompt.Degraded) {
-		t.Errorf("second body should contain Degraded prompt: %s", bodies[1])
+	if strings.Contains(string(bodies[0]), prompt.Degraded) {
+		t.Errorf("passthrough must not inject Degraded prompt: %s", bodies[0])
 	}
-	if strings.Contains(string(bodies[1]), "原始指纹") {
-		t.Errorf("second body should not contain original system: %s", bodies[1])
+	if !strings.Contains(string(bodies[0]), "原始指纹") {
+		t.Errorf("outbound body must preserve original system: %s", bodies[0])
+	}
+	assertJSONErrorCode(t, rec.Body.String(), "content_blocked")
+	if h.degrade.Active() {
+		t.Fatal("rejection must not enable a global prompt override")
 	}
 }
 
-// TestContentBlockedStickyDegraded 降级后新请求直达 Degraded（不再先撞 400）。
-func TestContentBlockedStickyDegraded(t *testing.T) {
-	var firstCall bool
-	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
-		if !firstCall {
-			firstCall = true
-			return 400, `{"code":11128,"msg":"blocked by security policy"}`, false
-		}
-		return 200, sseOK, true
-	})
+// TestContentBlockedDoesNotRewriteAnotherSession 一个会话的拒绝不能改变其它会话的指令。
+func TestContentBlockedDoesNotRewriteAnotherSession(t *testing.T) {
+	var bodies [][]byte
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			body, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, body)
+			status, contentType, result := 200, "text/event-stream", sseOK
+			if len(bodies) == 1 {
+				status, contentType, result = 400, "application/json", `{"code":11128,"msg":"blocked by security policy"}`
+			}
+			return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": []string{contentType}}, Body: io.NopCloser(strings.NewReader(result))}, nil
+		})}, ChatBaseCN: "https://fake.example",
+	}
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "passthrough"})
 
-	// 首请求触发降级 → 200。
+	// 第一会话显式失败，第二会话仍按自己的原始指令独立处理。
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
-		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"system","content":"x"},{"role":"user","content":"hi"}]}`)))
-	if rec.Code != 200 {
+		strings.NewReader(`{"model":"glm-5.2","conversation_id":"first-session","stream":true,"messages":[{"role":"system","content":"first original instruction"},{"role":"user","content":"hi"}]}`)))
+	if rec.Code != 400 {
 		t.Fatalf("first req code=%d", rec.Code)
 	}
-	// 降级粘性：新请求 Active()=true，body 已被 Rewrite(Degraded)，上游首字节即 200。
-	// 但 fake 上游只对 firstCall 返回 400，之后都 200，无法区分"直达"与"重试"。
-	// 用 degrade.Active() 直接断言粘性生效。
-	if !h.degrade.Active() {
-		t.Fatal("degrade should be active after trigger")
+	if h.degrade.Active() {
+		t.Fatal("a rejected session must not activate a global override")
+	}
+	second := httptest.NewRecorder()
+	h.ServeHTTP(second, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","conversation_id":"other-session","stream":true,"messages":[{"role":"system","content":"second original instruction"},{"role":"user","content":"hi"}]}`)))
+	if second.Code != 200 {
+		t.Fatalf("second req code=%d body=%s", second.Code, second.Body)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("want one upstream call per session, got %d", len(bodies))
+	}
+	for i, want := range []string{"first original instruction", "second original instruction"} {
+		if !strings.Contains(string(bodies[i]), want) || strings.Contains(string(bodies[i]), prompt.Degraded) {
+			t.Errorf("session %d instruction changed: %s", i, bodies[i])
+		}
 	}
 }
 
@@ -1989,8 +2018,7 @@ func TestContentBlockedCustomModeDoesNotDegrade(t *testing.T) {
 }
 
 // TestContentBlockedDoesNotPenalizeAccount ErrContentBlocked 不罚账号（无冷却/熔断/NoteError），
-// 且 passthrough 降级重试后第二次仍拦 → 立即 400 content_blocked（不轮转），
-// message 透传上游 code/msg 原文（error-passthrough）。
+// passthrough 拒绝直接回 400，不自动替换指令、不轮转；诊断保留上游原因。
 func TestContentBlockedDoesNotPenalizeAccount(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 400, `{"code":11128,"msg":"blocked by security policy"}`, false
@@ -2004,12 +2032,12 @@ func TestContentBlockedDoesNotPenalizeAccount(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
 
-	// passthrough 首遇（无原始 system，实际无降级重试）→ 内容拦截直接回 400 content_blocked。
+	// passthrough 内容拦截直接回 400 content_blocked。
 	if rec.Code != 400 {
 		t.Fatalf("code=%d want 400 body=%s", rec.Code, rec.Body)
 	}
 	if !strings.Contains(rec.Body.String(), `"code":"content_blocked"`) {
-		t.Errorf("passthrough retry-still-blocked should return content_blocked: %s", rec.Body)
+		t.Errorf("passthrough rejection should return content_blocked: %s", rec.Body)
 	}
 
 	st, _ := p.Status("u1")
@@ -2018,9 +2046,9 @@ func TestContentBlockedDoesNotPenalizeAccount(t *testing.T) {
 	}
 }
 
-// TestContentBlockedSecondHitReturns400 passthrough 首遇降级重试、第二次仍拦 → 立即 400
+// TestContentBlockedFirstHitReturns400 passthrough 首次拒绝立即回 400
 // content_blocked：**不轮转**（多账号池也只打一次）、**不罚账号**、防火墙文案不含账号/错误码。
-func TestContentBlockedSecondHitReturns400(t *testing.T) {
+func TestContentBlockedFirstHitReturns400(t *testing.T) {
 	calls := 0
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -2043,12 +2071,12 @@ func TestContentBlockedSecondHitReturns400(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"system","content":"原始指纹"},{"role":"user","content":"hi"}]}`)))
 
-	// passthrough 首遇（body 含原始 system）→ 降级重试一次；第二次仍拦 → 立即 400，不轮转。
+	// 原始 system 的存在不授权改写后重试；首次拒绝即停止。
 	if rec.Code != 400 {
 		t.Fatalf("code=%d want 400 body=%s", rec.Code, rec.Body)
 	}
-	if calls != 2 {
-		t.Errorf("want exactly 2 upstream calls (first 400 + one degraded retry, then stop), got %d", calls)
+	if calls != 1 {
+		t.Errorf("want exactly 1 upstream call without a degraded retry, got %d", calls)
 	}
 	body := rec.Body.String()
 	if !assertJSONErrorCode(t, body, "content_blocked") {
@@ -2125,15 +2153,9 @@ func TestContentBlockedReturnsFirewallMessage(t *testing.T) {
 	}
 }
 
-// TestCustomModeFingerprintSanitizePreserved custom 端到端：user 消息含 Claude Code
-// 指纹句（PR39 fixture 串）→ Rewrite 注入自有 system → 经 sanitize → 出站 body 中
-// 该指纹被改写、system 为自有提示词。证明两层（提示词替换 + 清洗）叠加工作。
-//
-// 两层各自职责（互不替代）：
-//   - prompt.Rewrite 替换 system/developer 消息（消灭 system 来源指纹）；
-//   - sanitizeMessages 改写 user/assistant 消息中残留的指纹串（兜底用户上下文）。
-func TestCustomModeFingerprintSanitizePreserved(t *testing.T) {
-	// 捕获出站 body（prepareBody 已强制 stream + 归一 + 清洗后）。
+// TestCustomModePreservesUserText custom 只执行明确配置的 system 替换，用户正文逐字保留。
+func TestCustomModePreservesUserText(t *testing.T) {
+	// 捕获实际经过 prepareBody 的出站体，旧清洗配置开启也不得改写用户正文。
 	var sentBody []byte
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -2146,7 +2168,7 @@ func TestCustomModeFingerprintSanitizePreserved(t *testing.T) {
 			}, nil
 		})},
 		ChatBaseCN:           "https://fake.example",
-		SanitizeFingerprints: true, // 开启清洗层（与生产一致）
+		SanitizeFingerprints: true, // 兼容旧配置，但不能再变更消息内容。
 	}
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	const customSys = "我是网关自有提示词"
@@ -2171,25 +2193,17 @@ func TestCustomModeFingerprintSanitizePreserved(t *testing.T) {
 	if !strings.Contains(out, customSys) {
 		t.Errorf("out body should contain custom system prompt: %s", out)
 	}
-	if strings.Contains(out, "official CLI for Claude.") && strings.Contains(out, "You are Claude Code, Anthropic's") {
-		// 旧 system 原文（含句点）不应以 system 角色出现；但 sanitize 把它改写为
-		// "...official CLI tool for Claude."，所以原文 fingerprint 串应消失。
+	if !strings.Contains(out, "official CLI for Claude.") {
+		t.Errorf("user identity text was changed: %s", out)
 	}
-	// 原始指纹串（逐字精确匹配）在出站 body 中应被改写：
-	// "official CLI for Claude." → "official CLI tool for Claude."
-	// "Main branch (" → "Default branch ("
-	if strings.Contains(out, "official CLI for Claude.") {
-		t.Errorf("identity fingerprint not rewritten by sanitize in user msg: %s", out)
+	if !strings.Contains(out, "Main branch (you will usually use this for PRs)") {
+		t.Errorf("user branch text was changed: %s", out)
 	}
-	if strings.Contains(out, "Main branch (you will usually use this for PRs)") {
-		t.Errorf("branch fingerprint not rewritten by sanitize in user msg: %s", out)
+	if strings.Contains(out, "official CLI tool for Claude.") {
+		t.Errorf("unexpected identity substitution: %s", out)
 	}
-	// 改写后的痕迹应在（证明 sanitize 层生效，不是"全删了"）。
-	if !strings.Contains(out, "official CLI tool for Claude.") {
-		t.Errorf("sanitized identity rewrite missing: %s", out)
-	}
-	if !strings.Contains(out, "Default branch (you will usually use this for PRs)") {
-		t.Errorf("sanitized branch rewrite missing: %s", out)
+	if strings.Contains(out, "Default branch (you will usually use this for PRs)") {
+		t.Errorf("unexpected branch substitution: %s", out)
 	}
 	// 2) messages 头部恰好一条 system = 自有提示词（Rewrite 已删旧 system）。
 	var obj map[string]any
@@ -2205,6 +2219,9 @@ func TestCustomModeFingerprintSanitizePreserved(t *testing.T) {
 			if mm["content"] != customSys {
 				t.Errorf("system content=%v want %q", mm["content"], customSys)
 			}
+		}
+		if mm["role"] == "user" && mm["content"] != "You are Claude Code, Anthropic's official CLI for Claude. Main branch (you will usually use this for PRs)" {
+			t.Errorf("custom mode changed user content: %v", mm["content"])
 		}
 	}
 	if systemCount != 1 {
@@ -2357,14 +2374,8 @@ func TestNewHandlerPromptDefaultPassthrough(t *testing.T) {
 	}
 }
 
-// TestContentBlockedCustomIgnoresActiveDegrade 显式 custom 模式在降级期仍走自有提示词、
-// 不参与降级：先人为触发 degrade.Active()（模拟 passthrough 首遇后进入降级期），
-// 再发 custom 请求 → 出站 body 为自有提示词而非 Degraded，且仍不经降级重试。
-//
-// 相交矩阵关键格：degrade gate 是 Handler 级全局状态（handler.go:69），passthrough
-// 请求可能在不经意间把整实例带入降级期。守卫在 handler.go:450-455 的 if/elseif 结构：
-// custom 分支恒优先，Active() 只在 passthrough 分支才被求值 → custom 请求永远
-// 命不中降级分支。此测试把该行为锁死，防未来重构把两分支合并后 custom 被降级期带偏。
+// TestContentBlockedCustomIgnoresActiveDegrade 遗留降级门即使被置为激活态，也不能干扰明确配置的 custom 提示词。
+// 该状态不再参与自动改写；保留此测试防止兼容旧状态时重新引入覆盖用户配置的行为。
 func TestContentBlockedCustomIgnoresActiveDegrade(t *testing.T) {
 	var sentBodies [][]byte
 	up := &upstream.Client{
@@ -2384,7 +2395,7 @@ func TestContentBlockedCustomIgnoresActiveDegrade(t *testing.T) {
 	const customSys = "我是网关自有提示词"
 	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "custom", PromptText: customSys})
 
-	// 人为把降级门拨到激活态（模拟 passthrough 首遇 400 后进入降级期）。
+	// 人为构造遗留状态；生产拒绝路径已经不再激活该门。
 	h.degrade.Trigger()
 	if !h.degrade.Active() {
 		t.Fatal("precondition: degrade gate should be active after Trigger")

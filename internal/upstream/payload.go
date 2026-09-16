@@ -1,3 +1,7 @@
+// ═══ 更新日志 ═══
+// 2026-09-16：移除业务正文清洗，旧 sanitize 参数仅兼容配置；保留既有协议适配。
+// 2026-09-16：请求及 console 系统消息适配保留 JSON 数字字面量，避免 schema 和业务值损失精度。
+// 2026-09-17：合并 fork 测试入口约定，保留参数兼容、协议整理与数字/正文保真。
 // payload.go 改写发往上游的 chat 请求体：
 //  1. 强制 stream:true（上游拒绝非流式）
 //  2. tool_choice 归一化（上游该字段是 string，对象形式会 400 code=11101）
@@ -7,14 +11,15 @@ import (
 	"encoding/json"
 	"log"
 	"strings"
+
+	"workbuddy2api/internal/jsonutil"
 )
 
-// PrepareBodyOpt 单 pass 改写；sanitize=false 时行为完全还原（仅强制 stream + 归一化 tool_choice）。
-// DeptestOnly: 仅测试引用（upstream 各 _test + server 稳定性回归）；生产经
-// prepareBody 走 PrepareBodyOptWithEffortsAndDefault。跨包测试引用，
-// 迁 export_test.go 不可行。保留作三层封装的最底层语义锚点。
-func PrepareBodyOpt(src []byte, sanitize bool) []byte {
-	return PrepareBodyOptWithEffortsAndDefault(src, sanitize, nil, nil)
+// PrepareBodyOpt 适配上游协议并保留消息业务内容。
+// legacySanitize 参数已废弃，保留调用兼容性；true/false 均不清洗内容，新调用应传 false。
+// DeptestOnly: 保留跨包回归测试入口；生产经 prepareBody 调用 PrepareBodyOptWithEffortsAndDefault。
+func PrepareBodyOpt(src []byte, legacySanitize bool) []byte {
+	return PrepareBodyOptWithEffortsAndDefault(src, legacySanitize, nil, nil)
 }
 
 // PrepareBodyOptWithEfforts 在 PrepareBodyOpt 基础上按模型 supportedEfforts 降级 reasoning_effort：
@@ -26,18 +31,19 @@ func PrepareBodyOpt(src []byte, sanitize bool) []byte {
 // 跨包测试引用，迁 export_test.go 不可行。保留作无默认档的降级管线锚点。
 //
 // 向后兼容封装：不传 defaultEfforts（无模型声明默认档），thinking.go 回退硬编码 high。
-func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]string) []byte {
-	return PrepareBodyOptWithEffortsAndDefault(src, sanitize, efforts, nil)
+// DeptestOnly: 保留跨包测试使用的无默认档管线，生产使用带默认档的完整入口。
+func PrepareBodyOptWithEfforts(src []byte, legacySanitize bool, efforts map[string][]string) []byte {
+	return PrepareBodyOptWithEffortsAndDefault(src, legacySanitize, efforts, nil)
 }
 
 // PrepareBodyOptWithEffortsAndDefault 在 PrepareBodyOptWithEfforts 基础上按模型
 // reasoning.defaultEffort 补默认档（缺显式 effort 时优先用模型声明档，空串/未知回退硬编码）。
-func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string) []byte {
+func PrepareBodyOptWithEffortsAndDefault(src []byte, legacySanitize bool, efforts map[string][]string, defaultEfforts map[string]string) []byte {
 	if len(src) == 0 {
 		return src
 	}
 	var obj map[string]any
-	if err := json.Unmarshal(src, &obj); err != nil {
+	if err := jsonutil.Decode(src, &obj); err != nil || obj == nil {
 		return src
 	}
 	obj["stream"] = true
@@ -48,8 +54,8 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	}
 	normalizeToolChoice(obj)
 	normalizeRoles(obj)
-	// 孤儿 tool_call↔tool 配对清理（见 tool_pairing.go）：所有模型一律执行（独立于
-	// deepseek-only 的 sanitize 开关）。这是「让请求通过」的安全网——不完整配对的
+	// 孤儿 tool_call↔tool 配对清理（见 tool_pairing.go）：所有模型一律执行。
+	// 这是协议适配的安全网——不完整配对的
 	// tool_calls/tool 结果会让上游对之后每条消息都返 400，必须先行剔除。
 	if msgs, ok := obj["messages"].([]any); ok {
 		// 先修顺序：把插在 assistant.tool_calls 与其结果之间的消息后移，
@@ -72,11 +78,7 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	// DeepSeek 多轮一致性：assistant 消息带 reasoning 痕迹时回填 reasoning_content
 	// （requiresReasoningContentOnAssistantMessages，见 thinking.go）。
 	backfillReasoningContent(obj)
-	if sanitize {
-		if msgs, ok := obj["messages"].([]any); ok {
-			sanitizeMessages(msgs)
-		}
-	}
+	warnDeprecatedSanitization(legacySanitize)
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return src
@@ -156,8 +158,7 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 // 命中即 HTTP 400 code=11128。developer 是 OpenAI 新规范里 system 的别名
 // （Codex / Cursor 等新客户端用它承载 system 级指令），改写为 system 不丢语义。
 //
-// 此归一化是「协议兼容」（补上游 role 白名单），不是「内容脱敏」，
-// 因此有意与 SanitizeFingerprints / sanitize 参数解耦：即使 sanitize=false 也照常归一。
+// 此归一化仅适配上游 role 白名单，保留消息正文；旧 sanitize 配置的任意取值均照常归一。
 //
 // 只认 developer 这一个值：其余 role（system/user/assistant/tool/任意未知值）一律原样保留，
 // 不合并、不重排、不删除任何消息（上游对多 system 的行为尚未实测，合并会引入新变量）。
@@ -182,7 +183,7 @@ func normalizeRoles(obj map[string]any) {
 	}
 }
 
-// ensureConsoleSystem global realm 兜底 system 注入（吸收 PR #45，防 console 域上游 code 11-128）：
+// ensureConsoleSystem global realm 兜底 system 注入（吸收 PR #45，防 console 域上游 code 11128）：
 // 首条消息非 system 时在 messages 最前补一条 fallback system（"You are a helpful assistant."）。
 // 仅对 global 请求调用（CN 现状不动；即使首条就是 system 也不重复注入）。
 // body 不可解析时原样返回（与 prepareBody 语义一致：坏 body 不在这里二次错误化）。
@@ -191,7 +192,7 @@ func ensureConsoleSystem(body []byte) []byte {
 		return body
 	}
 	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil {
+	if err := jsonutil.Decode(body, &obj); err != nil || obj == nil {
 		return body
 	}
 	msgs, ok := obj["messages"].([]any)

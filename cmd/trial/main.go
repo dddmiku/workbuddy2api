@@ -124,4 +124,3 @@ func main() {
 	fmt.Printf("\ntotal=%d ok=%d already=%d na=%d fail=%d\n",
 		len(rows), okN, alreadyN, notAppN, failN)
 }
-

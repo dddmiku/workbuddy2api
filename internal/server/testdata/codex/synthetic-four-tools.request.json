@@ -1,0 +1,116 @@
+{
+  "model": "cn:deepseek-v4.1-flash",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": "Summarize the sample invoices and preserve their identifiers exactly."
+    },
+    {
+      "type": "function_call",
+      "call_id": "synthetic-call-01",
+      "name": "exec_command",
+      "arguments": "{\"cmd\":\"ls\",\"workdir\":\".\"}"
+    },
+    {
+      "type": "function_call",
+      "call_id": "synthetic-call-02",
+      "name": "exec_command",
+      "arguments": "{\"cmd\":\"cat test_ledger.py\",\"workdir\":\".\"}"
+    },
+    {
+      "type": "function_call",
+      "call_id": "synthetic-call-03",
+      "name": "exec_command",
+      "arguments": "{\"cmd\":\"cat invoices.json\",\"workdir\":\".\"}"
+    },
+    {
+      "type": "function_call",
+      "call_id": "synthetic-call-04",
+      "name": "exec_command",
+      "arguments": "{\"cmd\":\"cat ledger.py\",\"workdir\":\".\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "synthetic-call-01",
+      "output": "invoices.json\nledger.py\ntest_ledger.py\n"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "synthetic-call-02",
+      "output": "assert summarize(rows)[\"invoice_ids\"] == [11128, 22229, 33330]\n"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "synthetic-call-03",
+      "output": "[{\"invoice_id\":11128,\"amount_cents\":1250},{\"invoice_id\":22229,\"amount_cents\":-200},{\"invoice_id\":33330,\"amount_cents\":450}]\n"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "synthetic-call-04",
+      "output": "def summarize(rows):\n    return {\"count\": len(rows), \"total_cents\": 0}\n"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "name": "exec_command",
+      "description": "Run a command in the synthetic example workspace.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "cmd": {
+            "type": "string"
+          },
+          "workdir": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "cmd",
+          "workdir"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "parallel_tool_calls": true,
+  "reasoning": {
+    "effort": "low",
+    "summary": "concise"
+  },
+  "store": false,
+  "stream": true,
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "prompt_cache_key": "synthetic-codex-cache-key",
+  "text": {
+    "format": {
+      "type": "json_schema",
+      "name": "codex_output_schema",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {
+          "summary": {
+            "type": "string"
+          },
+          "tests_passed": {
+            "type": "boolean"
+          },
+          "first_invoice_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "summary",
+          "tests_passed",
+          "first_invoice_id"
+        ],
+        "additionalProperties": false
+      }
+    }
+  }
+}

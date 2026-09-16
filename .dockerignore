@@ -20,3 +20,25 @@ README.md
 real2.json
 replay_full.json
 combined.json
+
+# Runtime credentials and private captures never enter build layers
+auths-trash/
+backups/
+artifacts/
+.env
+.env.*
+config.json.*
+**/*.key
+**/*.pem
+**/*.tmp-*
+**/*.bak
+**/*.bak.*
+**/*.bak-*
+**/*.before-*
+**/*.old.*
+**/*.log
+**/*-wire-*.request.json
+real_input.json
+big_payload.json
+trial_bin
+activity_bin

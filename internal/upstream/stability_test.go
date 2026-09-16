@@ -1,3 +1,5 @@
+// ═══ 更新日志 ═══
+// 2026-09-16：把稳定性用例改为内容保真契约，旧清洗配置不再参与业务正文改写。
 // stability_test.go upstream 侧 body 重写稳定性回归测试。
 //
 // 背景（lovingfish/workbuddy-cliproxy issue#4）：逐字节相同的请求在上游侧 prompt cache
@@ -16,7 +18,7 @@ import (
 )
 
 // prepareBodyChain 以字节级精度仿真生产出站 body 重写链（upstream 侧）：
-// PrepareBodyOptWithEfforts（脱敏 + effort 降级等，efforts 传 nil → 透传不降级）
+// PrepareBodyOptWithEfforts（协议适配 + effort 降级等，efforts 传 nil → 透传不降级）
 // → ensureConsoleSystem（global realm 首条消息非 system 时前置兜底 system）。
 func prepareBodyChain(body []byte, realm string) []byte {
 	out := PrepareBodyOptWithEfforts(body, true, nil)
@@ -40,7 +42,7 @@ func TestUpstreamRewriteStableSerialization(t *testing.T) {
 		{"deepseek 开思考注入 thinking+effort", `{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}`, "cn"},
 		{"deepseek 显式 thinking disabled 删 effort", `{"model":"deepseek-v4-flash","reasoning_effort":"high","thinking":{"type":"disabled"},"messages":[]}`, "cn"},
 		{"tool_choice 归一化", `{"model":"g:glm-4","tool_choice":{"type":"function","function":{"name":"f"}},"tools":[{"type":"function","function":{"name":"f"}}],"messages":[{"role":"user","content":"hi"}]}`, "global"},
-		{"脱敏指纹 system 改写（逐字稳定）", `{"model":"g:glm-4","messages":[{"role":"system","content":"You are Claude Code, Anthropic's official CLI for Claude. Main branch (you will usually use this for PRs). 11128"},{"role":"user","content":"hi"}]}`, "global"},
+		{"system 业务内容保留（逐字稳定）", `{"model":"g:glm-4","messages":[{"role":"system","content":"You are Claude Code, Anthropic's official CLI for Claude. Main branch (you will usually use this for PRs). 11128"},{"role":"user","content":"hi"}]}`, "global"},
 		{"assistant reasoning_content + tool_calls 数组", `{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"x"},{"role":"assistant","content":null,"reasoning_content":"hidden","tool_calls":[{"function":{"name":"f","arguments":"[\"a\",\"b\"]"}}]}]}`, "cn"},
 		{"多模态 content 数组", `{"model":"g:glm-4","messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD"}}]}]}`, "global"},
 	}

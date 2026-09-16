@@ -89,8 +89,8 @@ func TestNormalizeScheduleEmptyHoursFallback(t *testing.T) {
 // TestNormalizeScheduleInvalidHour 非法小时快速失败并指向正确开关。
 func TestNormalizeScheduleInvalidHour(t *testing.T) {
 	cases := []struct {
-		s           Schedule
-		wantSwitch  string
+		s          Schedule
+		wantSwitch string
 	}{
 		{Schedule{CheckinHours: []int{25}}, "checkin_enabled"},
 		{Schedule{CheckinHours: []int{-1}}, "checkin_enabled"},

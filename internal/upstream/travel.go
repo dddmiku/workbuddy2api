@@ -1,5 +1,6 @@
 // travel.go growth 域「猫猫旅行」接口：状态查询 / 派出 / 领奖 / 领养 / 协议。
 // 全部走 chatBase（copilot.tencent.com，不带 /v2 前缀）+ BillingHeaders，信封同 doJSON。
+// 2026-09-16：growth 请求的 URL 与鉴权头共享同一凭据快照，避免并发刷新跨代读取。
 package upstream
 
 import (
@@ -44,6 +45,7 @@ type TravelState struct {
 // growthJSON 发 growth 域请求并解信封；body 为 nil 时不带请求体。
 // 错误语义与 doJSON 一致：HTTP 非 2xx / 业务 code != 0 → *Error。
 func (c *Client) growthJSON(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
+	a = a.Snapshot()
 	var rdr io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)

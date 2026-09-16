@@ -1,3 +1,5 @@
+// ═══ 更新日志 ═══
+// 2026-09-16：缓存键注入保留请求中的数字原值，并保持完整 JSON 文档校验。
 // cache_key.go 注入上游 prompt_cache_key 字段（P0 费用优化）。
 //
 // 逆向实测（buddy-adapter.ts:706-714）：上游服务端支持 prompt_cache_key，
@@ -14,6 +16,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"strings"
+
+	"workbuddy2api/internal/jsonutil"
 )
 
 // InjectPromptCacheKey 在已改写的出站 body 上注入 prompt_cache_key 字段。
@@ -37,7 +41,7 @@ func InjectPromptCacheKey(body []byte, uid, conversationID string) []byte {
 		return body
 	}
 	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil {
+	if err := jsonutil.Decode(body, &obj); err != nil || obj == nil {
 		return body
 	}
 	// 优先级 1：客户端已显式带 key → 绝不覆盖。

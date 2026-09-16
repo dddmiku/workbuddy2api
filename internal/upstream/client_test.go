@@ -1,3 +1,6 @@
+// ═══ 更新日志 ═══
+// 2026-09-16：修正渠道拒绝的分类预期，保留真实内容策略拦截测试。
+// 2026-09-17：合并模型避让、统一限流及并发探测测试，并保留渠道拒绝的独立分类。
 package upstream
 
 import (
@@ -40,10 +43,10 @@ func TestClassify(t *testing.T) {
 		{200, `{"code":1,"msg":"model usage limit exceeded"}`, ErrSoftRate},
 		{200, `{"code":1,"msg":"too many requests"}`, ErrSoftRate},
 		{500, `rate-limited upstream`, ErrSoftRate}, // 限流文案优先于 5xx 分类
-		// 内容策略拦截（HTTP 400 + 审核文案）：误报信号，不罚账号，走降级重试。
-		{400, `Illegal API invocation from an unapproved channel`, ErrContentBlocked},
+		// 渠道拒绝与内容策略文案分别分类，不能互相替代。
+		{400, `Illegal API invocation from an unapproved channel`, ErrChannelRejected},
 		{400, `{"code":11128,"msg":"blocked by security policy"}`, ErrContentBlocked},
-		{400, `unapproved channel`, ErrContentBlocked},
+		{400, `unapproved channel`, ErrChannelRejected},
 		// 通用 4xx（非审核文案）：仍判 ErrClient，只换号不罚。
 		{400, `bad request`, ErrClient},
 		// ErrBadParams：请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）。
@@ -93,15 +96,11 @@ func TestClassify(t *testing.T) {
 	}
 }
 
-// TestClassifyContentBlocked 内容拦截分类仍由 Classify 负责（error-passthrough 后
-// 固定文案生成器已删除，分类仍按 contentBlockedRule 识别内容审核——识别是为了不罚号
-// 与降级重试，客户端文案改为直接透传上游原文）。
+// TestClassifyContentBlocked 保留内容策略分类；明确渠道拒绝不能混同内容违规。
 func TestClassifyContentBlocked(t *testing.T) {
 	for _, body := range []string{
 		`{"code":11128,"msg":"blocked by security policy"}`,
 		`{"code":"11128","msg":"blocked by security policy"}`,
-		`Illegal API invocation from an unapproved channel`,
-		`{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`,
 	} {
 		if got := Classify(400, body); got != ErrContentBlocked {
 			t.Errorf("Classify(400, %q)=%v want ErrContentBlocked", body, got)

@@ -13,6 +13,7 @@
 // realm 感知：复用 upstream.Client（auth.Parse + upstream.New），global 账号查积分
 // 走 workbuddy.ai /billing/meter/*（404 回落 /v2），CN 账号维持 codebuddy.cn
 // /v2/billing/meter/get-user-resource（现状逐字）。聚合口径即 upstream.ResourceSummary。
+// 2026-09-16：余额工具改从凭据快照判断令牌，保持与并发安全的上游客户端契约一致。
 package main
 
 import (
@@ -65,7 +66,7 @@ func collect(authDir string, up *upstream.Client) []accountResult {
 			continue
 		}
 		res := accountResult{UID: a.UID, Nickname: a.Nickname}
-		if a.AccessToken == "" {
+		if a.Snapshot().AccessToken == "" {
 			res.Error = "no accessToken"
 			accounts = append(accounts, res)
 			continue

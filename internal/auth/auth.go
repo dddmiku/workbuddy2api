@@ -1,5 +1,7 @@
 // Package auth 解析 WorkBuddy auth 文件（嵌套形/扁平形双形态），
 // 提供 refresh 后的原子写回。
+// ═══ 更新日志 ═══
+// 2026-09-16：凭据读取改为一致快照，合并同账号并发刷新，并用独立落盘锁和唯一临时文件防止竞态覆盖。
 package auth
 
 import (
@@ -19,8 +21,11 @@ import (
 
 // Auth 是归一化后的账号凭证（来源可以是插件 OAuth 嵌套形或手写扁平形）。
 type Auth struct {
-	// mu 串行化 RefreshToken 写与 SaveAtomic 读，防止并发写回半更新 token。
-	mu sync.Mutex
+	// mu 仅保护凭据内存状态；网络与文件 I/O 均不持有该锁。
+	mu         sync.RWMutex
+	saveMu     sync.Mutex
+	refreshMu  sync.Mutex
+	refreshing *refreshCall
 
 	AccessToken  string
 	RefreshToken string
@@ -31,11 +36,11 @@ type Auth struct {
 	//
 	// 命名注记：Go 不允许字段与方法同名，持久化字段用未导出 realm，计算访问器用
 	// 导出的 Realm()（跨包调用全部走方法）。Parse/SaveAtomic/login 在包内读写字段。
-	realm          string
-	UID            string
-	EnterpriseID   string
-	Nickname       string
-	FilePath       string // 来源文件；refresh 后原子写回此处
+	realm        string
+	UID          string
+	EnterpriseID string
+	Nickname     string
+	FilePath     string // 来源文件；refresh 后原子写回此处
 
 	// DeviceToken 设备风控 Token（X-Device-Token 头），来源 auth 文件的 device_token 键。
 	// 缺省为空 = 不注入该头（容器内无桌面端 Turing SDK 的常见部署）。
@@ -49,6 +54,89 @@ func (a *Auth) Lock() { a.mu.Lock() }
 
 // Unlock 释放 a.Lock 获取的锁。
 func (a *Auth) Unlock() { a.mu.Unlock() }
+
+// Snapshot 返回逐字段构造的独立只读副本，不复制互斥锁或刷新任务状态。
+// 请求 URL、realm 与请求头应从同一个快照构造；刷新始终针对原始 Auth 调用。
+func (a *Auth) Snapshot() *Auth {
+	if a == nil {
+		return nil
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return &Auth{
+		AccessToken: a.AccessToken, RefreshToken: a.RefreshToken, ExpiresAt: a.ExpiresAt,
+		Domain: a.Domain, realm: a.realm, UID: a.UID, EnterpriseID: a.EnterpriseID,
+		Nickname: a.Nickname, FilePath: a.FilePath, DeviceToken: a.DeviceToken,
+	}
+}
+
+// TokenUpdate 的空可选字段保留原值；AccessToken 必须非空。
+type TokenUpdate struct {
+	AccessToken  string
+	RefreshToken string
+	ExpiresAt    int64
+	Domain       string
+}
+
+type refreshCall struct {
+	done chan struct{}
+	err  error
+}
+
+// RefreshOnce 合并同一个 Auth 上重叠的刷新调用，包括来自不同 Client 的调用。
+// refresh 只接收独立快照；没有任何凭据锁跨过网络调用。失败会传给全部等待者。
+func (a *Auth) RefreshOnce(refresh func(*Auth) (TokenUpdate, error)) (err error) {
+	if a == nil {
+		return fmt.Errorf("no auth credentials")
+	}
+	a.refreshMu.Lock()
+	if pending := a.refreshing; pending != nil {
+		a.refreshMu.Unlock()
+		<-pending.done
+		return pending.err
+	}
+	pending := &refreshCall{done: make(chan struct{})}
+	a.refreshing = pending
+	a.refreshMu.Unlock()
+
+	// 即使回调 panic，等待者也会被释放并看到失败；发起者仍按原语义传播 panic。
+	resultErr := fmt.Errorf("credential refresh interrupted")
+	defer func() {
+		a.refreshMu.Lock()
+		pending.err = resultErr
+		a.refreshing = nil
+		close(pending.done)
+		a.refreshMu.Unlock()
+	}()
+	before := a.Snapshot()
+	update, err := refresh(before)
+	if err != nil {
+		resultErr = err
+		return err
+	}
+	if strings.TrimSpace(update.AccessToken) == "" {
+		resultErr = fmt.Errorf("refresh refused: empty accessToken")
+		return resultErr
+	}
+	a.mu.Lock()
+	// 在网络等待期间若别的受锁写入已经更新凭据，旧响应不能覆盖更新后的那一组。
+	if a.AccessToken == before.AccessToken && a.RefreshToken == before.RefreshToken &&
+		a.ExpiresAt == before.ExpiresAt && a.Domain == before.Domain {
+		a.AccessToken = update.AccessToken
+		if update.RefreshToken != "" {
+			a.RefreshToken = update.RefreshToken
+		}
+		if update.Domain != "" {
+			a.Domain = update.Domain
+		}
+		if update.ExpiresAt > 0 {
+			a.ExpiresAt = update.ExpiresAt
+		}
+	}
+	a.mu.Unlock()
+	resultErr = nil
+	return nil
+}
 
 // globalEnabled 全局开关：global realm 是否路由（D5 双保险）。
 // 默认开启（与 config global.enabled 缺省 true 一致）：Realm() 正常按显式 realm/
@@ -70,6 +158,8 @@ func GlobalEnabled() bool { return globalEnabled.Load() }
 // 全局开关 SetGlobalEnabled(false) 时恒 "cn"（逃生门：纯 CN 锁定，不影响默认行为）。
 // 空 realm + 空 domain → "cn"（老 CN 凭证零回归）。
 func (a *Auth) Realm() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	if !globalEnabled.Load() {
 		return "cn"
 	}
@@ -99,6 +189,8 @@ func ResolveRealm(explicit, domain string) string {
 // （SetGlobalEnabled(false)）下恒降级 cn，把 global 账号写死成 cn 会永久污染凭证
 // （逃生门是纯 CN 部署的临时锁，不应改写落盘数据）。domain 也为空时写 "cn"（老 CN 凭证）。
 func (a *Auth) BackfillRealm() (bool, string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if strings.TrimSpace(a.realm) != "" {
 		return false, a.realm
 	}
@@ -108,7 +200,11 @@ func (a *Auth) BackfillRealm() (bool, string) {
 }
 
 // RealmStored 直读持久化的 realm 标识（可能为空 = 未 backfill 的旧文件，Realm() 会 fallback）。
-func (a *Auth) RealmStored() string { return a.realm }
+func (a *Auth) RealmStored() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.realm
+}
 
 // IsGlobal 报告账号是否属于 global realm（= Realm() == "global"）。
 func (a *Auth) IsGlobal() bool { return a.Realm() == "global" }
@@ -122,6 +218,8 @@ func isGlobalDomain(d string) bool {
 
 // NeedsRefresh 报告 token 是否将在 within 内过期（或已过期/无 expiry）。
 func (a *Auth) NeedsRefresh(within time.Duration) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	if a.ExpiresAt <= 0 {
 		return true
 	}
@@ -206,12 +304,13 @@ func Parse(raw []byte) (*Auth, error) {
 	return &a, nil
 }
 
-// SaveAtomic 以嵌套形原子写回 FilePath（tmp + rename），保持嵌套形（插件可读）格式。
-// 全程持 a.mu：防止与 RefreshToken 修改 token 字段并发，杜绝写回半更新。
+// SaveAtomic 以嵌套形原子写回 FilePath（同目录唯一 tmp + rename），保持插件可读格式。
+// saveMu 串行化落盘，拿到保存次序后才取快照，避免旧调用延后覆盖较新的一组凭据。
 // 防御：accessToken 为空时拒绝写回，避免误用空凭证覆盖有效文件。
 func (a *Auth) SaveAtomic() error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.saveMu.Lock()
+	defer a.saveMu.Unlock()
+	a = a.Snapshot()
 	if strings.TrimSpace(a.AccessToken) == "" {
 		return fmt.Errorf("save refused: empty accessToken (uid=%s)", a.UID)
 	}
@@ -241,8 +340,21 @@ func (a *Auth) SaveAtomic() error {
 	if err != nil {
 		return err
 	}
-	tmp := a.FilePath + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	file, err := os.CreateTemp(filepath.Dir(a.FilePath), filepath.Base(a.FilePath)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := file.Name()
+	defer os.Remove(tmp)
+	if _, err := file.Write(raw); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp, a.FilePath)

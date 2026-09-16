@@ -1,6 +1,8 @@
 {
   "listen": ":7863",
   "api_key": "test_key",
+  "api_keys_file": "",
+  "api_keys_socket": "",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "server": {
@@ -48,7 +50,7 @@
     "passthrough_ip": false
   },
   "features": {
-    "sanitize_blacklist_fingerprints": true
+    "sanitize_blacklist_fingerprints": false
   },
   "prompt": {
     "mode": "passthrough",

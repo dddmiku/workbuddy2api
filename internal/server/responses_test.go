@@ -2,7 +2,12 @@
 // 2026-09-15: 新增。/v1/responses 兼容层单测：请求翻译、工具翻译、非流式对象翻译、
 //   流式事件序列（含推理条目与工具调用）。
 // 2026-09-16: 新增工具输出图片用例——含图保留 part 数组 + detail；纯文本仍退化字符串。
+// 2026-09-16: 补 custom 工具桥接用例（入站折成 function{input}、出站还原 custom_tool_call、
+//   历史项互逆折回、流式不发 arguments.delta、非流式按名还原），并更新 chatToResponses 签名。
 
+// ═══ 更新日志 ═══
+// 2026-09-16：补充已有部分输出后的 failed 终态及 length/content_filter 的 incomplete 与工具状态回归。
+// 2026-09-17：合并两侧有效转换断言，未知工具由静默丢弃改为明确拒绝并保留相应用例。
 package server
 
 import (
@@ -113,8 +118,7 @@ func TestResponsesFunctionCallPairing(t *testing.T) {
 
 func TestResponsesToolsAndChoice(t *testing.T) {
 	body := []byte(`{"model":"cn:auto","input":"hi","tools":[
-		{"type":"function","name":"f1","description":"d1","parameters":{"type":"object"}},
-		{"type":"web_search"}
+		{"type":"function","name":"f1","description":"d1","parameters":{"type":"object"}}
 	],"tool_choice":{"type":"function","name":"f1"}}`)
 	chatBody, _, err := responsesToChat(body)
 	if err != nil {
@@ -123,7 +127,7 @@ func TestResponsesToolsAndChoice(t *testing.T) {
 	chat := decodeChat(t, chatBody)
 	tools, ok := chat["tools"].([]any)
 	if !ok || len(tools) != 1 {
-		t.Fatalf("非 function 工具应被丢弃，实际 %#v", chat["tools"])
+		t.Fatalf("function 工具应完整保留，实际 %#v", chat["tools"])
 	}
 	fn := tools[0].(map[string]any)["function"].(map[string]any)
 	if fn["name"] != "f1" || fn["description"] != "d1" {
@@ -132,6 +136,13 @@ func TestResponsesToolsAndChoice(t *testing.T) {
 	tc := chat["tool_choice"].(map[string]any)
 	if tc["type"] != "function" || tc["function"].(map[string]any)["name"] != "f1" {
 		t.Fatalf("tool_choice 未转换: %#v", chat["tool_choice"])
+	}
+}
+
+func TestResponsesUnsupportedToolIsExplicitlyRejected(t *testing.T) {
+	body := []byte(`{"model":"cn:auto","input":"hi","tools":[{"type":"function","name":"f1","parameters":{"type":"object"}},{"type":"web_search"}]}`)
+	if _, _, err := responsesToChat(body); err == nil {
+		t.Fatal("unsupported web_search must not disappear from an otherwise accepted request")
 	}
 }
 
@@ -316,7 +327,7 @@ func TestChatToResponsesNonStream(t *testing.T) {
 			"prompt_cache_hit_tokens": float64(6),
 		},
 	}
-	obj := chatToResponses(chat, "cn:auto")
+	obj := chatToResponses(chat, "cn:auto", nil)
 	if obj["id"] != "resp_abc123" || obj["object"] != "response" {
 		t.Fatalf("id/object 不对: %v / %v", obj["id"], obj["object"])
 	}
@@ -420,5 +431,330 @@ func TestResponsesToolOutputTextStaysString(t *testing.T) {
 	toolMsg := chat["messages"].([]any)[2].(map[string]any)
 	if toolMsg["content"] != "晴 26 度" {
 		t.Fatalf("纯文本 tool 结果应退化成字符串，实际 %#v", toolMsg["content"])
+	}
+}
+
+// ─────────────────────── custom 型工具桥接（Codex exec / apply_patch）───────────────────────
+//
+// 这一组用例锁死的是 Codex 长任务中断的根因：custom 型工具被静默丢弃后，模型看到的
+// 是个「没有 exec / apply_patch」的世界，于是只输出叙述句就结束回合。桥接必须双向互逆。
+
+// 入站：custom 工具定义要折成 function，参数固定 {input:string}。
+func TestResponsesCustomToolBridged(t *testing.T) {
+	body := []byte(`{"model":"cn:auto","input":"hi","tools":[
+		{"type":"function","name":"f1","description":"d1","parameters":{"type":"object"}},
+		{"type":"custom","name":"apply_patch","description":"Apply a patch"},
+		{"type":"custom","name":"exec","description":"Run a command"}
+	]}`)
+	chatBody, _, err := responsesToChat(body)
+	if err != nil {
+		t.Fatalf("翻译失败: %v", err)
+	}
+	chat := decodeChat(t, chatBody)
+	tools, ok := chat["tools"].([]any)
+	if !ok || len(tools) != 3 {
+		t.Fatalf("function + 两个 custom 应共 3 条，实际 %#v", chat["tools"])
+	}
+	byName := map[string]map[string]any{}
+	for _, tl := range tools {
+		m := tl.(map[string]any)
+		if m["type"] != "function" {
+			t.Fatalf("所有出站工具都应是 function 形状: %#v", m)
+		}
+		fn := m["function"].(map[string]any)
+		byName[fn["name"].(string)] = fn
+	}
+	for _, name := range []string{"apply_patch", "exec"} {
+		fn, ok := byName[name]
+		if !ok {
+			t.Fatalf("custom 工具 %s 被丢弃了 —— 这正是 Codex 空转的根因", name)
+		}
+		params := fn["parameters"].(map[string]any)
+		props := params["properties"].(map[string]any)
+		if _, ok := props["input"]; !ok {
+			t.Fatalf("%s 的参数应固定含 input 字段: %#v", name, params)
+		}
+		req := params["required"].([]any)
+		if len(req) != 1 || req[0] != "input" {
+			t.Fatalf("%s 的 required 应为 [input]: %#v", name, req)
+		}
+	}
+	if _, ok := byName["f1"]; !ok {
+		t.Fatal("原生 function 工具被误伤")
+	}
+}
+
+// 入站历史：custom_tool_call / custom_tool_call_output 要折回 chat 的 tool 流量，
+// 否则客户端把上一轮调用写回历史时会被整条丢掉，模型忘记自己刚做过什么。
+func TestResponsesCustomToolCallHistoryFoldBack(t *testing.T) {
+	body := []byte(`{"model":"cn:auto","input":[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"改个文件"}]},
+		{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_abc","name":"apply_patch","input":"*** Begin Patch\n*** End Patch\n"},
+		{"type":"custom_tool_call_output","call_id":"call_abc","output":"Done!"},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"继续"}]}
+	]}`)
+	chatBody, _, err := responsesToChat(body)
+	if err != nil {
+		t.Fatalf("翻译失败: %v", err)
+	}
+	chat := decodeChat(t, chatBody)
+	msgs := chat["messages"].([]any)
+	roles := rolesOf(t, chat)
+
+	var assistant map[string]any
+	for _, m := range msgs {
+		mm := m.(map[string]any)
+		if mm["role"] == "assistant" {
+			assistant = mm
+		}
+	}
+	if assistant == nil {
+		t.Fatalf("custom_tool_call 未折成 assistant 条目，roles=%v", roles)
+	}
+	tcs, ok := assistant["tool_calls"].([]any)
+	if !ok || len(tcs) != 1 {
+		t.Fatalf("assistant 应带一条 tool_calls: %#v", assistant)
+	}
+	fn := tcs[0].(map[string]any)["function"].(map[string]any)
+	if fn["name"] != "apply_patch" {
+		t.Fatalf("工具名丢了: %#v", fn)
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(fn["arguments"].(string)), &args); err != nil {
+		t.Fatalf("参数不是合法 JSON: %v", fn["arguments"])
+	}
+	if args["input"] != "*** Begin Patch\n*** End Patch\n" {
+		t.Fatalf("原始 input 未原样装回: %#v", args["input"])
+	}
+	if tcs[0].(map[string]any)["id"] != "call_abc" {
+		t.Fatalf("call_id 未透传: %#v", tcs[0])
+	}
+
+	var toolMsg map[string]any
+	for _, m := range msgs {
+		mm := m.(map[string]any)
+		if mm["role"] == "tool" {
+			toolMsg = mm
+		}
+	}
+	if toolMsg == nil || toolMsg["tool_call_id"] != "call_abc" || toolMsg["content"] != "Done!" {
+		t.Fatalf("custom_tool_call_output 未折成 tool 消息: %#v", toolMsg)
+	}
+}
+
+// 出站流式：custom 工具要产出 custom_tool_call（带 input），且不发 arguments.delta/done。
+func TestResponsesWriterStreamCustomToolCall(t *testing.T) {
+	rec := httptest.NewRecorder()
+	rw := newResponsesWriter(rec, &responsesRequest{
+		Model: "cn:auto", Stream: true,
+		customTools: map[string]bool{"apply_patch": true},
+	})
+	rw.Header().Set("Content-Type", "text/event-stream")
+	rw.WriteHeader(200)
+	_, _ = rw.Write(sseStream(
+		`{"id":"c3","model":"glm-5.3","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_9","type":"function","function":{"name":"apply_patch","arguments":"{\"input\":\"*** Begin"}}]},"finish_reason":null}]}`,
+		`{"id":"c3","model":"glm-5.3","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":" Patch\"}"}}]},"finish_reason":null}]}`,
+		`{"id":"c3","model":"glm-5.3","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+	))
+	rw.finish()
+
+	names, datas := eventsOf(t, rec.Body.String())
+	for i, n := range names {
+		if n == evArgsDelta || n == evArgsDone {
+			t.Fatalf("custom 工具不该发 %s（Responses 侧无对应事件）: %#v", n, datas[i])
+		}
+	}
+	final := datas[len(datas)-1]["response"].(map[string]any)
+	out := final["output"].([]any)
+	if len(out) != 1 {
+		t.Fatalf("output 应只有一条，实际 %d", len(out))
+	}
+	call := out[0].(map[string]any)
+	if call["type"] != "custom_tool_call" {
+		t.Fatalf("应还原成 custom_tool_call，实际 %v", call["type"])
+	}
+	if call["name"] != "apply_patch" || call["call_id"] != "call_9" {
+		t.Fatalf("name/call_id 不对: %#v", call)
+	}
+	if call["input"] != "*** Begin Patch" {
+		t.Fatalf("input 未从 {input:...} 参数里取出: %#v", call["input"])
+	}
+	if _, hasArgs := call["arguments"]; hasArgs {
+		t.Fatalf("custom_tool_call 不该带 arguments 字段: %#v", call)
+	}
+	if !strings.HasPrefix(call["id"].(string), "ctc_") {
+		t.Fatalf("custom 条目 id 应用 ctc_ 前缀（真实 API 约定）: %#v", call["id"])
+	}
+
+	// 进行中的条目 input 应为空串（与参考仓库一致），完成时才填。
+	for i, n := range names {
+		if n == evItemAdded {
+			item := datas[i]["item"].(map[string]any)
+			if item["type"] != "custom_tool_call" || item["input"] != "" {
+				t.Fatalf("in_progress 条目应为空 input 的 custom_tool_call: %#v", item)
+			}
+		}
+	}
+}
+
+// 出站非流式：同样的还原逻辑走 chatToResponses。
+func TestChatToResponsesCustomToolNonStream(t *testing.T) {
+	chat := map[string]any{
+		"id": "abc999", "object": "chat.completion", "created": float64(1700000000),
+		"model": "glm-5.3",
+		"choices": []any{map[string]any{
+			"index": float64(0), "finish_reason": "tool_calls",
+			"message": map[string]any{
+				"role": "assistant", "content": "",
+				"tool_calls": []any{
+					map[string]any{
+						"id": "call_p", "type": "function",
+						"function": map[string]any{"name": "apply_patch", "arguments": `{"input":"*** Patch ***"}`},
+					},
+					map[string]any{
+						"id": "call_f", "type": "function",
+						"function": map[string]any{"name": "f1", "arguments": `{"a":1}`},
+					},
+				},
+			},
+		}},
+	}
+	obj := chatToResponses(chat, "cn:auto", map[string]bool{"apply_patch": true})
+	// 按类型取，不按序号：message 条目在非流式路径恒产出（既有行为），
+	// 序号断言会被它带偏。
+	var patch, plain map[string]any
+	for _, it := range obj["output"].([]any) {
+		item := it.(map[string]any)
+		switch item["type"] {
+		case "custom_tool_call":
+			patch = item
+		case "function_call":
+			plain = item
+		}
+	}
+	if patch == nil {
+		t.Fatalf("custom 名未还原成 custom_tool_call: %#v", obj["output"])
+	}
+	if patch["name"] != "apply_patch" {
+		t.Fatalf("custom 名丢了: %#v", patch)
+	}
+	if patch["input"] != "*** Patch ***" {
+		t.Fatalf("input 提取错误: %#v", patch["input"])
+	}
+	if patch["call_id"] != "call_p" {
+		t.Fatalf("call_id 未透传: %#v", patch["call_id"])
+	}
+	if !strings.HasPrefix(patch["id"].(string), "ctc_") {
+		t.Fatalf("custom 条目 id 应用 ctc_ 前缀: %#v", patch["id"])
+	}
+	if _, hasArgs := patch["arguments"]; hasArgs {
+		t.Fatalf("custom_tool_call 不该带 arguments 字段: %#v", patch)
+	}
+	if plain == nil {
+		t.Fatal("非 custom 工具丢了")
+	}
+	if plain["arguments"] != `{"a":1}` {
+		t.Fatalf("非 custom 工具应保持 function_call 原样: %#v", plain)
+	}
+	if !strings.HasPrefix(plain["id"].(string), "fc_") {
+		t.Fatalf("普通条目 id 应用 fc_ 前缀: %#v", plain["id"])
+	}
+}
+
+// 参数不是预期形状时原样返回，绝不丢内容。
+func TestCustomInputFromArgsNeverDrops(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{`{"input":"hello"}`, "hello"},
+		{`{"input":""}`, ""},
+		{`not json at all`, "not json at all"},
+		{`{"other":1}`, `{"other":1}`},
+		{`  {"input":"trimmed"}  `, "trimmed"},
+		{``, ""},
+		{`{"input":123}`, "123"},
+	}
+	for _, c := range cases {
+		if got := customInputFromArgs(c.in); got != c.want {
+			t.Fatalf("customInputFromArgs(%q) = %q，期望 %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestResponsesWriterPartialErrorIsFailed(t *testing.T) {
+	rec := httptest.NewRecorder()
+	rw := newResponsesWriter(rec, &responsesRequest{Model: "cn:deepseek-v4.1-flash", Stream: true})
+	rw.Header().Set("Content-Type", "text/event-stream")
+	rw.WriteHeader(200)
+	_, _ = rw.Write(sseStream(
+		`{"choices":[{"index":0,"delta":{"content":"partial 11128"}}]}`,
+		`{"error":{"code":"upstream_error","message":"upstream failed after partial output"}}`,
+	))
+	rw.finish()
+	names, datas := eventsOf(t, rec.Body.String())
+	if len(names) == 0 || names[len(names)-1] != evFailed {
+		t.Fatalf("partial error must end with response.failed: %v", names)
+	}
+	for _, name := range names {
+		if name == evCompleted {
+			t.Fatalf("failed response also emitted completed: %v", names)
+		}
+	}
+	final := datas[len(datas)-1]["response"].(map[string]any)
+	if final["status"] != "failed" {
+		t.Fatalf("partial output hid failure: %v", final)
+	}
+	errObj, _ := final["error"].(map[string]any)
+	if errObj["code"] != "upstream_error" || errObj["message"] != "upstream failed after partial output" {
+		t.Fatalf("error details lost: %v", errObj)
+	}
+	output, _ := final["output"].([]any)
+	if len(output) != 1 || output[0].(map[string]any)["content"].([]any)[0].(map[string]any)["text"] != "partial 11128" {
+		t.Fatalf("failure discarded existing output: %v", output)
+	}
+}
+
+func TestResponsesWriterIncompleteDoesNotCompleteTools(t *testing.T) {
+	for _, tc := range []struct{ reason, detail string }{{"length", "max_output_tokens"}, {"content_filter", "content_filter"}} {
+		t.Run(tc.reason, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			rw := newResponsesWriter(rec, &responsesRequest{Model: "cn:deepseek-v4.1-flash", Stream: true})
+			rw.Header().Set("Content-Type", "text/event-stream")
+			rw.WriteHeader(200)
+			_, _ = rw.Write(sseStream(
+				`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_incomplete","type":"function","function":{"name":"lookup","arguments":"{\"id\":"}}]}}]}`,
+				`{"choices":[{"index":0,"delta":{},"finish_reason":"`+tc.reason+`"}]}`,
+			))
+			rw.finish()
+			names, datas := eventsOf(t, rec.Body.String())
+			if len(names) == 0 || names[len(names)-1] != evIncomplete {
+				t.Fatalf("incomplete terminal lost: %v", names)
+			}
+			sawArgs := false
+			for i, name := range names {
+				if name == evCompleted || name == evArgsDone {
+					t.Fatalf("partial tool was marked complete: %v", names)
+				}
+				if name == evArgsDelta {
+					sawArgs = true
+				}
+				if name == evItemDone && datas[i]["item"].(map[string]any)["status"] == "completed" {
+					t.Fatalf("partial tool item completed: %v", datas[i])
+				}
+			}
+			if !sawArgs {
+				t.Fatal("partial tool arguments disappeared")
+			}
+			final := datas[len(datas)-1]["response"].(map[string]any)
+			if final["status"] != "incomplete" || final["incomplete_details"].(map[string]any)["reason"] != tc.detail {
+				t.Fatalf("incomplete details wrong: %v", final)
+			}
+			out := final["output"].([]any)
+			if len(out) != 1 {
+				t.Fatalf("tool item lost/duplicated: %v", out)
+			}
+			call := out[0].(map[string]any)
+			if call["status"] != "incomplete" || call["arguments"] != `{"id":` {
+				t.Fatalf("partial arguments/status changed: %v", call)
+			}
+		})
 	}
 }

@@ -1,3 +1,5 @@
+// ═══ 更新日志 ═══
+// 2026-09-16：统计读取器保留底层错误，避免带末尾数据的断流被误报为正常 EOF。
 // logging.go 请求级表格日志：每个 /v1/chat/completions 请求结束后打印一行到 stdout。
 package server
 
@@ -64,6 +66,8 @@ type chatStatsReader struct {
 	credit    float64 // 末帧 usage.credit（本次真实扣费，供成本账本）
 	prompt    int     // 末帧 usage.prompt_tokens（与 completion 合计折算单价）
 	pend      []byte  // 已读未返回的行缓存
+	readErr   error
+	dataParts []string
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -88,10 +92,14 @@ func (s *chatStatsReader) TotalTokens() int { return s.prompt + s.tokens }
 // parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens。
 func (s *chatStatsReader) parseSSELine(line string) {
 	line = strings.TrimRight(line, "\r\n")
-	if !strings.HasPrefix(line, "data: ") {
+	if line == "" {
+		s.dataParts = nil
 		return
 	}
-	payload := strings.TrimPrefix(line, "data: ")
+	if !strings.HasPrefix(line, "data:") {
+		return
+	}
+	payload := strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " ")
 	if payload == "[DONE]" {
 		return
 	}
@@ -99,6 +107,8 @@ func (s *chatStatsReader) parseSSELine(line string) {
 		s.seen = true
 		s.ttfb = time.Since(s.start)
 	}
+	s.dataParts = append(s.dataParts, payload)
+	payload = strings.Join(s.dataParts, "\n")
 	var chunk struct {
 		Usage *struct {
 			CompletionTokens int      `json:"completion_tokens"`
@@ -120,13 +130,22 @@ func (s *chatStatsReader) parseSSELine(line string) {
 
 // Read 返回原始数据，同时解析统计 TTFB/token。
 func (s *chatStatsReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	if len(s.pend) > 0 {
 		n := copy(p, s.pend)
 		s.pend = s.pend[n:]
 		return n, nil
 	}
+	if s.readErr != nil {
+		err := s.readErr
+		s.readErr = nil
+		return 0, err
+	}
 	line, err := s.br.ReadString('\n')
 	if line != "" {
+		s.readErr = err
 		s.parseSSELine(line)
 		s.pend = []byte(line)
 		n := copy(p, s.pend)

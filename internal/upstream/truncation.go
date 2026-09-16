@@ -7,6 +7,9 @@
 //
 // 关键区分：只把「非空但无法解析」视为截断。空串是合法的无参数工具；能解析但类型不对
 // （标量 / 数组）属于模型输出错误，交给客户端 schema 校验回传即可，不在此判定。
+// ═══ 更新日志 ═══
+// 2026-09-16：结束校验覆盖所有成功终态；只检验 JSON 语法，避免把大数等合法参数误判为残缺。
+// 2026-09-16：不完整终态也过滤完全缺失或类型错误的参数，显式空字符串继续保留。
 package upstream
 
 import (
@@ -23,8 +26,7 @@ func isTruncatedArguments(raw string) bool {
 	if trimmed == "" {
 		return false
 	}
-	var v any
-	return json.Unmarshal([]byte(trimmed), &v) != nil
+	return !json.Valid([]byte(trimmed))
 }
 
 // dropTruncatedToolCalls 过滤出 arguments 完整的 tool_call（返回新 slice）。
@@ -34,11 +36,10 @@ func dropTruncatedToolCalls(calls []map[string]any) []map[string]any {
 	for _, call := range calls {
 		fn, _ := call["function"].(map[string]any)
 		if fn == nil {
-			kept = append(kept, call)
 			continue
 		}
-		args, _ := fn["arguments"].(string)
-		if isTruncatedArguments(args) {
+		args, exists := fn["arguments"].(string)
+		if !exists || isTruncatedArguments(args) {
 			continue
 		}
 		kept = append(kept, call)

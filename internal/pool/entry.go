@@ -85,15 +85,15 @@ type entry struct {
 	// （比 NoteModelCost 的 0.3 更平滑——选号权重不应被单次成败主导）。
 	// 持久化（stateAccount.SuccessEMA/ErrorEMA）；旧 state.json 缺字段时从
 	// successCount/errTotal 反推初始值（向后兼容）。
-	successEMA float64
-	errorEMA   float64
-	lastErr         time.Time // 最近一次错误时间
-	lastSuccess     time.Time // 最近一次成功时间
-	coolKind        CoolKind
-	until           time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
-	disabled        bool
-	reason          string
-	lastUsed        time.Time // 最近被选中时刻（防并发撞号）
+	successEMA  float64
+	errorEMA    float64
+	lastErr     time.Time // 最近一次错误时间
+	lastSuccess time.Time // 最近一次成功时间
+	coolKind    CoolKind
+	until       time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
+	disabled    bool
+	reason      string
+	lastUsed    time.Time // 最近被选中时刻（防并发撞号）
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效（高并发/低精度时钟下：

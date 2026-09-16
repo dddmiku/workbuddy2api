@@ -1,22 +1,10 @@
+// ═══ 更新日志 ═══
+// 2026-09-17：保留取消等待回归，并按既有任务日志隔离契约验证批量任务全部完成。
 package scheduler
-
-// parallel_test.go P1-3 调度器去串行化 + sleep 可取消化（TDD RED，先于实现提交）。
-//
-// 对应审查报告 comprehensive-code-review.md HIGH 发现 3：六类任务共用一个派发
-// goroutine，time.Sleep 不响应 ctx 取消——活跃上报 54 号 × 5 条 ≈ 7-8 分钟纯
-// 睡眠阻塞同槽其他任务族，优雅停机要等 sleep 醒来。本文件断言修复后的行为：
-//  1. sleepCtx：d<=0 立即放行；等满返回 true；ctx 取消立即返回 false；
-//  2. runActivity/runTravel：账号间限速等待中取消 ctx，遍历立即退出（不等
-//     sleep 醒来），后续账号不再发起上游调用；
-//  3. runBatch：同一唤醒时刻的多类任务并行派发——签到占用 /daily-checkin
-//     窗口期间，活跃上报的 /v2/report 已能发出（串行派发时必然落在窗口之后）。
-//
-// 本提交为 RED：引用尚未实现的 sleepCtx / runActivity / runTravel / runBatch，
-// 编译失败即 RED 证据；下一提交补实现转 GREEN。账号间延迟值不变（800ms/
-// 1500ms），只换等待方式，fastActivity/fastTravel 置 0 的既有测试不受影响。
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -179,70 +167,86 @@ func TestRunTravelCtxCancelsDuringAccountDelay(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// 同槽多类任务并行派发：慢任务族不再阻塞其他任务族
-// ---------------------------------------------------------------------------
-
-// TestRunBatchFiresKindsInParallel 同一唤醒时刻的两类任务并行执行：
-// 签到 handler 在 /daily-checkin 窗口内等 /v2/report 的信号（握手）——并行派发时
-// report 随时可达（checkin 不阻塞 activity）；串行派发时 report 只会在 checkin
-// 结束后才发出，checkin 等信号必然超时 → overlap=false。
-// 账号 token 未过期（不触发 refresh 写 AccessToken），与 activity 读并发，
-// 保证 -race 干净（refresh 写 vs report 读属既有 chat/keepalive 同款并发面）。
-func TestRunBatchFiresKindsInParallel(t *testing.T) {
+// 同时到期的任务都要执行；当前日志接收器需要串行执行，避免任务日志互相覆盖。
+func TestRunBatchCompletesKindsWithIsolatedLogs(t *testing.T) {
 	fastActivity(t)
 	fastTravel(t)
-
-	reportSeen := make(chan struct{})
-	var reportOnce sync.Once
-	var overlap atomic.Bool
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondStarted := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseFirst) }) }
+	defer release()
+	var entries, active, maximum atomic.Int32
 	var checkinCalls, reportCalls atomic.Int32
+	enter := func(marker string) {
+		now := active.Add(1)
+		for old := maximum.Load(); now > old && !maximum.CompareAndSwap(old, now); old = maximum.Load() {
+		}
+		if entries.Add(1) == 1 {
+			close(firstStarted)
+			<-releaseFirst
+		} else {
+			close(secondStarted)
+		}
+		log.Print(marker)
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/daily-checkin"):
 			checkinCalls.Add(1)
-			// 窗口内等 report 信号：并行时 report 在 checkin 进行中可达；
-			// 串行时 report 落在窗口之后，2s 超时 → overlap 保持 false。
-			select {
-			case <-reportSeen:
-				overlap.Store(true)
-			case <-time.After(2 * time.Second):
-			}
+			enter("fixture_checkin_only")
+			defer active.Add(-1)
 			w.Write([]byte(`{"code":0,"msg":"ok","data":{}}`))
 		case strings.HasSuffix(r.URL.Path, "/get-user-resource"):
 			w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CycleCapacitySize":100,"CycleCapacityRemain":500,"CycleCapacityUsed":0}]}}}}`))
 		case strings.HasSuffix(r.URL.Path, "/v2/report"):
 			reportCalls.Add(1)
-			reportOnce.Do(func() { close(reportSeen) })
+			enter("fixture_activity_only")
+			defer active.Add(-1)
 			w.Write([]byte(`{"code":0,"msg":"OK"}`))
 		default:
-			http.Error(w, "not found", 404) // streak 自检 / buddy-info 等，无需模拟
+			http.Error(w, "not found", 404)
 		}
 	}))
 	defer srv.Close()
-
+	// 必须先释放握手，再等待HTTP服务退出，避免失败路径挂住测试。
+	defer release()
 	p := pool.New("")
 	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
-	s := New(Config{Pool: p, Upstream: up})
-
+	scheduler := New(Config{Pool: p, Upstream: up})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})
-	go func() {
-		s.runBatch(ctx, []taskKind{taskCheckin, taskActivity})
-		close(done)
-	}()
+	go func() { scheduler.runBatch(ctx, []taskKind{taskCheckin, taskActivity}); close(done) }()
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first task did not start")
+	}
+	select {
+	case <-secondStarted:
+		t.Error("task operations overlapped while the first task held its log context")
+	case <-time.After(25 * time.Millisecond):
+	}
+	release()
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("runBatch 未在 5s 内完成")
+	case <-time.After(3 * time.Second):
+		t.Fatal("batch did not complete")
 	}
-
-	if checkinCalls.Load() != 1 || reportCalls.Load() != 1 {
-		t.Fatalf("checkin=%d report=%d want 1/1", checkinCalls.Load(), reportCalls.Load())
+	if checkinCalls.Load() != 1 || reportCalls.Load() != 1 || maximum.Load() != 1 {
+		t.Fatalf("checkin=%d activity=%d concurrent=%d", checkinCalls.Load(), reportCalls.Load(), maximum.Load())
 	}
-	if !overlap.Load() {
-		t.Error("checkin 与 activity 未并行：/v2/report 未落在 /daily-checkin 窗口内（同槽串行阻塞）")
+	for _, test := range []struct{ key, own, other string }{{"checkin", "fixture_checkin_only", "fixture_activity_only"}, {"activity", "fixture_activity_only", "fixture_checkin_only"}} {
+		lines, err := scheduler.TaskLog(test.key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := strings.Join(lines, "\n")
+		if !strings.Contains(text, test.own) || strings.Contains(text, test.other) {
+			t.Errorf("%s task log mixed or lost operation output: %s", test.key, text)
+		}
 	}
 }

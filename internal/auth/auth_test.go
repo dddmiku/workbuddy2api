@@ -1,3 +1,5 @@
+// ═══ 更新日志 ═══
+// 2026-09-16：原子保存改用唯一临时文件，旧 .tmp 目录夹具改验兼容；真实保存失败另由 credential_integrity_test 覆盖。
 package auth
 
 import (
@@ -185,17 +187,15 @@ func TestLoadDirBackfillsRealm(t *testing.T) {
 	}
 }
 
-// TestLoadDirBackfillWriteFailureDoesNotBlock 单个文件 backfill 落盘失败（tmp 预置目录
-// 使 WriteFile 失败）不阻断启动：其他文件照常迁移，LoadDir 不向上抛错。
-// （历史纯 CN auth 目录一次性迁移时，个别文件不可写不应让整个服务起不来。）
-func TestLoadDirBackfillWriteFailureDoesNotBlock(t *testing.T) {
+// TestLoadDirLegacyTempDoesNotBlockBackfill 旧固定 .tmp 路径留下目录时，唯一临时文件仍能正常保存与启动。
+func TestLoadDirLegacyTempDoesNotBlockBackfill(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	good := `{"auth":{"accessToken":"at","refreshToken":"r","expiresAt":1,"domain":"www.workbuddy.ai"},"account":{"uid":"g1"}}`
 	if err := os.WriteFile(filepath.Join(dir, "workbuddy-g1.json"), []byte(good), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// 预置同名 .tmp 目录 → SaveAtomic 的 os.WriteFile(".tmp") 报 is a directory。
+	// 遗留的固定 .tmp 目录不再与本次保存使用的唯一临时文件冲突。
 	if err := os.Mkdir(filepath.Join(dir, "workbuddy-c1.json.tmp"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +206,7 @@ func TestLoadDirBackfillWriteFailureDoesNotBlock(t *testing.T) {
 
 	list, err := LoadDir(dir)
 	if err != nil {
-		t.Fatalf("load err=%v want nil (write failure must not block startup)", err)
+		t.Fatalf("load err=%v want nil (legacy temp path must not block startup)", err)
 	}
 	if len(list) != 2 {
 		t.Fatalf("want 2 accounts loaded, got %d", len(list))
@@ -216,6 +216,14 @@ func TestLoadDirBackfillWriteFailureDoesNotBlock(t *testing.T) {
 	b, _ := Parse(raw)
 	if b.RealmStored() != "global" {
 		t.Errorf("good file realm=%q want global (migration should succeed)", b.RealmStored())
+	}
+	raw, err = os.ReadFile(filepath.Join(dir, "workbuddy-c1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err = Parse(raw)
+	if err != nil || b.RealmStored() != "cn" {
+		t.Fatalf("legacy temp directory blocked backfill: %v", err)
 	}
 }
 

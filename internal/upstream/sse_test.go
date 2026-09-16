@@ -1,8 +1,13 @@
+// ═══ 更新日志 ═══
+// 2026-09-16：成功流夹具使用合法工具参数；只有明确结束才允许补 DONE，空流验证真实错误。
+// 2026-09-17：保留 fork 错误详情透传断言，错误返回改验 typed 失败，并覆盖完整错误信封与数字字面量。
 package upstream
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -227,7 +232,7 @@ func TestStreamToolCallNameOnce(t *testing.T) {
 	const nFrames = 11
 	var sb strings.Builder
 	for i := 0; i < nFrames; i++ {
-		sb.WriteString(`data: {"id":"x1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"Bash","arguments":"arg` + string(rune('0'+i)) + `"}}]}}]}`)
+		sb.WriteString(`data: {"id":"x1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"Bash","arguments":"` + strconv.Itoa(i+1) + `"}}]}}]}`)
 		sb.WriteString("\n\n")
 	}
 	sb.WriteString("data: [DONE]\n\n")
@@ -254,7 +259,7 @@ func TestStreamToolCallNameOnce(t *testing.T) {
 				t.Errorf("frame %d unexpected name=%v (name 只能出现在首帧且为 Bash)", i, fn["name"])
 			}
 		}
-		if want := "arg" + string(rune('0'+i)); fn["arguments"] != want {
+		if want := strconv.Itoa(i + 1); fn["arguments"] != want {
 			t.Errorf("frame %d arguments=%v want %q", i, fn["arguments"], want)
 		}
 	}
@@ -268,8 +273,8 @@ func TestStreamToolCallNameOnce(t *testing.T) {
 func TestStreamToolCallParallelFragments(t *testing.T) {
 	raw := "data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_0\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",\"arguments\":\"\"}}]}}]}\n\n" +
 		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Read\",\"arguments\":\"\"}}]}}]}\n\n" +
-		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"Bash\",\"arguments\":\"a0\"}}]}}]}\n\n" +
-		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"name\":\"Read\",\"arguments\":\"a1\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"Bash\",\"arguments\":\"10\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"name\":\"Read\",\"arguments\":\"11\"}}]}}]}\n\n" +
 		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
 		"data: [DONE]\n\n"
 
@@ -296,12 +301,12 @@ func TestStreamToolCallParallelFragments(t *testing.T) {
 			}
 		}
 	}
-	// 每个 index 恰好出现一次 name，arguments 逐片原样（a0/a1 各自保留）
+	// 每个 index 恰好出现一次 name，arguments 逐片原样（合法数字 10/11 各自保留）
 	if nameCount[0] != 1 || nameCount[1] != 1 {
 		t.Errorf("name 出现次数 index0=%d index1=%d，各 want 1", nameCount[0], nameCount[1])
 	}
-	if argByIndex[0] != "a0" || argByIndex[1] != "a1" {
-		t.Errorf("arguments index0=%q index1=%q want a0/a1", argByIndex[0], argByIndex[1])
+	if argByIndex[0] != "10" || argByIndex[1] != "11" {
+		t.Errorf("arguments index0=%q index1=%q want 10/11", argByIndex[0], argByIndex[1])
 	}
 }
 
@@ -309,8 +314,8 @@ func TestStreamToolCallParallelFragments(t *testing.T) {
 // 键缺失是比空串更安全的形态，客户端「键缺失则保留旧值」不会清空工具名。
 func TestStreamToolCallNoiseEmptyName(t *testing.T) {
 	raw := "data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"\"}}]}}]}\n\n" +
-		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"arg1\"}}]}}]}\n\n" +
-		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"arg2\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"{\"}}]}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"}\"}}]}}]}\n\n" +
 		"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
 		"data: [DONE]\n\n"
 
@@ -555,9 +560,9 @@ func TestStreamNoIdFallsBackToSentinel(t *testing.T) {
 }
 
 func TestStreamDoneFallback(t *testing.T) {
-	// 上游流在无 [DONE] 时 EOF，Stream 必须兜底写一个 [DONE]
+	// 上游已有明确 finish_reason、只漏发 [DONE] 时，Stream 可补一个传输结束标记。
 	rec := httptest.NewRecorder()
-	err := Stream(rec, strings.NewReader("data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+	err := Stream(rec, strings.NewReader("data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -708,7 +713,7 @@ func TestStreamEmptyFramesCase(t *testing.T) {
 						continue
 					}
 					if json.Unmarshal([]byte(payload), &e) == nil {
-						if em, ok := e["error"].(map[string]any); ok && em["message"] == "empty upstream stream" && em["type"] == "upstream_error" {
+						if em, ok := e["error"].(map[string]any); ok && em["message"] == "upstream stream contained no valid data events" && em["type"] == "upstream_error" && em["code"] == "empty_upstream" {
 							found = true
 						}
 					}
@@ -731,8 +736,9 @@ func TestStreamMidStreamErrorFramePassthrough(t *testing.T) {
 		"data: [DONE]\n\n"
 
 	rec := httptest.NewRecorder()
-	if err := Stream(rec, strings.NewReader(raw)); err != nil {
-		t.Fatal(err)
+	var streamErr *StreamError
+	if err := Stream(rec, strings.NewReader(raw)); !errors.As(err, &streamErr) {
+		t.Fatalf("upstream error must return a typed failure while preserving its frame: %v", err)
 	}
 	body := rec.Body.String()
 	// 错误帧原文存续：message/code/requestId 都在。
@@ -747,6 +753,24 @@ func TestStreamMidStreamErrorFramePassthrough(t *testing.T) {
 	// 干净帧仍被规范化透传（error 帧不计入规范化路径，不影响普通帧）。
 	if !strings.Contains(body, `"role":"assistant"`) || !strings.Contains(body, `"content":"hello"`) {
 		t.Errorf("clean frame missing or not normalized: %q", body)
+	}
+}
+
+// 错误信封可能把 requestId 放在 error 对象外；数值诊断字段也不得经 float64 改写。
+func TestStreamErrorEnvelopePassthrough(t *testing.T) {
+	raw := "event: error\ndata: {\"requestId\":\"synthetic-request\",\n" +
+		"data: \"diagnostic_id\":9007199254740993,\"error\":{\"message\":\"failed\",\"code\":\"upstream_error\"}}\n\n"
+	rec := httptest.NewRecorder()
+	var streamErr *StreamError
+	if err := Stream(rec, strings.NewReader(raw)); !errors.As(err, &streamErr) {
+		t.Fatalf("expected typed upstream failure, got %v", err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"requestId":"synthetic-request"`) || !strings.Contains(body, `"diagnostic_id":9007199254740993`) {
+		t.Fatalf("upstream error envelope changed: %s", body)
+	}
+	if strings.Count(body, "data: [DONE]") != 1 || strings.Count(body, `"error"`) != 1 {
+		t.Fatalf("failure should have one error frame and one closing delimiter: %s", body)
 	}
 }
 
@@ -773,14 +797,14 @@ func TestStreamGarbageAfterDone(t *testing.T) {
 }
 
 // TestStreamNormalPassthroughRegression 校验正常透传回归：帧被 normalize 后透传、
-// 末尾恰好一个 [DONE]、无 error 帧；上游漏发 DONE 时自动补。
+// 末尾恰好一个 [DONE]、无 error 帧；有 finish_reason、漏发 DONE 时自动补。
 func TestStreamNormalPassthroughRegression(t *testing.T) {
 	cases := []struct {
 		name string
 		raw  string
 	}{
 		{"带 DONE 的正常流", sseFixture},
-		{"漏发 DONE 自动补", "data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"},
+		{"已有 finish、漏发 DONE 自动补", "data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

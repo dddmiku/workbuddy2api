@@ -37,8 +37,22 @@ backups/
 LOOP.md
 PLAN.md
 SPEC.md
-docs/
 
 # 设计/计划文档（但 README.md 必须进版本库）
-*.md
-!README.md
+
+# Runtime credentials, backups, and diagnostic captures
+/auths-trash/
+/config.json.*
+/artifacts/
+*.tmp-*
+*.bak
+*.bak.*
+*.bak-*
+*.before-*
+*.old.*
+*.log
+/real_input.json
+/big_payload.json
+**/*-wire-*.request.json
+/trial_bin
+/activity_bin

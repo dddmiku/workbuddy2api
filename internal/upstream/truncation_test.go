@@ -1,3 +1,5 @@
+// ═══ 更新日志 ═══
+// 2026-09-16：验证正常终态也拒绝残缺参数，并保留 length、合法 JSON 大数与无参数工具。
 package upstream
 
 import (
@@ -17,6 +19,7 @@ func TestIsTruncatedArguments(t *testing.T) {
 		{`{"a":1}`, false},          // 合法对象
 		{"null", false},             // 能解析（类型错误交给 schema，非截断）
 		{"[1,2]", false},            // 能解析（数组非对象，非截断）
+		{"1e999", false},            // 合法 JSON 数字，不由网关限制调用方数值精度
 		{`{"command": "ls -`, true}, // 半截 JSON
 		{`{"a":`, true},             // 半截键
 		{`\deveco-code-rust\crates\deveco`, true}, // 非 JSON 文本
@@ -37,10 +40,10 @@ func TestDropTruncatedToolCalls(t *testing.T) {
 		{"id": "nofn"},
 	}
 	out := dropTruncatedToolCalls(calls)
-	if len(out) != 3 {
-		t.Fatalf("dropped=%d want 3, out=%#v", len(out), out)
+	if len(out) != 2 {
+		t.Fatalf("kept=%d want 2, out=%#v", len(out), out)
 	}
-	if out[0]["id"] != "ok" || out[1]["id"] != "empty" || out[2]["id"] != "nofn" {
+	if out[0]["id"] != "ok" || out[1]["id"] != "empty" {
 		t.Fatalf("order/kept wrong: %#v", out)
 	}
 }
@@ -94,9 +97,8 @@ data: [DONE]
 	}
 }
 
-// TestAggregateToolCallsNormalFinishUntouched finish_reason==tool_calls（非 length）
-// → 截断检测不触发，既有行为不变（残缺参数透传由既有路径处理）。
-func TestAggregateToolCallsNormalFinishUntouched(t *testing.T) {
+// TestAggregateToolCallsNormalFinishRejectsPartial 不允许成功终态掩盖残缺工具参数。
+func TestAggregateToolCallsNormalFinishRejectsPartial(t *testing.T) {
 	raw := `data: {"id":"x1","model":"m","created":1,"choices":[{"index":0,"delta":{"content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{\"file_path\":"},"index":0}]}}]}
 
 data: {"id":"x1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
@@ -105,12 +107,7 @@ data: [DONE]
 
 `
 	resp, err := Aggregate(strings.NewReader(raw))
-	if err != nil {
-		t.Fatal(err)
-	}
-	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
-	calls, ok := msg["tool_calls"].([]map[string]any)
-	if !ok || len(calls) != 1 {
-		t.Fatalf("non-length finish must keep tool_calls as-is (zero-change): %#v", msg)
+	if err == nil || resp != nil {
+		t.Fatalf("partial tool arguments became a successful completion: resp=%#v err=%v", resp, err)
 	}
 }

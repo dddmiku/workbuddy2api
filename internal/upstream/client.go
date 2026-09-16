@@ -1,5 +1,9 @@
 // Package upstream 封装对 CodeBuddy 上游（chat / billing / auth）的全部 HTTP 调用，
 // 以及错误分类（驱动 pool 冷却状态机）。
+// ═══ 更新日志 ═══
+// 2026-09-16：请求全程使用同一凭据快照，同账号刷新合并并由 Auth 原子提交，消除刷新与聊天/模型/计费的竞争。
+// 2026-09-16：把明确的未批准渠道错误与内容策略拦截分开，避免伪造违禁词原因。
+// 2026-09-17：合并较新模型目录、限流及传输修复，并保留请求快照与刷新合并以防回归。
 package upstream
 
 import (
@@ -24,18 +28,19 @@ import (
 type ErrKind int
 
 const (
-	ErrNone           ErrKind = iota // 成功
-	ErrHardCredit                    // 余额不足（402 或 body 关键词）→ 长冷却
-	ErrSoftRate                      // 429 软限流 → 短冷却
-	ErrSessionDead                   // 401 + 12153 offline session 失效 → 禁用
-	ErrNotFound                      // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
-	ErrServer                        // 5xx 上游故障
-	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
-	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 不罚账号，仍轮转
-	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
-	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
-	ErrClient                        // 其他 4xx / 业务错误
-	ErrContextTooLong                // 上下文超限（11115 prompt is too long）→ 请求终态，不轮转、透传原文
+	ErrNone            ErrKind = iota // 成功
+	ErrHardCredit                     // 余额不足（402 或 body 关键词）→ 长冷却
+	ErrSoftRate                       // 429 软限流 → 短冷却
+	ErrSessionDead                    // 401 + 12153 offline session 失效 → 禁用
+	ErrNotFound                       // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
+	ErrServer                         // 5xx 上游故障
+	ErrContentBlocked                 // 内容策略拦截：不罚账号，返回错误并保留原请求内容
+	ErrBadParams                      // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 请求终态，不轮转
+	ErrAccountFault                   // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
+	ErrModelBlocked                   // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
+	ErrClient                         // 其他 4xx / 业务错误
+	ErrContextTooLong                 // 上下文超限（11115 prompt is too long）→ 请求终态，不轮转、透传原文
+	ErrChannelRejected                // 明确拒绝未批准的调用渠道：请求终态，不推断为内容违规
 )
 
 func (k ErrKind) String() string {
@@ -62,6 +67,8 @@ func (k ErrKind) String() string {
 		return "client"
 	case ErrContextTooLong:
 		return "context_too_long"
+	case ErrChannelRejected:
+		return "channel_rejected"
 	default:
 		return "none"
 	}
@@ -164,14 +171,10 @@ var sessionDeadRule = errorRule{kind: ErrSessionDead, mode: matchExact, patterns
 
 // contentBlockedRule 内容策略拦截关键词（大小写不敏感子串匹配）。
 //
-// 定位：上游按逐字精确指纹审核，system 来源的模板句（如 Claude Code/Codex
-// 注入指令）触发 HTTP 400 + 以下文案。这是「误报」（合法流量被审核误杀），
-// 非账号问题——该账号余额健康、未限流、session 未死，故 ErrContentBlocked
-// 在 applyErrorPolicy 中不罚账号（无冷却/熔断/NoteError），改由网关降级重试。
+// 泛化的安全策略文案保留原分类；若主错误明确指出调用渠道未获批准，
+// Classify 会先返回 ErrChannelRejected，不能据此给调用者安上内容违规原因。
 var contentBlockedRule = errorRule{kind: ErrContentBlocked, mode: matchLower, patterns: []string{
 	"blocked by security policy",
-	"unapproved channel",
-	"illegal api invocation",
 }}
 
 // contentBlockedClientMsg 内容拦截返回给调用方的固定文案。
@@ -397,11 +400,35 @@ func ParseRateReset(body string) (time.Time, bool) {
 	return t, true
 }
 
+// isUnapprovedChannel 只依据主错误文案识别已观测的渠道拒绝。
+// code=11128、泛化 displayMsg 或回显请求中的同名文本均不能单独证明拒绝原因。
+func isUnapprovedChannel(body string) bool {
+	message := body
+	var envelope map[string]json.RawMessage
+	if json.Unmarshal([]byte(body), &envelope) == nil && envelope != nil {
+		message = ""
+		_ = json.Unmarshal(envelope["msg"], &message)
+		if message == "" {
+			var upstreamError struct {
+				Message string `json:"message"`
+			}
+			if json.Unmarshal(envelope["error"], &upstreamError) == nil {
+				message = upstreamError.Message
+			}
+		}
+	}
+	message = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(message), "."))
+	return strings.EqualFold(message, "Illegal API invocation from an unapproved channel") ||
+		strings.EqualFold(message, "unapproved channel")
+}
+
 // Classify 按 HTTP 状态码 + body 判定错误类别。
 //
 // 判定顺序自「严」到「宽」，每层的先后都有语义依据：
 //  0. 11102（IsModelBlocked）——「该后端无此模型」确定性答复，语义最具体，最先判
 //     （详见 IsModelBlocked 注释）。
+//
+// 之后在 HTTP 402 判定后识别明确渠道主错误，先于宽泛内容/额度关键词。
 //  1. 402 / hardRule —— 计费额度耗尽，最严、最不可自愈，必须最先判。
 //     "quota exceeded" 语义跨计费/限流两界，历史归 hard_credit，本次保持不变
 //     （issue #28 已记录该反向误判风险，待上游原始响应确认后再定）。
@@ -431,6 +458,9 @@ func Classify(status int, body string) ErrKind {
 	}
 	if status == http.StatusPaymentRequired {
 		return ErrHardCredit
+	}
+	if isUnapprovedChannel(body) {
+		return ErrChannelRejected
 	}
 	lower := strings.ToLower(body)
 	if hardRule.hit(body, lower) {
@@ -513,7 +543,7 @@ type Client struct {
 	// 见 global_models.go。按实例持有，测试新建 Client 即隔离。
 	globalModels fetchGlobalModelsCache
 
-	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
+	// SanitizeFingerprints 兼容旧配置；已废弃，不再清洗或替换业务文本。
 	SanitizeFingerprints bool
 
 	// OutboundImageBudgetBytes 出站请求体字节预算（<=0 = 不裁剪）。
@@ -588,7 +618,7 @@ func New() *Client {
 	return &Client{
 		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
-		SanitizeFingerprints: true,
+		SanitizeFingerprints: false,
 		ChatBaseCN:           "https://copilot.tencent.com",
 		BillingBaseCN:        "https://www.codebuddy.cn",
 	}
@@ -634,7 +664,7 @@ func (c *Client) chatBase(a *auth.Auth) string {
 	return c.ChatBaseCN
 }
 
-// prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
+// prepareBody 组装出站请求体；SanitizeFingerprints 仅兼容旧配置，不再改写正文。
 // 显式传 realm 使 effort 降级按域取桶：CN 探测信息不得作用到 global 请求（C-2）。
 // conversationID 为网关解析出的会话标识（用于 prompt_cache_key 注入的会话段；
 // body 里自带 conversation_id 时以 body 为准）。uid8 来自账号 UID，是跨账号硬隔离段。
@@ -791,89 +821,45 @@ func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 	return env.Data, nil
 }
 
-// refreshIOTimeout 单次 refresh 网络调用的总时长上限。
-// 远小于 HTTP.Client.Timeout(120s)：refresh 持锁窗口内做网络 I/O，超时越短，
-// 单账号 hang 对该账号相关操作的阻塞越短（issue:持锁 120s I/O → 池级停滞）。
+// refreshIOTimeout 单次 refresh 网络调用的总时长上限；网络调用不持凭据锁。
 const refreshIOTimeout = 30 * time.Second
 
 // RefreshToken 刷新 access token；成功时更新 a 的字段（缺省值保留旧值），
 // 调用方负责 SaveAtomic。
 //
-// 并发安全模型（两段式，缩小持锁窗口）：
-//   - 锁内仅做「读 refreshToken 快照」与「校验未变后写回新 token」两小段内存操作；
-//   - 网络 I/O（doJSON）在**锁外**执行，带 30s ctx 超时——避免上游 hang 时长时间
-//     独占 a.mu，阻塞同账号的 SaveAtomic / 其他刷新（issue:持锁 120s I/O）。
-//   - 写回前重新校验快照一致性：若锁外期间另一 goroutine 已完成刷新（refreshToken
-//     已变），本次结果直接采用（新 token 已生效），不再重复写回。
+// 同账号并发刷新由 Auth.RefreshOnce 合并；URL 与全部头字段使用同一凭据快照。
 func (c *Client) RefreshToken(a *auth.Auth) error {
-	// 第 1 段（锁内）：读快照。
-	a.Lock()
-	rtSnapshot := a.RefreshToken
-	atBefore := a.AccessToken
-	a.Unlock()
-	if strings.TrimSpace(rtSnapshot) == "" {
-		return fmt.Errorf("no refreshToken")
-	}
-
-	url := c.chatBase(a) + "/v2/plugin/auth/token/refresh"
-	ctx, cancel := context.WithTimeout(context.Background(), refreshIOTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
-	if err != nil {
-		return err
-	}
-	// RefreshHeaders 读取 a 的字段（domain/uid 等）注入请求头——需在锁内取快照值，
-	// 用一个显式逐字段拷贝的临时 auth 构造头（不拷贝 sync.Mutex，避免 vet copies-lock）。
-	a.Lock()
-	hdrSnapshot := auth.Auth{
-		AccessToken:  a.AccessToken,
-		RefreshToken: rtSnapshot,
-		ExpiresAt:    a.ExpiresAt,
-		Domain:       a.Domain,
-		UID:          a.UID,
-		EnterpriseID: a.EnterpriseID,
-		Nickname:     a.Nickname,
-		DeviceToken:  a.DeviceToken,
-	}
-	a.Unlock()
-	c.RefreshHeaders(req, &hdrSnapshot)
-
-	// 网络 I/O（锁外，30s 上限）。
-	data, err := c.doJSON(req)
-	if err != nil {
-		return err
-	}
-	var tok struct {
-		AccessToken  string `json:"accessToken"`
-		RefreshToken string `json:"refreshToken"`
-		ExpiresIn    int64  `json:"expiresIn"`
-		Domain       string `json:"domain"`
-	}
-	if err := json.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
-		return fmt.Errorf("refresh_failed: no accessToken in response — re-login required")
-	}
-
-	// 第 2 段（锁内）：校验快照一致后写回。
-	a.Lock()
-	defer a.Unlock()
-	if a.AccessToken != atBefore && a.RefreshToken != rtSnapshot {
-		// 锁外期间另一 goroutine 已完成刷新：新 token 已生效，本次结果不必再写
-		// （两个并发刷新拿到的新 token 都有效，后写会覆盖先写，但二者等价可用；
-		// 提前返回避免无意义覆盖与 ExpiresAt 抖动）。
-		return nil
-	}
-	a.AccessToken = tok.AccessToken
-	if tok.RefreshToken != "" {
-		a.RefreshToken = tok.RefreshToken
-	}
-	if tok.Domain != "" {
-		a.Domain = tok.Domain
-	}
-	// preserveExpiry：响应缺 expiresIn 时保留旧过期时间，避免刷新风暴。
-	if tok.ExpiresIn > 0 {
-		a.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
-	}
-	return nil
+	return a.RefreshOnce(func(snapshot *auth.Auth) (auth.TokenUpdate, error) {
+		if strings.TrimSpace(snapshot.RefreshToken) == "" {
+			return auth.TokenUpdate{}, fmt.Errorf("no refreshToken")
+		}
+		url := c.chatBase(snapshot) + "/v2/plugin/auth/token/refresh"
+		ctx, cancel := context.WithTimeout(context.Background(), refreshIOTimeout)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+		if err != nil {
+			return auth.TokenUpdate{}, err
+		}
+		c.RefreshHeaders(req, snapshot)
+		data, err := c.doJSON(req)
+		if err != nil {
+			return auth.TokenUpdate{}, err
+		}
+		var tok struct {
+			AccessToken  string `json:"accessToken"`
+			RefreshToken string `json:"refreshToken"`
+			ExpiresIn    int64  `json:"expiresIn"`
+			Domain       string `json:"domain"`
+		}
+		if err := json.Unmarshal(data, &tok); err != nil || strings.TrimSpace(tok.AccessToken) == "" {
+			return auth.TokenUpdate{}, fmt.Errorf("refresh_failed: no accessToken in response — re-login required")
+		}
+		update := auth.TokenUpdate{AccessToken: tok.AccessToken, RefreshToken: tok.RefreshToken, Domain: tok.Domain}
+		if tok.ExpiresIn > 0 {
+			update.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
+		}
+		return update, nil
+	})
 }
 
 // chatPath 按 realm 返回 chat 端点路径（不含 base）：
@@ -912,6 +898,7 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta Cha
 // r.Context() 后，客户端断连/请求取消会立即中断在途上游调用、释放连接与账号在途名额，
 // 不再空转到 IdleTimeout。ctx 为 nil 时回落 Background。
 func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
+	a = a.Snapshot()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1115,6 +1102,8 @@ func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 // （credits 等字段以 v3 为准），企业端点只补 v3 缺失的模型。/v3 失败（400/网络错/解析
 // 失败）不拖累企业端点结果——降级为仅企业端点，warn 日志；反之亦然（两路独立容错）。
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
+	// 两路目录探测共享同一代凭据，后续刷新不能改变本轮路由或缓存归属。
+	a = a.Snapshot()
 	type probeResult struct {
 		infos []ModelInfo
 		err   error
@@ -1197,6 +1186,7 @@ func mergeModelInfos(primary, secondary []ModelInfo) []ModelInfo {
 // agents[cli].models 过滤 + nonChatModel 剔除 + disabled 剔除（既有 FetchModels 逐字保留，
 // v3-config-merge 重构抽出的单路函数）。
 func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
+	a = a.Snapshot()
 	url := c.chatBase(a) + c.modelsPath(a)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
@@ -1275,6 +1265,7 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 // 但 mergeModelInfos 以 enterprise（已 cli 过滤）为 secondary 补缺，v3 全量条目中
 // 只有企业端点缺失的 id 会进并集，实际生效口径仍是「cli 面并集」。
 func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
+	a = a.Snapshot()
 	url := c.chatBase(a) + v3ConfigPath
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
@@ -1319,6 +1310,7 @@ func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
 // billingMeterJSON 按 realm 候选路径发 billing/meter 域请求，ErrNotFound 时换下一候选路径
 // （global：/billing/meter/* → /v2/billing/meter/*；cn：单路径 /v2/billing/meter/* 现状）。
 func (c *Client) billingMeterJSON(a *auth.Auth, paths []string, method string, body any) (json.RawMessage, error) {
+	a = a.Snapshot()
 	var lastErr error
 	for i, p := range paths {
 		data, err := c.billingJSON(a, method, p, body)
@@ -1363,6 +1355,7 @@ const packageEndLayout = "2006-01-02 15:04:05"
 // PackageEndTime 解析失败/缺失的套餐保守归入 Stable（不误标为快过期而插队）。
 // 单套餐取数口径（Cycle* 优先）与 UserResource 完全一致，保证向后兼容。
 func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain int64, buckets CreditBuckets, err error) {
+	a = a.Snapshot()
 	now := time.Now()
 	body := map[string]any{
 		"PageNumber":               1,
@@ -1432,6 +1425,7 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain 
 // realm 感知继承 billingMeterPaths：global 账号打 workbuddy.ai /billing/meter/*（404
 // fallback /v2），CN 账号维持 /v2/billing/meter/get-user-resource（现状逐字，零回归）。
 func (c *Client) ResourceSummary(a *auth.Auth) (remain, used, size int64, packs int, err error) {
+	a = a.Snapshot()
 	now := time.Now()
 	body := map[string]any{
 		"PageNumber":               1,
@@ -1536,6 +1530,7 @@ func packageRemainUsed(a respAccount) (remain, used, size int64) {
 
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
+	a = a.Snapshot()
 	_, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), http.MethodPost, map[string]any{})
 	return err
 }

@@ -1,5 +1,6 @@
 // travel.go 猫猫旅行巡检状态机：随旅行时点（travel_hours，默认 09 点）对池内每个可用账号单趟推进一次。
 // 无猫 → 同意协议 + 领养；有猫 → 按 travel/status 分派 派出 / 领奖 / 跳过。
+// 2026-09-16：旅行任务使用凭据快照检查刷新令牌，消除与其它刷新任务的读取竞争。
 package scheduler
 
 import (
@@ -75,7 +76,7 @@ func (s *Scheduler) runTravel(ctx context.Context) {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshToken == "" {
+		if a == nil || a.Snapshot().RefreshToken == "" {
 			continue
 		}
 		if a.IsGlobal() {

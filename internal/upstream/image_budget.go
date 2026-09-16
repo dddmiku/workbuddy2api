@@ -1,3 +1,6 @@
+// ═══ 更新日志 ═══
+// 2026-09-16：图片裁剪时保留 schema 和业务数字字面量，避免重新序列化改变大整数与负零。
+// 2026-09-17：保留 fork 的图片预算裁剪顺序，合入 UseNumber 解析，避免裁图引起无关数字变化。
 // image_budget.go 出站图片预算：把发往上游的请求体按字节压进预算内。
 //
 // ── 为什么需要这一层（全部为实测结论） ──
@@ -30,6 +33,8 @@ package upstream
 import (
 	"encoding/json"
 	"log"
+
+	"workbuddy2api/internal/jsonutil"
 )
 
 // imageOmittedPlaceholder 图片被省略时写回的占位文本。
@@ -139,7 +144,7 @@ func ShrinkOutboundImages(body []byte, maxBytes int) []byte {
 		return body
 	}
 	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil {
+	if err := jsonutil.Decode(body, &obj); err != nil || obj == nil {
 		return body
 	}
 	parts := collectImageParts(obj)

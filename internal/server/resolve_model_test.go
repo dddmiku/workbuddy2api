@@ -6,9 +6,9 @@ import "testing"
 // 取第一个 ":"，前段为 cn/global 才剥离，否则 (cn, 原串)。
 func TestResolveModel(t *testing.T) {
 	cases := []struct {
-		in           string
-		wantRealm    string
-		wantBare     string
+		in        string
+		wantRealm string
+		wantBare  string
 	}{
 		{"cn:glm-5.2", "cn", "glm-5.2"},
 		{"global:gpt-5.4", "global", "gpt-5.4"},
@@ -32,7 +32,7 @@ func TestResolveModelEdge(t *testing.T) {
 	}{
 		{"", "cn", ""},
 		{":", "cn", ":"},
-		{":model", "cn", ":model"}, // 空前缀不匹配 cn/global，不剥离
+		{":model", "cn", ":model"},             // 空前缀不匹配 cn/global，不剥离
 		{"GLOBAL:gpt-5", "cn", "GLOBAL:gpt-5"}, // 大小写敏感：不做归一
 		{"global:", "global", ""},              // 前缀合法 + 空裸名仍剥离
 		{"global:gpt-5.4", "global", "gpt-5.4"},

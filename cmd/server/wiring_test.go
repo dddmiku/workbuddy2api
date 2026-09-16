@@ -29,9 +29,9 @@ func TestRealmAwareAvailableForModel(t *testing.T) {
 		model string
 		want  []string
 	}{
-		{"glm-5.2", []string{"cn1"}},           // 裸名 → cn 集合
-		{"cn:glm-5.2", []string{"cn1"}},        // 显式 cn 前缀 → cn 集合
-		{"global:gpt-5.4", []string{"g1"}},     // global 前缀 → global 集合
+		{"glm-5.2", []string{"cn1"}},       // 裸名 → cn 集合
+		{"cn:glm-5.2", []string{"cn1"}},    // 显式 cn 前缀 → cn 集合
+		{"global:gpt-5.4", []string{"g1"}}, // global 前缀 → global 集合
 	}
 	for _, c := range cases {
 		if got := fn(c.model); !reflect.DeepEqual(got, c.want) {
@@ -75,9 +75,9 @@ func TestRealmAwareAvailableForModelDefaultOnCNZeroRegression(t *testing.T) {
 		model string
 		want  []string
 	}{
-		{"glm-5.2", []string{"cn1", "cn2"}},       // 裸名 → cn 集合（现状零回归）
-		{"cn:glm-5.2", []string{"cn1", "cn2"}},    // cn 前缀 → cn 集合
-		{"global:gpt-5.4", nil},                   // global 前缀 → 纯 CN 池无可用（不对 spread）
+		{"glm-5.2", []string{"cn1", "cn2"}},    // 裸名 → cn 集合（现状零回归）
+		{"cn:glm-5.2", []string{"cn1", "cn2"}}, // cn 前缀 → cn 集合
+		{"global:gpt-5.4", nil},                // global 前缀 → 纯 CN 池无可用（不对 spread）
 	}
 	for _, c := range cases {
 		want := c.want

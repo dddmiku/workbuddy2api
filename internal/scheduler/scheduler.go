@@ -1,6 +1,9 @@
 // Package scheduler 定时任务：签到 / 活跃上报 / 猫猫旅行 / token keepalive / 开学季 / 夜猫子 /
 // 连登兑换 / 成长抽奖 / 补签 —— 多类独立排程，各自独立开关与独立时点。
 // 签到成功后重新查余额，余额 > 0 的冷却账号自动解冻。
+// ═══ 更新日志 ═══
+// 2026-09-17：保留较新调度上下文及奖励幂等，统一凭据快照读取。
+// 2026-09-16：定时任务的凭据存在性判断改读快照，避免与聊天触发的刷新并发竞争。
 package scheduler
 
 import (
@@ -378,7 +381,7 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshToken == "" {
+		if a == nil || a.Snapshot().RefreshToken == "" {
 			oc.Status, oc.Detail = CheckinSkipped, "no credentials"
 			skipN++
 			out = append(out, oc)
@@ -502,7 +505,7 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.AccessToken == "" {
+		if a == nil || a.Snapshot().AccessToken == "" {
 			continue
 		}
 		// global 账号同样上报（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上 code=0 OK，
@@ -576,7 +579,7 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 //
 // 日志每号一行可 grep：`activity %s: redeem tier=%s ...` / `activity %s: lottery ...`。
 func (s *Scheduler) claimGrowthRewards(a *auth.Auth) {
-	if a == nil || a.AccessToken == "" {
+	if a == nil || a.Snapshot().AccessToken == "" {
 		return
 	}
 	// global 门控：连登奖励/抽奖链只服务 CN。国际版 /activity/growth/* 端点虽同构存在
@@ -688,7 +691,7 @@ func (s *Scheduler) RunKeepaliveNow() {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshToken == "" {
+		if a == nil || a.Snapshot().RefreshToken == "" {
 			skipCnt++
 			continue
 		}

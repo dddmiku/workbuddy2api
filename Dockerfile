@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1
+# ═══ 更新日志 ═══
+# 2026-09-17：依赖下载同时读取 go.sum，确保干净构建使用已提交的依赖校验记录。
 FROM golang:1.23-alpine AS build
 WORKDIR /src
-COPY go.mod ./
+COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 # 一次编译全部二进制（工具进镜像，容器内可直接跑脚本）。全部 -trimpath -s -w。

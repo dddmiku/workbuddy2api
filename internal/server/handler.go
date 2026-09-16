@@ -1,7 +1,11 @@
+// ═══ 更新日志 ═══
+// 2026-09-17：合并模型级避让与完整响应校验，仅在确认成功后解除模型负缓存。
+// 2026-09-16：保留调用者指令，停止全局自动降级；校验输入并按真实流结果记录成功。
 // Package server 暴露 OpenAI 兼容 HTTP 接口，内部驱动 pool 挑号 + upstream 转发。
 package server
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -14,7 +18,9 @@ import (
 	"sync"
 	"time"
 
+	"workbuddy2api/internal/apikeys"
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/jsonutil"
 	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/prompt"
@@ -26,8 +32,9 @@ import (
 type Config struct {
 	Pool      *pool.Pool
 	Upstream  *upstream.Client
-	APIKey    string // 空 = 不鉴权
-	MaxRotate int    // 单请求最多换号次数，默认 3
+	APIKey    string         // 空 = 不鉴权
+	APIKeys   *apikeys.Store // 配置后以持久化密钥库为准，空库不放行。
+	MaxRotate int            // 单请求最多换号次数，默认 3
 	// MaxBodyBytes 聊天请求体大小上限；<=0 兜底 8<<20（8MB）。
 	// 超限直接 413 request_body_too_large（不再静默截断喂给上游，issue #41）。
 	MaxBodyBytes int64
@@ -110,6 +117,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Context().Value(internalAdminContextKey{}) == true {
+			next(w, r)
+			return
+		}
+		if h.cfg.APIKeys != nil {
+			authz := r.Header.Get("Authorization")
+			if !strings.HasPrefix(authz, "Bearer ") || !h.cfg.APIKeys.Authenticate(strings.TrimPrefix(authz, "Bearer ")) {
+				writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+				return
+			}
+			next(w, r)
+			return
+		}
 		if h.cfg.APIKey != "" {
 			authz := r.Header.Get("Authorization")
 			// 常量时间比较（发现 7）：!= 短路时序随前缀长度变化，公网暴露下
@@ -123,6 +143,15 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+type internalAdminContextKey struct{}
+
+// InternalHandler 只挂载到权限为 0600 的 Unix socket，使面板管理不依赖任一调用密钥。
+func (h *Handler) InternalHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), internalAdminContextKey{}, true)))
+	})
 }
 
 func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
@@ -381,7 +410,7 @@ func rewriteModel(body []byte, bare string) []byte {
 		return body
 	}
 	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil {
+	if err := jsonutil.Decode(body, &obj); err != nil {
 		return body
 	}
 	if cur, ok := obj["model"].(string); !ok || cur == bare {
@@ -464,7 +493,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		Stream bool   `json:"stream"`
 		Model  string `json:"model"`
 	}
-	_ = json.Unmarshal(body, &peek)
+	var requestObject map[string]json.RawMessage
+	if err := json.Unmarshal(body, &requestObject); err != nil || requestObject == nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "request body must be a JSON object")
+		return
+	}
+	if err := json.Unmarshal(body, &peek); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid request fields: "+err.Error())
+		return
+	}
+	if err := validateChatRequest(body); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
 
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/账本/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
@@ -536,16 +577,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 系统提示词改写（出站前、轮转前；每个请求一次）。
-	//   - custom：用自有提示词替换客户端 system/developer（从源头消灭 system 指纹误报）。
-	//   - passthrough + 降级期：换 Degraded 中性提示词直达，不再先撞 400。
-	//   - passthrough 非降级期：透传客户端原始 system（不改写）。
-	degradedApplied := false
+	// 只有显式 custom 配置才替换 system/developer；passthrough 始终保留原文。
 	if h.cfg.PromptMode == "custom" && h.cfg.PromptText != "" {
 		body = prompt.Rewrite(body, h.cfg.PromptText)
-	} else if h.cfg.PromptMode == "passthrough" && h.degrade.Active() {
-		body = prompt.Rewrite(body, prompt.Degraded)
-		degradedApplied = true
 	}
 
 	// outbound model 名重写为 bareModel（D6）：realm 前缀是网关侧路由协议，
@@ -579,6 +613,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
+		if r.Context().Err() != nil {
+			st.status = 499
+			return
+		}
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
@@ -653,19 +691,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if status >= 400 {
 			st.status = status
 			kind := upstream.Classify(status, string(respBody))
-			// 内容拦截误报（passthrough 模式首遇）：判定为 system 指纹误报，
-			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试。
-			// 第二次仍被拦（用户内容本身触发审核）→ 回内容防火墙错误（见下分支）。
-			// 内容问题非账号问题：applyErrorPolicy 不罚账号（见 ErrContentBlocked 分支）。
-			if kind == upstream.ErrContentBlocked && h.cfg.PromptMode == "passthrough" && !degradedApplied {
-				h.degrade.Trigger()
-				body = prompt.Rewrite(body, prompt.Degraded)
-				degradedApplied = true
-				delete(tried, acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
-				releaseHeld()
-				log.Printf("WARN: [server] content-blocked (likely fingerprint false positive) -> degraded prompt retry")
-				continue
+			if kind == upstream.ErrChannelRejected {
+				fail(acct.UID)
+				writeOpenAIError(w, http.StatusBadRequest, "upstream_channel_rejected",
+					"upstream rejected the client channel: Illegal API invocation from an unapproved channel")
+				st.status = http.StatusBadRequest
+				return
 			}
+			// 上游内容拒绝属于当前请求；直接返回，不修改其他会话或替换正文重试。
 			if kind == upstream.ErrContentBlocked {
 				// 内容命中网关内容防火墙：立即回客户端，**不轮转**——换任何账号都会撞同一
 				// 审核，轮转纯属浪费时间。不罚账号（ErrContentBlocked 分支无冷却/熔断/NoteError）。
@@ -696,26 +729,57 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+			if kind == upstream.ErrBadParams || kind == upstream.ErrClient {
+				fail(acct.UID)
+				detail := string(respBody)
+				acct.Lock()
+				secretValues := []string{acct.AccessToken, acct.RefreshToken, acct.DeviceToken}
+				acct.Unlock()
+				secretValues = append(secretValues, h.cfg.APIKey, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+				for _, secret := range secretValues {
+					if len(secret) > 4 {
+						detail = strings.ReplaceAll(detail, secret, "[redacted]")
+					}
+				}
+				if len(detail) > 2000 {
+					detail = logfmt.Truncate(detail, 2000)
+				}
+				writeOpenAIError(w, http.StatusBadRequest, "upstream_invalid_request", "upstream rejected request params: "+detail)
+				st.status = http.StatusBadRequest
+				return
+			}
 			h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel)
 			fail(acct.UID)
 			continue
 		}
-		h.cfg.Pool.NoteSuccess(acct.UID)
-		// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
-		// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
-		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
-		if sessKey != "" && h.cfg.Session != nil {
-			h.cfg.Session.Bind(sessKey, acct.UID)
-		}
 		if peek.Stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK
 			stats := newChatStatsReaderSince(rc, st.start)
-			_ = upstream.Stream(w, stats)
+			streamErr := upstream.Stream(w, stats)
+			if checker, ok := w.(interface{ CompletionError() error }); ok && streamErr == nil {
+				streamErr = checker.CompletionError()
+			}
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
+			if streamErr != nil {
+				rc.Close()
+				if r.Context().Err() != nil {
+					st.status = 499
+				} else {
+					st.status = http.StatusBadGateway
+					log.Printf("WARN: [server] stream incomplete uid=%s model=%s error=%v", logfmt.UID8(acct.UID), bareModel, streamErr)
+				}
+				fail(acct.UID)
+				return
+			}
+			h.cfg.Pool.NoteSuccess(acct.UID)
+			h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
+			if sessKey != "" && h.cfg.Session != nil {
+				h.cfg.Session.Bind(sessKey, acct.UID)
+			}
 			// 成本账本：末帧 usage 带 credit 与 token 总数时记录实测单价，
 			// 供下次选号把免费/便宜的号排在前面。
 			if credit, ok := stats.Credit(); ok {
@@ -735,6 +799,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
 			return
+		}
+		if checker, ok := w.(interface{ ValidateCompletion(map[string]any) error }); ok {
+			if err := checker.ValidateCompletion(resp); err != nil {
+				writeOpenAIError(w, http.StatusBadGateway, "response_contract_violation", err.Error())
+				st.status = http.StatusBadGateway
+				return
+			}
+		}
+		h.cfg.Pool.NoteSuccess(acct.UID)
+		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
+		if sessKey != "" && h.cfg.Session != nil {
+			h.cfg.Session.Bind(sessKey, acct.UID)
 		}
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
@@ -789,14 +865,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 //     softStreak 翻倍、封顶 soft_rate_max，冷却中兜底探测不翻倍）。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩，不随 soft_rate 退避。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
-//   - ErrContentBlocked → 不罚账号（无冷却/熔断/NoteError）；passthrough 首遇触发
-//     降级重试，最终仍拦则回 400 content_blocked（防火墙文案，不含账号/错误码）。
-//   - ErrBadParams → 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇），但仍轮转。
+//   - ErrContentBlocked → 不罚账号，直接回 400 content_blocked。
+//   - ErrBadParams → 不罚账号，直接回 400 并保留脱敏后的诊断。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
 //   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11102 负缓存避让（复用 modelCooldowns
 //     机制，Until=指数退避 TTL，选号侧 healthyForModel 避开，切模型即可用）。
-//   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断。
+//   - ErrClient 在调用前直接回 400；其他未知错误不喂熔断。
 //
 // body 仅在 ErrSoftRate 分支用于识别上游 6004 模型级限流并解析重置时间；model 为请求
 // 携带的模型名（触发 6004 时记录以便后续切模型豁免）。

@@ -32,9 +32,9 @@ import (
 // cfgFile 只取本工具需要的字段；Schedule 段直接用 internal/config.Schedule
 // （与 cmd/server 同源），其余段保持精简内联。
 type cfgFile struct {
-	AuthDir   string            `json:"auth_dir"`
-	StateFile string            `json:"state_file"`
-	Schedule  config.Schedule   `json:"schedule"`
+	AuthDir   string          `json:"auth_dir"`
+	StateFile string          `json:"state_file"`
+	Schedule  config.Schedule `json:"schedule"`
 	Upstream  struct {
 		TimeoutSeconds int `json:"timeout_seconds"`
 	} `json:"upstream"`
