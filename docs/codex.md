@@ -2,13 +2,30 @@
 
 官方 Codex CLI 可以使用本项目的 Responses 接口。实际验证版本为 `codex-cli 0.153.4`，模型为 `cn:deepseek-v4.1-flash`。
 
-**只填写 API key 和 URL 不一定可用。** 原生默认 codex 请求曾被上游以未获准渠道拒绝；已通过的配置显式选择了一份独立、中性的模型说明。该结果不等于默认配置通过，也不代表其他版本与模型已经验证。
+**只填写 API key 和 URL 不一定可用**，取决于客户端自带哪份系统说明：
+
+- 桌面版 Codex（`codex_work_desktop` 0.155.0-alpha.2.6）的说明不含被拒句子，实测真实形状请求返回 200 `completed`；
+- 官方 CLI 的默认说明含被拒句子，必须显式换成下面这份中性说明，否则上游返回 `upstream_channel_rejected`。
+
+该结论只覆盖这两个客户端与版本，不代表其他客户端、版本或模型已经验证。
 
 ## 默认指令为什么会被拒
 
-对一份真实的 desktop Codex 请求做字段二分后可以定位：`tools`（含 namespace 分组与 `web_search`）全部移除仍然被拒，把 `instructions` 换成中性文案后立即返回 200。
+对一份真实的 Codex 请求做字段二分：`tools`（含 namespace 分组与 `web_search`）全部移除仍然被拒，把 `instructions` 换成中性文案后立即返回 200。工具声明、模型名与用户消息都不是触发点。
 
-继续对 `instructions` 二分：整段原文被拒，只保留第一句（`You are a coding agent running in the Codex CLI, a terminal-based coding assistant.`，83 字符）可以通过；把同样开头里的 `Codex CLI` / `led by OpenAI` 换成中性说法后，整段也能通过。也就是说，上游的渠道校验命中的是系统说明里**声明自己是 Codex CLI / OpenAI 产品**的那类句子，而不是工具声明、模型名或消息内容。
+再对 `instructions` 二分，触发面收敛到**一句话**：`Codex CLI is an open source project led by OpenAI.`
+
+| 说明内容 | 结果 |
+|---|---|
+| 完整原文（21026 字符） | 400 `upstream_channel_rejected` |
+| 删掉上面那一句 | 200 |
+| 把那一句改写成中性说法 | 200 |
+| 只把 `OpenAI` 换成其他词（其余原文不动） | 200 |
+| 只保留第一句 `You are a coding agent running in the Codex CLI, a terminal-based coding assistant.`（83 字符） | 200 |
+| 说明里只有 `OpenAI`、没有那一句 | 200 |
+| 用户消息里提到 `OpenAI` | 200 |
+
+也就是说上游的渠道校验命中的是这句对**渠道归属**的声明，而不是 `OpenAI` 这个词本身。
 
 网关不会替换这些正文（正文保真是刻意的设计），因此默认指令的客户端需要用下面这份中性说明覆盖系统提示词。
 
@@ -46,6 +63,14 @@ stream_idle_timeout_ms = 90000
 先在普通测试目录验证读文件、执行一条测试命令和续接对话，再用于自己的项目。需要结构化结果时，可以在 Codex 中提供 `--output-schema`。
 
 本次验证的两轮任务使用同一会话，工具调用结果均回传，业务测试从 5 项到 8 项通过，最终编号保持整数 `11128`。这属于指定客户端、模型和说明配置的验证，不是对全部功能的保证。
+
+接入回归（同一台服务器，真实客户端实测）：
+
+| 场景 | 结果 |
+|---|---|
+| 桌面版形状请求：21261 字符说明 + 14 个工具（含 3 个 namespace 分组） | 200 `completed`，回答 `OK` |
+| 真实 `codex exec` + 默认说明 | 400 `upstream_channel_rejected` |
+| 真实 `codex exec` + `model_instructions_file` 指向本仓库说明 | 200，回答 `OK` |
 
 如果出现 `upstream_channel_rejected`，应保留完整错误并核对上游允许范围；若出现 `invalid_api_key`，检查密钥状态；若请求了不支持的内置工具，按[兼容性说明](compatibility.md)调整客户端能力。
 
