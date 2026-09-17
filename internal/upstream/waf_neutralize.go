@@ -5,6 +5,7 @@ package upstream
 import (
 	"encoding/json"
 	"regexp"
+	"strings"
 
 	"workbuddy2api/internal/jsonutil"
 )
@@ -155,5 +156,174 @@ func sortInts(values []int) {
 			j--
 		}
 		values[j+1] = value
+	}
+}
+
+// wafRiskyChars token 级二次断词的触发字符集（命令注入、路径穿越、URL 协议的共同特征）。
+var wafRiskyChars = []byte("$`'\"()/\\;|&<>=%{}[]*?~:@")
+
+// NeutralizeWAFTokens 第二级中性化：对消息正文里含风险字符的 token 断词。
+//
+// 触发字符集覆盖命令注入、路径穿越与 URL 协议族（`printf`、`$()`、`/etc/passwd`、
+// `../../`、`ldap://` 等）。只在「一级断词重试仍被拦」时升级使用；零宽字符不参与
+// 词义，模型读到的是同一段文本。
+//
+// 只改 messages 里的正文（含 system/instructions），不动工具定义、JSON schema 与
+// 工具调用参数——那些是结构字段，插字符会破坏工具名与参数字面量。
+func NeutralizeWAFTokens(body []byte) ([]byte, bool) {
+	return neutralizeMessages(body, breakRiskyTokens)
+}
+
+// NeutralizeWAFTokensDeep 第三级中性化（最后手段）：逐 token 断词——每个空白分隔
+// token 在首字符之后插零宽，token 内其余非字母数字字符之后再插一个。
+//
+// 用于上游 WAF 的累积型判定：单个片段都在白名单内，但整段正文里可疑 token 数量
+// 过阈值后整包被拦（实测同一批历史逐条都过、合起来被拦）。作用范围与二级一致，
+// 只碰消息正文。仍是零宽字符，正文语义不变。
+func NeutralizeWAFTokensDeep(body []byte) ([]byte, bool) {
+	return neutralizeMessages(body, breakEveryToken)
+}
+
+// neutralizeMessages 对 messages 数组里的正文文本应用 transform。
+//
+// 覆盖三种形态：content 为字符串（纯文本消息、system 提示）、content 为 part 数组
+// 时的 text 字段，以及 tool_calls / function_call 的参数字符串（agent 历史里的 shell
+// 命令）。其余字段（工具名、tools 定义、model、JSON 键）一律不动——那些是结构数据，
+// 插字符会破坏工具名与参数字面量。
+func neutralizeMessages(body []byte, transform func(string, *bool) string) ([]byte, bool) {
+	if len(body) == 0 {
+		return body, false
+	}
+	var obj map[string]any
+	if err := jsonutil.Decode(body, &obj); err != nil || obj == nil {
+		return body, false
+	}
+	msgs, ok := obj["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		return body, false
+	}
+	changed := false
+	for _, m := range msgs {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch content := msg["content"].(type) {
+		case string:
+			msg["content"] = transform(content, &changed)
+		case []any:
+			for _, e := range content {
+				part, ok := e.(map[string]any)
+				if !ok {
+					continue
+				}
+				if text, ok := part["text"].(string); ok {
+					part["text"] = transform(text, &changed)
+				}
+			}
+		}
+		// 工具调用参数同样进正文：agent 历史里的 shell 命令（heredoc、管道、重定向）
+		// 是上游 WAF 命令注入规则的目标（2026-09-17 实测：正文断词不覆盖此处时，
+		// 带 heredoc 的 tool_calls 仍被拦）。只动参数字符串，不动工具名与 JSON 结构。
+		if calls, ok := msg["tool_calls"].([]any); ok {
+			for _, c := range calls {
+				call, ok := c.(map[string]any)
+				if !ok {
+					continue
+				}
+				fn, ok := call["function"].(map[string]any)
+				if !ok {
+					continue
+				}
+				if args, ok := fn["arguments"].(string); ok {
+					fn["arguments"] = transform(args, &changed)
+				}
+			}
+		}
+		if fn, ok := msg["function_call"].(map[string]any); ok {
+			if args, ok := fn["arguments"].(string); ok {
+				fn["arguments"] = transform(args, &changed)
+			}
+		}
+	}
+	if !changed {
+		return body, false
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body, false
+	}
+	return out, true
+}
+
+// breakRiskyTokens 对含风险字符的空白分隔 token 插入零宽空格。
+func breakRiskyTokens(text string, changed *bool) string {
+	if text == "" {
+		return text
+	}
+	parts := strings.Split(text, " ")
+	wrote := false
+	for i, token := range parts {
+		if token == "" {
+			continue
+		}
+		if !strings.ContainsAny(token, string(wafRiskyChars)) {
+			continue
+		}
+		pos := firstLetterOffset(token)
+		if pos < 0 {
+			pos = 0
+		}
+		if pos+1 > len(token) {
+			continue
+		}
+		parts[i] = token[:pos+1] + wafBreakMarker + token[pos+1:]
+		wrote = true
+	}
+	if !wrote {
+		return text
+	}
+	*changed = true
+	return strings.Join(parts, " ")
+}
+
+// breakEveryToken 对每个 token 的首字符之后、以及每个非字母数字字符之后插零宽。
+func breakEveryToken(text string, changed *bool) string {
+	if len(text) < 2 {
+		return text
+	}
+	parts := strings.Split(text, " ")
+	for i, token := range parts {
+		if len(token) < 2 {
+			continue
+		}
+		var b strings.Builder
+		b.Grow(len(token) + len(token)/2)
+		for idx := 0; idx < len(token); idx++ {
+			c := token[idx]
+			b.WriteByte(c)
+			brk := false
+			if idx == 0 {
+				brk = true
+			} else if !isASCIIAlnum(c) {
+				brk = true
+			}
+			if brk {
+				b.WriteString(wafBreakMarker)
+			}
+		}
+		parts[i] = b.String()
+	}
+	*changed = true
+	return strings.Join(parts, " ")
+}
+
+// isASCIIAlnum 报告字节是否 ASCII 字母或数字。
+func isASCIIAlnum(c byte) bool {
+	switch {
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		return true
+	default:
+		return false
 	}
 }

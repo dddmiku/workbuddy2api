@@ -757,8 +757,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if kind == upstream.ErrUpstreamWAF {
 				fail(acct.UID)
 				writeOpenAIError(w, http.StatusBadRequest, "upstream_waf_blocked",
-					"upstream WAF blocked the request body before it reached the model "+
-						"(HTML doctype/script tags or SQL-looking text); remove that content and retry")
+					"upstream WAF rejected this request even after the gateway broke the matching "+
+						"patterns; start a new conversation, or remove the HTML/script/SQL-looking part")
 				st.status = http.StatusBadRequest
 				return
 			}

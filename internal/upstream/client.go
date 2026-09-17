@@ -934,9 +934,11 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	pathCount := len(c.chatPaths(a))
 	for attempt, path := range c.chatPaths(a) {
 		url := c.chatBase(a) + path
-		// wafNeutralized：同一路径最多用断词版本重发一次（见下方 WAF 分支）。
-		// 原样请求先发，只有真的撞到 WAF 拦截页才改写，正常请求的正文不变。
-		wafNeutralized := false
+		// wafLevel：WAF 断词升级档位。0 = 原样重发前；1 = 模式级断词；
+		// 2 = 风险 token 断词；3 = 逐 token 断词。原样请求先发，只有真的撞到
+		// WAF 拦截页才改写，正常请求的正文不变；每档最多再发一次，避免反复拉扯。
+		wafLevel := 0
+		lastSent := prepared
 	retry:
 		for {
 			req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(prepared))
@@ -967,15 +969,33 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 				kind := Classify(resp.StatusCode, string(raw))
 				log.Printf("WARN: [upstream] chat_stream uid=%s: upstream %d %s body=%s",
 					logfmt.UID8(a.UID), resp.StatusCode, kind, truncate(string(raw), 200))
-				// 国际版 WAF 按正文特征拦截（脚本/事件处理器/SQL 注入式片段等），返回的是
-				// 前置 WAF 的拦截页而非模型答复。此时把命中的模式用零宽字符断开后同路径重发
-				// 一次：正文语义不变（零宽不参与词义），用户不必自己删改内容。
-				// 只重发一次；仍被拦则按请求终态返回，交 handler 回可行错误文案。
-				if kind == ErrUpstreamWAF && !wafNeutralized {
-					if neutralized, changed := NeutralizeWAFTriggers(prepared); changed {
-						prepared = neutralized
-						wafNeutralized = true
-						log.Printf("WARN: [upstream] waf triggers neutralized for retry uid=%s path=%s", logfmt.UID8(a.UID), path)
+				// 国际版 WAF 按正文特征拦截（脚本、命令注入、路径穿越等），返回的是前置
+				// WAF 的拦截页而非模型答复。按两级做零宽断词后同路径重发：一级按已知模式
+				// 断词，二级按 token 断词覆盖命令注入/路径穿越族。零宽字符不参与词义，
+				// 模型读到的仍是同一段文本，用户不必自己删改内容。
+				// 每档最多重发一次；仍被拦则按请求终态返回，交 handler 回可行错误文案。
+				if kind == ErrUpstreamWAF {
+					// 逐级升级：某一级没有可断词内容时直接尝试下一级，而不是放弃。
+					for wafLevel < 3 {
+						var candidate []byte
+						switch wafLevel {
+						case 0:
+							candidate, _ = NeutralizeWAFTriggers(prepared)
+						case 1:
+							candidate, _ = NeutralizeWAFTokens(prepared)
+						default:
+							candidate, _ = NeutralizeWAFTokensDeep(prepared)
+						}
+						wafLevel++
+						if bytes.Equal(candidate, prepared) {
+							continue
+						}
+						prepared = candidate
+						log.Printf("WARN: [upstream] waf neutralized level=%d for retry uid=%s path=%s", wafLevel, logfmt.UID8(a.UID), path)
+						break
+					}
+					if wafLevel > 0 && !bytes.Equal(prepared, lastSent) {
+						lastSent = prepared
 						continue retry
 					}
 				}
