@@ -11,6 +11,7 @@
 # 2026-09-17：路径、端口与容器名支持环境变量覆盖，便于与网关同一 Compose 项目部署。
 # 2026-09-17：密钥管理支持模型绑定字段，并新增供前端选择模型的 /api/models。
 # 2026-09-17：新增用量统计通道 /api/usage；容器日志解析成结构化请求行供日志页表格展示。
+# 2026-09-17：新增热更新通道：/api/update 读状态，/api/update/apply 触发版本切换。
 
 """workbuddy2api 账号管理面板 —— 后端
 
@@ -818,17 +819,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/usage":
             # 用量账本只经本机管理通道读取：面板能看到全量，普通调用密钥看不到。
-            try:
-                socket = key_management.socket_path(CONFIG_PATH, BASE)
-            except (OSError, ValueError):
-                return self._json(200, {"ok": False, "message": "无法读取网关配置，用量不可用"})
-            code, result = key_management.request(socket, "GET", "/usage")
-            if code != 200 or not isinstance(result, dict):
-                message = ""
-                if isinstance(result, dict):
-                    message = result.get("message") or ""
-                return self._json(200, {"ok": False, "message": message or "网关未响应用量接口（旧版本网关请先升级）"})
-            return self._json(200, result)
+            return self._gateway_admin("GET", "/usage")
+
+        if path == "/api/update":
+            return self._gateway_admin("GET", "/update")
 
         if path == "/api/models":
             # 面板经本机管理通道读取完整模型列表，不受单个调用密钥的绑定限制。
@@ -904,6 +898,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, self.task_toggle(body))
             if path == "/api/service/restart":
                 return self._json(200, self.service_restart())
+            if path in ("/api/update/check", "/api/update/apply"):
+                return self.update_post(path, body)
             if path == "/api/credit":
                 return self._json(200, {"credit": get_credits(force=True)})
         except Exception as ex:
@@ -918,16 +914,51 @@ class Handler(BaseHTTPRequestHandler):
         code, result = key_management.request(path, method, endpoint, body)
         return self._json(code, result)
 
-    def keys_post(self, path):
-        if not self._session():
-            return self._json(401, {"ok": False, "message": "请先登录管理面板"})
+    def _origin_ok(self):
+        """同源校验：没带 Origin（同源表单/脚本）或与 Host 完全一致才算合法。"""
         origin = self.headers.get("Origin")
         try:
             parsed = urlsplit(origin) if origin else None
-            origin_ok = not parsed or (parsed.scheme in ("http", "https") and parsed.netloc.lower() == self.headers.get("Host", "").lower() and not parsed.username)
         except ValueError:
-            origin_ok = False
-        if not origin_ok or self.headers.get("X-Admin-Request") != "1":
+            return False
+        if not parsed:
+            return True
+        return (parsed.scheme in ("http", "https")
+                and parsed.netloc.lower() == self.headers.get("Host", "").lower()
+                and not parsed.username)
+
+    def _gateway_admin(self, method, endpoint, body=None):
+        """经本机管理 socket 调用网关内部接口（用量、热更新等），不暴露给调用密钥。"""
+        try:
+            socket = key_management.socket_path(CONFIG_PATH, BASE)
+        except (OSError, ValueError):
+            return self._json(200, {"ok": False, "message": "无法读取网关配置"})
+        code, result = key_management.request(socket, method, endpoint, body)
+        if code != 200 or not isinstance(result, dict):
+            message = result.get("message") if isinstance(result, dict) else ""
+            return self._json(200, {"ok": False,
+                                    "message": message or "网关未响应（旧版本网关请先升级）"})
+        return self._json(200, result)
+
+    def update_post(self, path, body):
+        """热更新操作：登录后由同源管理页面触发，闸门与密钥写操作一致。"""
+        if not self._session():
+            return self._json(401, {"ok": False, "message": "请先登录管理面板"})
+        if not self._origin_ok() or self.headers.get("X-Admin-Request") != "1":
+            return self._json(403, {"ok": False, "message": "请求来源无效，请从管理页面重新操作"})
+        if not isinstance(body, dict) or set(body) - {"tag"}:
+            return self._json(400, {"ok": False, "message": "包含不支持的字段"})
+        tag = body.get("tag")
+        if tag is not None and (not isinstance(tag, str) or len(tag) > 64 or not re.fullmatch(r"[A-Za-z0-9._-]*", tag)):
+            return self._json(400, {"ok": False, "message": "版本号格式不正确"})
+        endpoint = "/update/check" if path.endswith("/check") else "/update/apply"
+        payload = {"tag": tag} if tag else {}
+        return self._gateway_admin("POST", endpoint, payload)
+
+    def keys_post(self, path):
+        if not self._session():
+            return self._json(401, {"ok": False, "message": "请先登录管理面板"})
+        if not self._origin_ok() or self.headers.get("X-Admin-Request") != "1":
             return self._json(403, {"ok": False, "message": "请求来源无效，请从管理页面重新操作"})
         if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
             return self._json(415, {"ok": False, "message": "请使用 JSON 格式提交"})

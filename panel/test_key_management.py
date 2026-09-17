@@ -115,7 +115,7 @@ class KeyManagementTests(unittest.TestCase):
             self.assertEqual(code, 200)
             self.assertTrue(result["ok"])
             self.assertEqual(result["keys"][0]["name"], "团队 A")
-            upstream.assert_called_once_with("/tmp/test.sock", "GET", "/usage")
+            upstream.assert_called_once_with("/tmp/test.sock", "GET", "/usage", None)
 
     def test_usage_reports_disabled_ledger(self):
         with patch.object(app.key_management, "socket_path", return_value="/tmp/test.sock"), \

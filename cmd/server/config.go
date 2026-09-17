@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -117,7 +118,27 @@ type Config struct {
 		// File 提示词文件路径；空 = 内置默认 defaultprompt.md；
 		// 路径非空但不可读 → 启动报错（fail fast，避免静默回落到内置默认）。
 		File string `json:"file"`
+		// ActNote 运行约定：追加在「带工具的 Responses 请求」system 末尾，抑制上游
+		// 模型「一句话一个命令」的叙述式输出（原生 DeepSeek 不会这样，反代链路实测会）。
+		// 空 = 内置默认（prompt.ActNote）；"off" = 关闭；其他值 = 自定义文本。
+		// 原 system 内容一字不改，只在末尾追加；不带工具的纯对话不受影响。
+		ActNote string `json:"act_note"`
 	} `json:"prompt"`
+
+	// Update 热更新：从 GitHub Release 取新二进制，在容器内完成监听套接字交接。
+	// 交接期间新实例已接管监听，旧实例把在途请求（含长 SSE 对话）跑完才退出，
+	// 因此版本切换不会打断正在进行的对话。
+	Update struct {
+		// Enabled 是否允许通过管理台触发热更新。缺省 true。
+		// 显式 false 时 /update/* 返回未启用，只能手工重新部署。
+		Enabled bool `json:"enabled"`
+		// Repo 发布仓库（owner/name）。空 = 内置默认 dddmiku/workbuddy2api。
+		Repo string `json:"repo"`
+		// Token 私有仓库读取用；公开仓库留空。
+		Token string `json:"token"`
+		// Dir 下载与 current 指针目录；空 = 数据目录下的 updates（与 state_file 同盘）。
+		Dir string `json:"dir"`
+	} `json:"update"`
 
 	// PromptText 解析后的系统提示词文本（custom 模式使用）。
 	PromptText string `json:"-"`
@@ -194,7 +215,22 @@ func Default() *Config {
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
+	// 热更新缺省开启：管理台可一键切版本，在途对话不受影响。
+	c.Update.Enabled = true
 	return c
+}
+
+// updateDir 热更新下载目录：显式配置优先，否则落在 state.json 同目录的 updates/
+// （容器里就是挂载出来的 data 卷，重启后 current 指针仍在）。
+func updateDir(c *Config) string {
+	if dir := strings.TrimSpace(c.Update.Dir); dir != "" {
+		return dir
+	}
+	stateDir := filepath.Dir(c.StateFile)
+	if stateDir == "" || stateDir == "." {
+		return filepath.Join("data", "updates")
+	}
+	return filepath.Join(stateDir, "updates")
 }
 
 // Load 从文件读，再用 WB2A_* env 覆盖。

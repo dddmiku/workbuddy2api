@@ -373,6 +373,8 @@ pre.term{margin:0;padding:12px 14px;background:var(--sunken);color:var(--ink-2);
 /* ══ 请求日志 ═══════════════════════════════════════════════════════ */
 .log-table td,.log-table th{white-space:nowrap}
 .log-table td.mono{font-family:var(--mono);font-size:12px}
+/* 表头数值列是 th.r，数据列是 td.num：两处都要右对齐，否则表头在右、数字在左。 */
+.log-table td.num,.log-table th.r{text-align:right}
 .log-table tbody tr:hover{background:var(--surface-2)}
 .log-table .st-ok{color:var(--ok);font-weight:600}
 .log-table .st-warn{color:var(--warn);font-weight:600}
@@ -382,6 +384,20 @@ pre.term{margin:0;padding:12px 14px;background:var(--sunken);color:var(--ink-2);
 .log-raw[open] summary{border-bottom:1px solid var(--line)}
 .log-raw .term{margin:0;max-height:320px}
 #btnLogAuto[aria-pressed=true]{background:var(--ok-soft);color:var(--ok);border-color:var(--ok)}
+/* ── 版本与热更新 ─────────────────────────────────── */
+.upd-rows{ padding:2px 0 }
+.upd-empty{
+  padding:14px 16px; border-radius:10px; line-height:1.6;
+  background:var(--sunken); color:var(--ink-2); font-size:12.5px;
+}
+.upd-tag{
+  display:inline-flex; align-items:center; gap:6px; padding:3px 10px; border-radius:999px;
+  font-size:11.5px; font-weight:600; letter-spacing:.2px;
+  background:var(--ok-soft); color:var(--ok);
+}
+.upd-tag::before{ content:''; width:6px; height:6px; border-radius:50%; background:currentColor }
+.upd-tag.w{ background:var(--warn-soft); color:var(--warn) }
+.upd-tag.e{ background:var(--err-soft); color:var(--err) }
 </style>
 </head>
 <body>
@@ -700,16 +716,38 @@ pre.term{margin:0;padding:12px 14px;background:var(--sunken);color:var(--ink-2);
               </div>
             </section>
           </div>
-          <section class="panel">
-            <div class="ph">
-              <h2>容器状态</h2>
-              <span class="sp"></span>
-              <button class="btn sm" data-view="logs">查看请求日志</button>
-            </div>
-            <div class="pb">
-              <p class="sub">请求级日志（含调用密钥、uid、TTFB 与 token）已移到独立的「请求日志」页，支持自动刷新。</p>
-            </div>
-          </section>
+          <div>
+            <section class="panel">
+              <div class="ph">
+                <h2>版本与热更新</h2>
+                <span class="sp"></span>
+                <span class="sub" id="updState">—</span>
+              </div>
+              <div class="pb">
+                <div class="upd-rows" id="updRows"></div>
+                <div class="frow" style="margin-top:12px">
+                  <button class="btn sm" id="btnUpdCheck">检查更新</button>
+                  <button class="btn pri sm" id="btnUpdApply" disabled>立即更新</button>
+                  <span class="sp"></span>
+                  <span class="sub" id="updHint">—</span>
+                </div>
+                <p class="sub" style="margin:10px 0 0;line-height:1.6">
+                  升级时新进程先接手监听套接字，旧进程把正在进行的请求（包含流式对话）跑完再退出，
+                  所以调用中的客户端不需要重连，容器也不会重建。
+                </p>
+              </div>
+            </section>
+            <section class="panel" style="margin-top:14px">
+              <div class="ph">
+                <h2>容器状态</h2>
+                <span class="sp"></span>
+                <button class="btn sm" data-view="logs">查看请求日志</button>
+              </div>
+              <div class="pb">
+                <p class="sub">请求级日志（含调用密钥、uid、TTFB 与 token）已移到独立的「请求日志」页，支持自动刷新。</p>
+              </div>
+            </section>
+          </div>
         </div>
       </section>
     </div>
@@ -866,7 +904,10 @@ $('#btnTheme').addEventListener('click', function(){
 /* ── 通讯 ─────────────────────────────────────────── */
 async function api(path, body){
   var opt = { headers:{ 'Content-Type':'application/json' }, cache:'no-store' };
-  if (path.indexOf('api/keys') === 0) opt.headers['X-Admin-Request'] = '1';
+  // 写操作要带管理标记：面板自身的同源校验据此拒绝第三方页面代发请求。
+  if (path.indexOf('api/keys') === 0 || path.indexOf('api/update/') === 0){
+    opt.headers['X-Admin-Request'] = '1';
+  }
   if (body !== undefined){ opt.method = 'POST'; opt.body = JSON.stringify(body || {}); }
   var r = await fetch(path, opt);
   if (r.status === 401){ location.replace('login'); throw new Error('登录已失效'); }
@@ -918,7 +959,10 @@ function go(v){
   closeNav();
   if (v === 'keys' && typeof loadKeys === 'function') loadKeys();
   if (v === 'usage' && typeof loadUsage === 'function') loadUsage();
+  // 更新卡片不依赖 /api/state，先拉它：即使系统页的数据还没到也不会漏掉加载。
+  if (v === 'system' && typeof loadUpdate === 'function') loadUpdate();
   if (v === 'system' && !sysLoaded){ sysLoaded = true; renderSystem(); }
+  if (v !== 'system' && typeof stopUpdatePoll === 'function') stopUpdatePoll();
   // 日志页：进入即拉一次，并按开关状态维持自动刷新；离开即停，避免后台空转。
   if (v === 'logs'){ loadLogs(); startLogAuto(); } else { stopLogAuto(); }
 }
@@ -1266,7 +1310,8 @@ function renderTasks(){
 }
 
 function renderSystem(){
-  var d = S.data, accounts = d.accounts || [];
+  var d = S.data; if (!d) return;   // 直接打开 /#system（刷新或深链）时数据还没到，等 render() 再补
+  var accounts = d.accounts || [];
   var cool = accounts.filter(function(a){ return a.pool && a.pool.cooling; }).length;
   var bad = accounts.filter(function(a){ return a.pool && a.pool.inPool && !a.pool.healthy; }).length;
   $('#sysCards').innerHTML =
@@ -1687,6 +1732,16 @@ function init(){
   }, 30000);
 }
 
+// app.js 与 keys.js / usage.js 拼在同一个脚本里，后者的顶层状态（KS / US / LOG）
+// 要等各自那一段执行完才赋值。init() 里的 go() 会直接调用这些页面的加载函数，
+// 所以必须等整个脚本跑完再启动——否则从 #usage 进入时 US 还是 undefined，
+// 页面会永远停在「正在加载用量…」。
+if (document.readyState === 'loading'){
+  document.addEventListener('DOMContentLoaded', init);
+} else {
+  init();
+}
+
 "use strict";
 // ═══ 更新日志 ═══
 // 2026-09-16：实现密钥创建、编辑、启停、删除与一次性显示，沿用控制台交互与主题。
@@ -1865,7 +1920,10 @@ $('#keyRows').addEventListener('click', function(event){
   });
 });
 
-init();
+// 注意：这里不要调用 init()。keys.js 与 usage.js 会被拼进同一个脚本，本段执行时
+// usage.js 的顶层状态（US）还没赋值，从 #usage 进入就会抛
+// "Cannot read properties of undefined (reading 'loading')" 并卡在加载态。
+// 启动统一由 app.js 末尾负责，且延迟到整个脚本执行完之后。
 
 "use strict";
 // ═══ 更新日志 ═══
@@ -1999,6 +2057,136 @@ function usageInit(){
   if (btn) btn.addEventListener('click', loadUsage);
 }
 usageInit();
+
+/* ── 版本与热更新 ────────────────────────────────────
+ * 状态来自网关的本机管理接口 GET /update；真正的升级动作走
+ * POST /update/apply，由网关下载校验后把监听套接字交给新进程，
+ * 旧进程继续把在途请求（含长流式对话）跑完再退出，所以前台不需要重连。
+ */
+var UP = { data:null, timer:null, loading:false };
+var UP_STATE = {
+  idle:      { t:'空闲',   cls:''   },
+  checking:  { t:'检查中', cls:'w'  },
+  downloading:{ t:'下载中', cls:'w' },
+  handover:  { t:'切换中', cls:'w'  },
+  failed:    { t:'失败',   cls:'e'  }
+};
+var UP_BUSY = { checking:1, downloading:1, handover:1 };
+
+function upState(st){
+  var m = UP_STATE[st] || { t: st || '未知', cls:'' };
+  return '<span class="upd-tag ' + m.cls + '">' + esc(m.t) + '</span>';
+}
+
+function upBytes(n){
+  if (!n) return '—';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(0) + ' KB';
+  return (n / 1048576).toFixed(1) + ' MB';
+}
+
+function renderUpdate(){
+  var r = UP.data, box = $('#updRows');
+  if (!box) return;
+  if (!r || r.ok === false){
+    box.innerHTML = '<div class="upd-empty">' + esc((r && r.message) || '网关未响应热更新接口（旧版本网关请先升级）') + '</div>';
+    $('#updState').textContent = '不可用';
+    $('#updHint').textContent = '';
+    $('#btnUpdApply').disabled = true;
+    $('#btnUpdCheck').disabled = true;
+    return;
+  }
+  var s = r.status || {};
+  var busy = !!UP_BUSY[s.state];
+  var current = s.current || '—';
+  var commit = (s.commit && s.commit !== 'unknown') ? ' · ' + s.commit.slice(0, 7) : '';
+  var latest = s.latest_tag || (s.checked_at ? '已是最新' : '未检查');
+  var rows =
+    mrow('当前版本', current + commit) +
+    mrow('构建时间', s.built_at && s.built_at !== 'unknown' ? fmtTime(s.built_at) : '—') +
+    mrow('远端最新', latest, s.update_ready ? 'w' : 'ok') +
+    mrow('更新状态', UP_STATE[s.state] ? UP_STATE[s.state].t : (s.state || '—'),
+      (UP_STATE[s.state] || {}).cls || '') +
+    mrow('下载包', s.asset_name ? (s.asset_name + ' · ' + upBytes(s.asset_size)) : '—') +
+    mrow('上次检查', s.checked_at ? relTime(s.checked_at) : '—') +
+    mrow('仓库', s.repo || '—');
+  box.innerHTML = rows;
+  $('#updState').innerHTML = upState(s.state);
+  $('#btnUpdCheck').disabled = busy;
+  $('#btnUpdApply').disabled = busy || !s.update_ready;
+  var hint;
+  if (s.state === 'failed') hint = s.last_error || '更新失败';
+  else if (busy) hint = '正在' + (UP_STATE[s.state].t) + '…升级期间现有对话不会中断';
+  else if (s.update_ready) hint = '可升级到 ' + s.latest_tag;
+  else if (s.checked_at) hint = '已是最新版本';
+  else hint = s.inherited_fd ? '尚未检查远端版本' : '尚未检查远端版本（当前进程不是热更新交接启动）';
+  $('#updHint').textContent = hint;
+}
+
+async function loadUpdate(){
+  if (UP.loading) return;
+  UP.loading = true;
+  try{
+    UP.data = await api('api/update');
+  }catch(err){
+    UP.data = { ok:false, message: err.message };
+  }finally{
+    UP.loading = false;
+  }
+  renderUpdate();
+}
+
+function stopUpdatePoll(){
+  if (UP.timer){ clearInterval(UP.timer); UP.timer = null; }
+}
+
+function startUpdatePoll(){
+  stopUpdatePoll();
+  var ticks = 0;
+  UP.timer = setInterval(async function(){
+    ticks++;
+    await loadUpdate();
+    var st = UP.data && UP.data.status && UP.data.status.state;
+    // 交接完成后旧进程随时会退出，继续轮询会看到连接错误，到点就停。
+    if (ticks > 240 || st === 'failed') stopUpdatePoll();
+  }, 2000);
+}
+
+async function actUpdateCheck(){
+  $('#btnUpdCheck').disabled = true;
+  try{
+    var r = await api('api/update/check', {});
+    UP.data = r.ok === false ? r : r;
+    renderUpdate();
+    toast(r.ok === false ? ((r.message) || '检查失败') : '已检查远端版本', r.ok === false ? 'err' : 'ok');
+  }catch(err){
+    toast(err.message, 'err');
+    $('#btnUpdCheck').disabled = false;
+  }
+}
+
+async function actUpdateApply(){
+  var s = (UP.data && UP.data.status) || {};
+  ask('立即更新',
+    '将下载并切换到 ' + (s.latest_tag || '最新版本') + '。升级时正在进行的对话会继续跑完，不会中断；' +
+    '控制台页面可能会短暂失去响应，稍后自动恢复。',
+    '开始更新', false, async function(){
+      try{
+        var r = await api('api/update/apply', {});
+        if (r.ok === false){ toast(r.message || '更新未开始', 'err'); await loadUpdate(); return; }
+        toast('已开始更新，正在下载与切换', 'ok');
+        renderUpdate();
+        startUpdatePoll();
+      }catch(err){
+        toast(err.message, 'err');
+      }
+    });
+}
+
+document.addEventListener('click', function(e){
+  if (e.target.closest('#btnUpdCheck')){ actUpdateCheck(); return; }
+  if (e.target.closest('#btnUpdApply')){ actUpdateApply(); }
+});
 
 </script>
 </body>

@@ -1,5 +1,6 @@
 // ═══ 更新日志 ═══
 // 2026-09-17：锁定用量账本的累计、按模型拆分、原子落盘与重启恢复语义。
+// 2026-09-17：锁定热更新期间新旧进程共用账本时的合并语义（取大不丢不重）。
 package usage
 
 import (
@@ -124,5 +125,102 @@ func TestResetClearsCounters(t *testing.T) {
 	snapshot := store.Snapshot()
 	if snapshot.Totals.Requests != 0 || len(snapshot.Keys) != 0 {
 		t.Fatalf("reset snapshot = %+v", snapshot)
+	}
+}
+
+// TestConcurrentStoresMergeInsteadOfOverwrite 复现热更新窗口：
+// 新旧两个进程各自记录，后落盘的一方不能覆盖对方刚写的记录。
+func TestConcurrentStoresMergeInsteadOfOverwrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "usage.json")
+	oldProcess, err := Open(path, time.Hour)
+	if err != nil {
+		t.Fatalf("open old: %v", err)
+	}
+	defer oldProcess.Close()
+	newProcess, err := Open(path, time.Hour)
+	if err != nil {
+		t.Fatalf("open new: %v", err)
+	}
+	defer newProcess.Close()
+
+	at := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
+	oldProcess.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:deepseek-v4.1-flash", 100, 40, 1.5, true, at)
+	if err := oldProcess.Flush(); err != nil {
+		t.Fatalf("old flush: %v", err)
+	}
+	// 新进程在旧进程落盘之后才写：磁盘上已经有 key_a 的 140 token。
+	newProcess.Record("key_b", "团队 B", "wb2a_ef…gh", "global:deepseek-v4.1-flash", 7, 3, 0, false, at.Add(time.Minute))
+	if err := newProcess.Flush(); err != nil {
+		t.Fatalf("new flush: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var doc document
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if doc.Totals.Requests != 2 || doc.Totals.TotalTokens != 150 {
+		t.Fatalf("merged totals = %+v want requests=2 tokens=150", doc.Totals)
+	}
+	if doc.Totals.Credit != 1.5 {
+		t.Fatalf("merged credit = %v want 1.5", doc.Totals.Credit)
+	}
+	if len(doc.Keys) != 2 || doc.Keys["key_a"] == nil || doc.Keys["key_b"] == nil {
+		t.Fatalf("merged keys = %+v want both key_a and key_b", doc.Keys)
+	}
+	if doc.Keys["key_a"].Totals.TotalTokens != 140 {
+		t.Fatalf("key_a totals lost: %+v", doc.Keys["key_a"].Totals)
+	}
+	// 合并只保留较新的更新时间与较早的起始时间。
+	if doc.UpdatedAt.Before(at.Add(time.Minute)) {
+		t.Fatalf("updated_at = %v want the later write", doc.UpdatedAt)
+	}
+
+	// 新进程内存里也要看到合并结果：再落一次盘仍然是 2 请求 150 token。
+	if err := newProcess.Flush(); err != nil {
+		t.Fatalf("second flush: %v", err)
+	}
+	reopened, err := Open(path, time.Hour)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	snapshot := reopened.Snapshot()
+	if snapshot.Totals.Requests != 2 || snapshot.Totals.TotalTokens != 150 {
+		t.Fatalf("reloaded totals = %+v want requests=2 tokens=150", snapshot.Totals)
+	}
+}
+
+// TestMergeFromDiskSurvivesBrokenLedger 账本被外部写坏时不能阻断落盘。
+func TestMergeFromDiskSurvivesBrokenLedger(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "usage.json")
+	store, err := Open(path, time.Hour)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+	store.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:deepseek-v4.1-flash", 5, 5, 0, false, time.Now())
+	// 另一个进程写了一半就被杀掉：盘上是半截 JSON。
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatalf("seed broken ledger: %v", err)
+	}
+	if err := store.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var doc document
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("ledger must be rewritten as valid json: %v", err)
+	}
+	if doc.Totals.TotalTokens != 10 {
+		t.Fatalf("totals = %+v want 10 tokens", doc.Totals)
 	}
 }

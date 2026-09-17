@@ -55,7 +55,14 @@
   },
   "prompt": {
     "mode": "passthrough",
-    "file": ""
+    "file": "",
+    "act_note": ""
+  },
+  "update": {
+    "enabled": true,
+    "repo": "",
+    "token": "",
+    "dir": ""
   },
   "upstash": {
     "url": "",

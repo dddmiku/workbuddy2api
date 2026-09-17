@@ -79,7 +79,10 @@ $('#btnTheme').addEventListener('click', function(){
 /* ── 通讯 ─────────────────────────────────────────── */
 async function api(path, body){
   var opt = { headers:{ 'Content-Type':'application/json' }, cache:'no-store' };
-  if (path.indexOf('api/keys') === 0) opt.headers['X-Admin-Request'] = '1';
+  // 写操作要带管理标记：面板自身的同源校验据此拒绝第三方页面代发请求。
+  if (path.indexOf('api/keys') === 0 || path.indexOf('api/update/') === 0){
+    opt.headers['X-Admin-Request'] = '1';
+  }
   if (body !== undefined){ opt.method = 'POST'; opt.body = JSON.stringify(body || {}); }
   var r = await fetch(path, opt);
   if (r.status === 401){ location.replace('login'); throw new Error('登录已失效'); }
@@ -131,7 +134,10 @@ function go(v){
   closeNav();
   if (v === 'keys' && typeof loadKeys === 'function') loadKeys();
   if (v === 'usage' && typeof loadUsage === 'function') loadUsage();
+  // 更新卡片不依赖 /api/state，先拉它：即使系统页的数据还没到也不会漏掉加载。
+  if (v === 'system' && typeof loadUpdate === 'function') loadUpdate();
   if (v === 'system' && !sysLoaded){ sysLoaded = true; renderSystem(); }
+  if (v !== 'system' && typeof stopUpdatePoll === 'function') stopUpdatePoll();
   // 日志页：进入即拉一次，并按开关状态维持自动刷新；离开即停，避免后台空转。
   if (v === 'logs'){ loadLogs(); startLogAuto(); } else { stopLogAuto(); }
 }
@@ -479,7 +485,8 @@ function renderTasks(){
 }
 
 function renderSystem(){
-  var d = S.data, accounts = d.accounts || [];
+  var d = S.data; if (!d) return;   // 直接打开 /#system（刷新或深链）时数据还没到，等 render() 再补
+  var accounts = d.accounts || [];
   var cool = accounts.filter(function(a){ return a.pool && a.pool.cooling; }).length;
   var bad = accounts.filter(function(a){ return a.pool && a.pool.inPool && !a.pool.healthy; }).length;
   $('#sysCards').innerHTML =
@@ -898,4 +905,14 @@ function init(){
   setInterval(function(){
     if (!document.hidden && !DT.timer) loadAll();
   }, 30000);
+}
+
+// app.js 与 keys.js / usage.js 拼在同一个脚本里，后者的顶层状态（KS / US / LOG）
+// 要等各自那一段执行完才赋值。init() 里的 go() 会直接调用这些页面的加载函数，
+// 所以必须等整个脚本跑完再启动——否则从 #usage 进入时 US 还是 undefined，
+// 页面会永远停在「正在加载用量…」。
+if (document.readyState === 'loading'){
+  document.addEventListener('DOMContentLoaded', init);
+} else {
+  init();
 }

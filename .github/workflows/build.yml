@@ -18,6 +18,7 @@ permissions:
   contents: read
   packages: write
 
+
 jobs:
   gateway:
     name: Gateway image
@@ -133,3 +134,50 @@ jobs:
           name: wb2api-admin-amd64
           path: wb2api-admin-amd64.tar.gz
           if-no-files-found: error
+
+  # 热更新用的原始二进制：容器内直接下载替换进程（不重建镜像、不重启容器）。
+  # 只在打 tag 时挂到 Release，日常 workflow_dispatch 仅产出 artifact。
+  binaries:
+    name: Update binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Build linux binaries
+        run: |
+          set -eu
+          version="${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}"
+          commit="${{ github.sha }}"
+          built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          ldflags="-s -w -X workbuddy2api/internal/version.Version=${version} -X workbuddy2api/internal/version.Commit=${commit} -X workbuddy2api/internal/version.BuiltAt=${built_at}"
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build -trimpath -ldflags "${ldflags}" \
+              -o "wb2api-linux-${arch}" ./cmd/server
+          done
+          sha256sum wb2api-linux-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wb2api-binaries
+          path: |
+            wb2api-linux-amd64
+            wb2api-linux-arm64
+            SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Attach to release (tags only)
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 || \
+            gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes "见提交记录"
+          gh release upload "${GITHUB_REF_NAME}" wb2api-linux-amd64 wb2api-linux-arm64 SHA256SUMS.txt --clobber

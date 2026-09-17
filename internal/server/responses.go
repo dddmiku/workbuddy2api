@@ -14,6 +14,9 @@
 // 2026-09-16：缓存迟到工具元数据与参数，保留 refusal/legacy 调用，并在终态确定后收口输出。
 // 2026-09-17：合并 fork 的 Responses/图片工具兼容，保留严格终态、schema控制与数字保真扩展。
 // 2026-09-17：展开命名空间工具分组，出站用扁平名、回程还原 namespace + name。
+// 2026-09-17：新增 applyActNote：带工具的请求在 system 末尾追加运行约定，抑制上游模型
+//
+//	「一句话一个命令」的叙述式输出（原生 DeepSeek 不会这样，反代链路实测会）。
 package server
 
 import (
@@ -28,7 +31,66 @@ import (
 	"strings"
 	"time"
 	"workbuddy2api/internal/jsonutil"
+	"workbuddy2api/internal/prompt"
 )
+
+// applyActNote 在翻译后的 chat 请求体上追加运行约定（见 prompt.ActNote）。
+//
+// 只在客户端声明了工具时追加：没有工具就没有"边说边做"的问题，纯对话不该被约束。
+// note 为空表示不追加；约定追加到第一条 system（Codex 的 instructions 就在首位）末尾，
+// 原有内容一字不动；没有 system 消息时补一条，保证约束一定到达模型。
+func applyActNote(body []byte, note string, hasTools bool) []byte {
+	if strings.TrimSpace(note) == "" || !hasTools || len(body) == 0 {
+		return body
+	}
+	var obj map[string]any
+	if err := jsonutil.Decode(body, &obj); err != nil || obj == nil {
+		return body
+	}
+	msgs, ok := obj["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		return body
+	}
+	appended := false
+	for _, item := range msgs {
+		msg, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := msg["role"].(string)
+		if !strings.EqualFold(strings.TrimSpace(role), "system") {
+			continue
+		}
+		content, ok := msg["content"].(string)
+		if !ok {
+			// 结构化 content（part 数组）形态少见，保持原样不猜。
+			continue
+		}
+		msg["content"] = strings.TrimRight(content, "\n") + "\n\n" + note
+		appended = true
+		break
+	}
+	if !appended {
+		obj["messages"] = append([]any{map[string]any{"role": "system", "content": note}}, msgs...)
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// ActNoteFor 按配置取值：空 = 内置默认约定；"off" = 关闭；其他 = 自定义文本。
+func ActNoteFor(configured string) string {
+	switch value := strings.TrimSpace(configured); value {
+	case "":
+		return prompt.ActNote
+	case prompt.ActNoteDisabled, "none", "false":
+		return ""
+	default:
+		return value
+	}
+}
 
 // responsesRequest 是 Responses API 请求体里网关需要理解的字段子集。
 // 输出格式与推理、工具控制明确映射；不支持的服务端存储与续接返回错误。
@@ -682,6 +744,8 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	// 运行约定：只在带工具的请求上追加，抑制「一句话一个命令」的叙述式输出。
+	chatBody = applyActNote(chatBody, h.cfg.PromptActNote, len(req.Tools) > 0)
 
 	// 让 chatCompletions 从翻译后的 body 读；header/context/方法保持不变。
 	sub := r.Clone(r.Context())

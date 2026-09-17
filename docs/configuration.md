@@ -17,6 +17,11 @@
 | `server.outbound_image_budget_mb` | `7` | 出站图片字节预算；非正数关闭裁剪 |
 | `prompt.mode` | `passthrough` | 保留客户端指令；`custom` 才执行显式替换 |
 | `prompt.file` | 空 | `custom` 模式使用的提示词文件 |
+| `prompt.act_note` | 内置运行约定 | 追加到「带工具的 Responses 请求」system 末尾；`off` 关闭，也可写自定义文本 |
+| `update.enabled` | `true` | 是否允许管理台一键热更新 |
+| `update.repo` | `dddmiku/workbuddy2api` | 拉取更新的 GitHub 仓库（`owner/name`） |
+| `update.token` | 空 | 私有仓库读取用 token；公开仓库留空 |
+| `update.dir` | 数据目录下 `updates/` | 下载件与 `current` 指针的存放目录 |
 | `pool.max_in_flight` | `3` | 单账号并发上限；0 表示不限制 |
 | `session_sticky.enabled` | `true` | 按客户端会话键选择账号 |
 | `global.enabled` | `true` | 是否允许国际版账号路由 |
@@ -54,6 +59,41 @@
 新增账号必须重启加载。容器内运行登录脚本会按镜像用户写文件；若在宿主机导入账号，需要同步检查文件的所有者和 0600 读取权限。
 
 管理台在宿主机使用同一个 `data/` 目录连接 socket。共享目录，避免单独挂载重启时会被替换的 socket 文件。socket 包含管理能力，不能公开反向代理。
+
+## 热更新
+
+热更新让部署者不必重新 `docker compose build`：管理台「系统 → 版本与热更新」点一次「立即更新」，网关从 `update.repo` 的 GitHub Release 下载本机架构的二进制（`wb2api-linux-amd64` / `wb2api-linux-arm64`），校验 Release 提供的 SHA-256 摘要，然后把监听套接字交给新实例。
+
+```json
+{
+  "update": {
+    "enabled": true,
+    "repo": "dddmiku/workbuddy2api",
+    "token": "",
+    "dir": "/app/data/updates"
+  }
+}
+```
+
+关掉热更新的效果是 `GET /update` 与 `POST /update/apply` 返回「未启用」，只能手工重新部署。
+
+机制与前置条件：
+
+1. 容器入口是 `docker-entrypoint.sh`（PID 1）。它以子进程方式运行网关，所以交接后 PID 1 不会跟着消失，容器不重建。
+2. 旧进程把监听套接字以继承 FD 传给新进程，新进程报告就绪后旧进程才停止接受新连接，并继续把在途请求（包含流式对话）跑完；收尾等待上限 15 分钟。
+3. 新进程以 `WB2API_LISTEN_FD=3` / `WB2API_READY_FD=4` 启动，读同一个 `config.json` 与 `data/`，因此账号池、密钥库和用量账本继续可用。
+4. 下载件与 `current` 指针写在 `update.dir`。容器重启后 PID 1 优先执行 `current` 指向的二进制，所以升级后的版本不会在重启时回退。
+5. 用量账本在文件锁内按「本方增量」合并：交接窗口里新旧两个进程同时记账，两边的请求都会累计，也不会重复计。
+
+回滚与清理：
+
+```bash
+sudo rm -f data/updates/current        # 丢掉指针，回到镜像内置二进制
+sudo docker compose restart wb2api
+sudo rm -rf data/updates/*-wb2api-linux-*   # 确认不再需要旧下载件后清理
+```
+
+容器需要能访问 `api.github.com` 与发布资产地址。断网环境把 `update.enabled` 设为 `false`，改用 Release 附件手工升级。
 
 ## 定时任务
 

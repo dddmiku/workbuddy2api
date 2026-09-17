@@ -176,4 +176,7 @@ $('#keyRows').addEventListener('click', function(event){
   });
 });
 
-init();
+// 注意：这里不要调用 init()。keys.js 与 usage.js 会被拼进同一个脚本，本段执行时
+// usage.js 的顶层状态（US）还没赋值，从 #usage 进入就会抛
+// "Cannot read properties of undefined (reading 'loading')" 并卡在加载态。
+// 启动统一由 app.js 末尾负责，且延迟到整个脚本执行完之后。

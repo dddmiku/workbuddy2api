@@ -313,16 +313,38 @@
               </div>
             </section>
           </div>
-          <section class="panel">
-            <div class="ph">
-              <h2>容器状态</h2>
-              <span class="sp"></span>
-              <button class="btn sm" data-view="logs">查看请求日志</button>
-            </div>
-            <div class="pb">
-              <p class="sub">请求级日志（含调用密钥、uid、TTFB 与 token）已移到独立的「请求日志」页，支持自动刷新。</p>
-            </div>
-          </section>
+          <div>
+            <section class="panel">
+              <div class="ph">
+                <h2>版本与热更新</h2>
+                <span class="sp"></span>
+                <span class="sub" id="updState">—</span>
+              </div>
+              <div class="pb">
+                <div class="upd-rows" id="updRows"></div>
+                <div class="frow" style="margin-top:12px">
+                  <button class="btn sm" id="btnUpdCheck">检查更新</button>
+                  <button class="btn pri sm" id="btnUpdApply" disabled>立即更新</button>
+                  <span class="sp"></span>
+                  <span class="sub" id="updHint">—</span>
+                </div>
+                <p class="sub" style="margin:10px 0 0;line-height:1.6">
+                  升级时新进程先接手监听套接字，旧进程把正在进行的请求（包含流式对话）跑完再退出，
+                  所以调用中的客户端不需要重连，容器也不会重建。
+                </p>
+              </div>
+            </section>
+            <section class="panel" style="margin-top:14px">
+              <div class="ph">
+                <h2>容器状态</h2>
+                <span class="sp"></span>
+                <button class="btn sm" data-view="logs">查看请求日志</button>
+              </div>
+              <div class="pb">
+                <p class="sub">请求级日志（含调用密钥、uid、TTFB 与 token）已移到独立的「请求日志」页，支持自动刷新。</p>
+              </div>
+            </section>
+          </div>
         </div>
       </section>
     </div>

@@ -1,6 +1,8 @@
 /* ══ 请求日志 ═══════════════════════════════════════════════════════ */
 .log-table td,.log-table th{white-space:nowrap}
 .log-table td.mono{font-family:var(--mono);font-size:12px}
+/* 表头数值列是 th.r，数据列是 td.num：两处都要右对齐，否则表头在右、数字在左。 */
+.log-table td.num,.log-table th.r{text-align:right}
 .log-table tbody tr:hover{background:var(--surface-2)}
 .log-table .st-ok{color:var(--ok);font-weight:600}
 .log-table .st-warn{color:var(--warn);font-weight:600}

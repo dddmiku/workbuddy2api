@@ -1,13 +1,20 @@
 # syntax=docker/dockerfile:1
 # ═══ 更新日志 ═══
 # 2026-09-17：依赖下载同时读取 go.sum，确保干净构建使用已提交的依赖校验记录。
+# 2026-09-17：注入版本元数据（版本号/提交/构建时间），并改用 PID 1 监督脚本启动，
+#             支撑容器内热更新（交接后容器保持存活，由新实例继续服务）。
 FROM golang:1.23-alpine AS build
 WORKDIR /src
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILT_AT=unknown
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 # 一次编译全部二进制（工具进镜像，容器内可直接跑脚本）。全部 -trimpath -s -w。
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/wb2api ./cmd/server \
+RUN CGO_ENABLED=0 go build -trimpath \
+      -ldflags="-s -w -X workbuddy2api/internal/version.Version=${VERSION} -X workbuddy2api/internal/version.Commit=${COMMIT} -X workbuddy2api/internal/version.BuiltAt=${BUILT_AT}" \
+      -o /out/wb2api ./cmd/server \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/signin_bin ./cmd/signin \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/login ./cmd/login \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/credit ./cmd/credit \
@@ -30,6 +37,8 @@ COPY --from=build /out/credit /app/credit
 COPY --from=build /out/trial_bin /app/trial_bin
 COPY --from=build /out/activity_bin /app/activity_bin
 COPY login.sh signin.sh credit.sh trial.sh /app/
+# PID 1 监督脚本：热更新交接后保持容器存活（见 docker-entrypoint.sh 头注释）。
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 # 国际版注册地区自动完善模块（login.sh global 分支 import；scripts/ 无测试/缓存）
 COPY scripts/global_region.py /app/scripts/global_region.py
 COPY scripts/task_common.py /app/scripts/task_common.py
@@ -44,4 +53,5 @@ USER app
 EXPOSE 7863
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \
   CMD wget -qO- http://127.0.0.1:7863/healthz || exit 1
-ENTRYPOINT ["/app/wb2api", "-config", "/app/config.json"]
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+CMD ["-config", "/app/config.json"]

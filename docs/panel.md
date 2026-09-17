@@ -87,6 +87,14 @@ Cookie 路径固定为 `/admin/`，`proxy_pass` 结尾的斜杠不能省。站�
 
 用量统计页读取网关闭环记账：每个 key 的请求数、输入/输出/合计 token、最近使用时间，以及该 key 的按模型拆分。账本默认落在密钥库同目录的 `usage.json`，每 5 秒或在进程退出时原子落盘；只有成功请求参与累计，上游没返回 usage 时只累计请求数，不臆造 token。
 
+## 版本与热更新
+
+「系统」页的「版本与热更新」卡片显示当前版本、构建时间、远端最新版本、待下载资产与最近一次检查时间，并提供「检查更新」与「立即更新」。点「立即更新」后网关在后台下载并校验二进制，把监听套接字交给新实例，随后页面会每 2 秒轮询进度（空闲 / 检查中 / 下载中 / 切换中 / 失败）。
+
+正在进行的对话不会因为升级中断：旧进程只在把在途请求跑完之后退出，退出码 `75` 让容器 PID 1 保持存活，由新实例继续服务。升级期间页面可能短暂失去响应，恢复后版本号即为新版本。
+
+配置项、前置条件与回滚步骤见 [配置说明 → 热更新](configuration.md#热更新)。
+
 ## 面板内部接口
 
 前端只调用下列路径，经反向代理访问时统一带 `/admin` 前缀；除登录外都需要会话 Cookie。
@@ -101,6 +109,7 @@ Cookie 路径固定为 `/admin/`，`proxy_pass` 结尾的斜杠不能省。站�
 | GET | `/api/tasks`、`/api/task/log?key=` | 排程任务与单个任务日志 |
 | GET | `/api/logs?lines=` | 网关容器日志（同时返回解析好的请求行 `rows`） |
 | GET | `/api/usage` | 按 API key 累计的 token 用量（经本机 Unix socket 读网关 `/usage`） |
+| GET | `/api/update` | 热更新状态（经本机 Unix socket 读网关 `/update`） |
 | GET | `/api/keys` | 密钥列表 |
 | POST | `/api/auth/login`、`/api/auth/logout`、`/api/auth/password` | 登录、退出、修改管理员账号 |
 | POST | `/api/login/start`、`/api/login/poll` | 上游账号授权 |
@@ -109,8 +118,9 @@ Cookie 路径固定为 `/admin/`，`proxy_pass` 结尾的斜杠不能省。站�
 | POST | `/api/credit` | 刷新积分 |
 | POST | `/api/service/restart` | 重启网关容器 |
 | POST | `/api/keys`、`/api/keys/update`、`/api/keys/delete` | 密钥创建、修改（含 `models` 绑定）、删除 |
+| POST | `/api/update/check`、`/api/update/apply` | 检查远端版本、触发一次热更新 |
 
-密钥写接口需要登录 Cookie、`Content-Type: application/json` 与 `X-Admin-Request: 1`；携带 `Origin` 时必须与当前 Host 一致，请求体上限 8 KiB。
+密钥写接口与热更新动作需要登录 Cookie、`Content-Type: application/json` 与 `X-Admin-Request: 1`；携带 `Origin` 时必须与当前 Host 一致，请求体上限 8 KiB。热更新的 `tag` 字段只允许字母、数字、点、下划线和短横线。
 
 页面检查用 GET；后端未实现 HEAD，`curl -I` 的结果不能用来判断页面是否可用。
 

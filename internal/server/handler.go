@@ -21,6 +21,7 @@ import (
 
 	"workbuddy2api/internal/apikeys"
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/hotupdate"
 	"workbuddy2api/internal/jsonutil"
 	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/pool"
@@ -28,6 +29,7 @@ import (
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 	"workbuddy2api/internal/usage"
+	"workbuddy2api/internal/version"
 )
 
 // Config handler 依赖。
@@ -54,6 +56,10 @@ type Config struct {
 	// PromptText custom 模式下注入的系统提示词文本（来自 config.PromptText）。
 	PromptText string
 
+	// PromptActNote 运行约定文本，追加在带工具请求的 system 末尾（见 prompt.ActNote）。
+	// 空 = 不追加（调用方用 ActNoteFor 解析配置后再传入）。
+	PromptActNote string
+
 	// Tasks 排程任务控制器（可选；nil = /tasks 报 available=false，面板渲染说明态）。
 	Tasks TaskController
 
@@ -66,6 +72,9 @@ type Config struct {
 	// Usage 按调用密钥累计的 token 账本（可选；nil = /usage 报未启用）。
 	// 只有成功请求参与累计，数据来自上游 usage，缺失即不记 token（缺失≠0）。
 	Usage *usage.Store
+
+	// Update 热更新管理器（可选；nil = /update/* 报未启用）。
+	Update *hotupdate.Manager
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -116,6 +125,10 @@ func NewHandler(cfg Config) *Handler {
 	// 用量统计只走本机 Unix socket（管理台「用量统计」页）：普通调用密钥拿不到全量用量，
 	// 单密钥自己的用量在日志与面板里按 key 归属，不需要公开端点。
 	h.mux.HandleFunc("GET /usage", h.requireInternal(h.usageStats))
+	// 热更新同样只走本机管理通道：能触发版本切换的入口不能暴露给调用密钥。
+	h.mux.HandleFunc("GET /update", h.requireInternal(h.updateStatus))
+	h.mux.HandleFunc("POST /update/check", h.requireInternal(h.updateCheck))
+	h.mux.HandleFunc("POST /update/apply", h.requireInternal(h.updateApply))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	return h
 }
@@ -237,6 +250,76 @@ func (h *Handler) recordUsage(st *chatStat, model string) {
 		st.credit, st.hasCred, time.Now())
 }
 
+// updateStatus 返回热更新状态（当前版本、远端最新版本、最近错误）。
+func (h *Handler) updateStatus(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Update == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": false, "enabled": false,
+			"message": "热更新未启用：config 里设置 update.enabled=true 后重启网关",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": h.cfg.Update.Status()})
+}
+
+// updateCheck 查询远端最新版本（只读，不改动任何东西）。
+func (h *Handler) updateCheck(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Update == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "热更新未启用"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	status, err := h.cfg.Update.Check(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": err.Error(), "status": status})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": status})
+}
+
+// updateApply 触发一次热更新。
+//
+// 下载与交接在后台完成（以秒计），接口立即返回；真正的停机发生在交接成功之后，
+// 由 main 的优雅停机路径把在途请求跑完。前端用 /update 轮询进度。
+func (h *Handler) updateApply(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Update == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "热更新未启用"})
+		return
+	}
+	var body struct {
+		Tag string `json:"tag"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<12)).Decode(&body)
+	}
+	status := h.cfg.Update.Status()
+	switch status.State {
+	case hotupdate.StateChecking, hotupdate.StateDownloading, hotupdate.StateHandover:
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "已有更新任务在进行中", "status": status})
+		return
+	}
+	target := strings.TrimSpace(body.Tag)
+	if !status.UpdateReady && target == "" {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": false, "message": "已经是最新版本（可先点「检查更新」确认远端版本）", "status": status,
+		})
+		return
+	}
+	go func() {
+		// 独立 ctx：请求返回后这次下载仍要跑完。
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		if _, err := h.cfg.Update.Apply(ctx, target); err != nil {
+			log.Printf("ERROR: [update] apply failed: %v", err)
+		}
+	}()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "message": "已开始热更新：新实例接管后，本实例会把手上的请求跑完再退出",
+		"status": h.cfg.Update.Status(),
+	})
+}
+
 func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 	total, healthy, _, _, _ := h.cfg.Pool.CountsDetailed()
 	// 用 ServableNow 判定：healthy>0 但全占满在途时 chat 会 503，探活必须同口径，
@@ -257,6 +340,8 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 		"healthy":        healthy,
 		"total":          total,
 		"service":        ServiceName,
+		"version":        version.Version,
+		"commit":         version.Commit,
 		"realm_servable": realmServable,
 	})
 }

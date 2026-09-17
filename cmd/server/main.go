@@ -14,6 +14,7 @@ import (
 
 	"workbuddy2api/internal/apikeys"
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/hotupdate"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/redisstore"
 	"workbuddy2api/internal/scheduler"
@@ -221,33 +222,66 @@ func main() {
 		log.Printf("补签已启用：%v 点（growth_center.py ALL --makeup-only --yes）", cfg.Schedule.MakeupHours)
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// 监听套接字：热更新后的新实例从环境变量继承 FD，其余情况正常监听。
+	// 用 listener 而不是 ListenAndServe，才能把套接字交给新实例。
+	mainLn, inherited, err := hotupdate.Listen(cfg.Listen)
+	if err != nil {
+		log.Fatalf("listen %s: %v", cfg.Listen, err)
+	}
+	defer mainLn.Close()
+	if inherited {
+		log.Printf("[update] inherited listening socket from the previous instance (fd=%s)",
+			os.Getenv(hotupdate.EnvListenFD))
+	}
+
+	// 热更新管理器：查版本、下载校验、交接。OnSwitched 触发本进程优雅停机——
+	// 新实例已经在同一套接字上 accept，本进程只负责把在途请求跑完。
+	handoverDone := make(chan string, 1)
+	updateManager := hotupdate.NewManager(hotupdate.Options{
+		Enabled:  cfg.Update.Enabled,
+		Repo:     cfg.Update.Repo,
+		Token:    cfg.Update.Token,
+		Dir:      updateDir(cfg),
+		Args:     os.Args[1:],
+		Listener: mainLn,
+		OnSwitched: func() {
+			select {
+			case handoverDone <- "hot update":
+			default:
+			}
+		},
+	})
+
 	h := server.NewHandler(server.Config{
-		Pool:         p,
-		Upstream:     up,
-		APIKey:       cfg.APIKey,
-		APIKeys:      keyStore,
-		Session:      sessRouter,
-		StickyCount:  sessCount,
-		RedisMode:    redisMode,
-		SoftCooldown: cfg.SoftRateDur,
-		PromptMode:   cfg.Prompt.Mode,
-		PromptText:   cfg.PromptText,
-		MaxBodyBytes: int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
-		Tasks:        sch,                               // /tasks 端点：排程自省 + 手动触发
+		Pool:          p,
+		Upstream:      up,
+		APIKey:        cfg.APIKey,
+		APIKeys:       keyStore,
+		Session:       sessRouter,
+		StickyCount:   sessCount,
+		RedisMode:     redisMode,
+		SoftCooldown:  cfg.SoftRateDur,
+		PromptMode:    cfg.Prompt.Mode,
+		PromptText:    cfg.PromptText,
+		PromptActNote: server.ActNoteFor(cfg.Prompt.ActNote),
+		Update:        updateManager,
+		MaxBodyBytes:  int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
+		Tasks:         sch,                               // /tasks 端点：排程自省 + 手动触发
 		// global realm 开关（handler 侧第三道闸：modelList 据此决定是否列 global 名单）。
 		GlobalEnabled: cfg.Global.Enabled,
 		Usage:         usageStore,
 	})
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	var adminServer *http.Server
 	if keyStore != nil {
-		listener, err := apikeys.ListenUnix(cfg.APIKeysSocket)
+		adminLn, err := apikeys.ListenUnix(cfg.APIKeysSocket)
 		if err != nil {
 			log.Fatalf("listen API key admin socket: %v", err)
 		}
-		defer listener.Close()
+		defer adminLn.Close()
 		mux := http.NewServeMux()
 		mux.Handle("/keys", keyStore.AdminHandler())
 		mux.Handle("/keys/", keyStore.AdminHandler())
@@ -255,7 +289,7 @@ func main() {
 		adminServer = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
 		defer adminServer.Close()
 		go func() {
-			if err := adminServer.Serve(listener); err != nil && err != http.ErrServerClosed {
+			if err := adminServer.Serve(adminLn); err != nil && err != http.ErrServerClosed {
 				log.Printf("[api-keys] admin server: %v", err)
 			}
 		}()
@@ -276,7 +310,18 @@ func main() {
 		IdleTimeout: 120 * time.Second,
 	}
 	go func() {
-		<-ctx.Done()
+		reason := "signal"
+		select {
+		case <-ctx.Done():
+		case why := <-handoverDone:
+			reason = why
+		}
+		if reason != "signal" {
+			// 热更新：新实例已接管监听，这里只等在途请求收尾；等待上限放宽到能覆盖
+			// 长 SSE（上游 idle_timeout 默认 300s + 收尾）。不设上限会在更新时掐断
+			// 正在进行的对话。
+			log.Printf("[update] draining in-flight requests before exit (%s)", reason)
+		}
 		p.Flush() // 信号触发：先落盘再做优雅停机
 		// Flush 已把最后一笔状态快照提交给 Redis（fire-and-forget）；store.Close
 		// 等 Upstash 在途/排队写排空再关连接——最后一笔镜像必须写完才退出（发现 4）。
@@ -284,12 +329,22 @@ func main() {
 		if cErr := store.Close(); cErr != nil {
 			log.Printf("WARN: [server] redisstore close: %v", cErr)
 		}
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		wait := 5 * time.Second
+		if reason != "signal" {
+			wait = hotupdate.ShutdownTimeout()
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), wait)
 		defer cancel()
 		if adminServer != nil {
 			_ = adminServer.Shutdown(shutdownCtx)
 		}
 		_ = srv.Shutdown(shutdownCtx)
+		if reason != "signal" {
+			// 约定退出码：容器 PID 1 看到它就不再拉起新实例（套接字已在别人手里），
+			// 但保持容器存活。
+			log.Printf("[update] handover complete, exiting %d", hotupdate.ExitHandover)
+			os.Exit(hotupdate.ExitHandover)
+		}
 	}()
 
 	if cfg.Global.Enabled {
@@ -299,7 +354,16 @@ func main() {
 		log.Printf("global realm 已禁用（config global.enabled=false，纯 CN）")
 	}
 	log.Printf("workbuddy2api listening on %s (api_key=%v)", cfg.Listen, cfg.APIKey != "")
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	// 先起 accept 循环再通知就绪：父进程收到通知后会立刻停止接受新连接，
+	// 如果这时本进程还没开始 accept，连接会压在队列里直到本进程接管（不影响正确性，
+	// 但排队越短越好）。
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(mainLn) }()
+	// 交接就绪通知：父进程据此确认新实例已开始服务，然后才停旧实例。
+	if err := hotupdate.NotifyReady(); err != nil {
+		log.Printf("WARN: [update] notify ready: %v", err)
+	}
+	if err := <-serveErr; err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
 	}
 	log.Printf("bye")

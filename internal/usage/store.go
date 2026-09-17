@@ -2,12 +2,21 @@
 // 2026-09-17：新增按调用密钥累计的 token 用量账本：进程内累加、周期落盘，
 //
 //	供请求日志（key= 列）与管理台「用量统计」页读取。
+//
+// 2026-09-17：落盘前先与磁盘账本按字段取最大值合并。热更新时新旧进程会短暂同时
+//
+//	持有账本，合并保证两边记的请求都不丢，也不会把同一笔重复计两次。
+//
+// 2026-09-17：改为「基线 + 本方增量」并在文件锁内读改写。取最大值只在两侧看到同一批
+//
+//	记录时才对；两个进程各自服务不同请求时取大会丢掉一方记的请求，改增量后可累加。
 package usage
 
 import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -100,11 +109,14 @@ type Store struct {
 	path     string
 	interval time.Duration
 	doc      document
-	dirty    bool
-	closed   bool
-	stop     chan struct{}
-	done     chan struct{}
-	persist  func(document) error
+	// written 本进程上一次提交的累计值。落盘时用「当前 - written」算出本方新增量，
+	// 热更新期间新旧进程各自只往盘上加自己那部分，既不覆盖对方也不重复计数。
+	written document
+	dirty   bool
+	closed  bool
+	stop    chan struct{}
+	done    chan struct{}
+	persist func(document) error
 }
 
 // Open 打开（或新建）账本文件。path 为空返回错误——调用方据此跳过用量统计。
@@ -163,6 +175,7 @@ func (s *Store) load() error {
 	}
 	doc.Version = Version
 	s.doc = doc
+	s.written = cloneDocument(doc)
 	return nil
 }
 
@@ -297,8 +310,20 @@ func (s *Store) Flush() error {
 	return nil
 }
 
-// write 原子写：先写同目录临时文件再 rename，避免半截 JSON 覆盖可用账本。
+// write 原子写：先在文件锁内把本进程的新增量并入盘上账本，再 tmp + rename。
 func (s *Store) write(doc document) error {
+	return s.persistDocument(doc, true)
+}
+
+// writeDirect 不做增量合并，直接覆盖（Reset 专用：清零必须真的清零）。
+func (s *Store) writeDirect(doc document) error {
+	return s.persistDocument(doc, false)
+}
+
+func (s *Store) persistDocument(doc document, merge bool) error {
+	if merge {
+		doc = s.mergeDelta(doc)
+	}
 	if dir := filepath.Dir(s.path); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return err
@@ -313,7 +338,233 @@ func (s *Store) write(doc document) error {
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	if err := os.Rename(tmp, s.path); err != nil {
+		return err
+	}
+	s.setWritten(doc)
+	return nil
+}
+
+// mergeDelta 把「本进程自上次落盘以来的新增量」加到盘上的账本里。
+//
+// 为什么不是简单覆盖：热更新期间新旧两个进程会同时存活（新实例已接管监听，旧实例
+// 还在把在途请求跑完），谁后落盘谁就会用自己内存里的快照覆盖对方刚写的记录。
+//
+// 为什么也不是"逐字段取最大值"：取大只对"两侧看到的是同一批记录"成立。两个进程
+// 各自服务不同请求时，取大会**丢掉**只被一方记到的那部分（旧进程 100 笔 + 新进程
+// 5 笔 → 仍是 100 笔）。改成"基线 + 本方增量"后，两边记录的都会累加，且由于增量
+// 是本方累计值减去本方上次已提交的累计值，重复落盘也不会重复计数。
+//
+// 读-改-写整段用文件锁保护，避免两个进程在同一瞬间落盘。读盘失败（文件缺失、被
+// 写坏、超限）时按空账本处理，只保证自己这份数据落盘，不阻断写入。
+func (s *Store) mergeDelta(mine document) document {
+	unlock, err := lockLedger(s.path)
+	if err != nil {
+		log.Printf("WARN: [usage] ledger lock: %v", err)
+	} else {
+		defer unlock()
+	}
+	base := s.readDisk()
+	mine.Version = Version
+	merged := addDocument(base, deltaDocument(mine, s.writtenSnapshot()))
+	s.setWritten(mine)
+	return merged
+}
+
+// readDisk 读回盘上账本；缺失或损坏时返回空账本（不阻断落盘）。
+func (s *Store) readDisk() document {
+	empty := document{Version: Version, Keys: map[string]*keyRecord{}}
+	raw, err := os.ReadFile(s.path)
+	if err != nil || len(raw) == 0 || len(raw) > 1<<20 {
+		return empty
+	}
+	var disk document
+	if json.Unmarshal(raw, &disk) != nil {
+		return empty
+	}
+	if disk.Keys == nil {
+		disk.Keys = map[string]*keyRecord{}
+	}
+	return disk
+}
+
+// writtenSnapshot 本进程上次提交的累计值（深拷贝，防止后续写入改到它）。
+func (s *Store) writtenSnapshot() document {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return cloneDocument(s.written)
+}
+
+func (s *Store) setWritten(doc document) {
+	s.mu.Lock()
+	s.written = cloneDocument(doc)
+	s.mu.Unlock()
+}
+
+// deltaDocument 本进程自上次提交以来的新增量（累计量单调不减，负数按 0 处理）。
+func deltaDocument(mine, prev document) document {
+	out := document{
+		Version:   Version,
+		Since:     mine.Since,
+		UpdatedAt: mine.UpdatedAt,
+		Totals:    deltaTotals(mine.Totals, prev.Totals),
+		Keys:      make(map[string]*keyRecord, len(mine.Keys)),
+	}
+	for id, current := range mine.Keys {
+		if current == nil {
+			continue
+		}
+		var before keyRecord
+		if old := prev.Keys[id]; old != nil {
+			before = *old
+		}
+		item := &keyRecord{
+			Name:        current.Name,
+			MaskedKey:   current.MaskedKey,
+			Totals:      deltaTotals(current.Totals, before.Totals),
+			Models:      make(map[string]*Totals, len(current.Models)),
+			FirstUsedAt: current.FirstUsedAt,
+			LastUsedAt:  current.LastUsedAt,
+		}
+		for model, totals := range current.Models {
+			if totals == nil {
+				continue
+			}
+			var beforeModel Totals
+			if before.Models != nil {
+				if old := before.Models[model]; old != nil {
+					beforeModel = *old
+				}
+			}
+			delta := deltaTotals(*totals, beforeModel)
+			item.Models[model] = &delta
+		}
+		out.Keys[id] = item
+	}
+	return out
+}
+
+// addDocument 把增量并进基线账本（总量、按密钥、按模型逐层累加）。
+func addDocument(base, delta document) document {
+	base.Version = Version
+	base.Totals = addTotals(base.Totals, delta.Totals)
+	if !delta.Since.IsZero() && (base.Since.IsZero() || delta.Since.Before(base.Since)) {
+		base.Since = delta.Since
+	}
+	if delta.UpdatedAt.After(base.UpdatedAt) {
+		base.UpdatedAt = delta.UpdatedAt
+	}
+	if base.Keys == nil {
+		base.Keys = map[string]*keyRecord{}
+	}
+	for id, add := range delta.Keys {
+		if add == nil {
+			continue
+		}
+		current := base.Keys[id]
+		if current == nil {
+			copied := *add
+			copied.Models = cloneModels(add.Models)
+			base.Keys[id] = &copied
+			continue
+		}
+		current.Totals = addTotals(current.Totals, add.Totals)
+		if current.Name == "" {
+			current.Name = add.Name
+		}
+		if current.MaskedKey == "" {
+			current.MaskedKey = add.MaskedKey
+		}
+		if !add.FirstUsedAt.IsZero() && (current.FirstUsedAt.IsZero() || add.FirstUsedAt.Before(current.FirstUsedAt)) {
+			current.FirstUsedAt = add.FirstUsedAt
+		}
+		if add.LastUsedAt.After(current.LastUsedAt) {
+			current.LastUsedAt = add.LastUsedAt
+		}
+		if current.Models == nil {
+			current.Models = map[string]*Totals{}
+		}
+		for model, totals := range add.Models {
+			if totals == nil {
+				continue
+			}
+			if existing := current.Models[model]; existing != nil {
+				merged := addTotals(*existing, *totals)
+				current.Models[model] = &merged
+			} else {
+				copied := *totals
+				current.Models[model] = &copied
+			}
+		}
+	}
+	return base
+}
+
+// cloneDocument 深拷贝账本，避免共享 map / 指针。
+func cloneDocument(doc document) document {
+	out := doc
+	out.Keys = make(map[string]*keyRecord, len(doc.Keys))
+	for id, record := range doc.Keys {
+		if record == nil {
+			continue
+		}
+		copied := *record
+		copied.Models = cloneModels(record.Models)
+		out.Keys[id] = &copied
+	}
+	return out
+}
+
+// deltaTotals 逐字段算增量，负数（清零或跨进程读到的更大值）按 0 处理。
+func deltaTotals(now, prev Totals) Totals {
+	return Totals{
+		Requests:         positive(now.Requests - prev.Requests),
+		PromptTokens:     positive(now.PromptTokens - prev.PromptTokens),
+		CompletionTokens: positive(now.CompletionTokens - prev.CompletionTokens),
+		TotalTokens:      positive(now.TotalTokens - prev.TotalTokens),
+		Credit:           positiveFloat(now.Credit - prev.Credit),
+	}
+}
+
+// addTotals 逐字段相加。
+func addTotals(base, delta Totals) Totals {
+	return Totals{
+		Requests:         base.Requests + delta.Requests,
+		PromptTokens:     base.PromptTokens + delta.PromptTokens,
+		CompletionTokens: base.CompletionTokens + delta.CompletionTokens,
+		TotalTokens:      base.TotalTokens + delta.TotalTokens,
+		Credit:           base.Credit + delta.Credit,
+	}
+}
+
+func positive(value int64) int64 {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
+func positiveFloat(value float64) float64 {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
+// cloneModels 深拷贝按模型维度的累计量。
+func cloneModels(source map[string]*Totals) map[string]*Totals {
+	if source == nil {
+		return map[string]*Totals{}
+	}
+	out := make(map[string]*Totals, len(source))
+	for model, totals := range source {
+		if totals == nil {
+			continue
+		}
+		copied := *totals
+		out[model] = &copied
+	}
+	return out
 }
 
 // loop 周期落盘，直到 Close。
@@ -356,7 +607,10 @@ func (s *Store) Reset(at time.Time) error {
 		return nil
 	}
 	s.doc = document{Version: Version, Since: at.UTC(), Keys: map[string]*keyRecord{}}
-	s.dirty = true
+	s.dirty = false
+	snapshot := s.doc
 	s.mu.Unlock()
-	return s.Flush()
+	// 清零必须直接覆盖：走增量合并的话，盘上旧数据会被当成"别人的贡献"保留下来。
+	// 清零之后各进程的新增量照旧累加（它们只减自己上次提交的基线）。
+	return s.writeDirect(snapshot)
 }
