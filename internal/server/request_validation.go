@@ -1,6 +1,7 @@
 // ═══ 更新日志 ═══
 // 2026-09-16：在选号前校验请求基础结构并拒绝不支持的 Responses 状态能力，避免坏参数被静默丢弃或触发换号。
 // 2026-09-17：接受 Responses 的命名空间工具分组，并把命名空间名字写回函数调用历史。
+// 2026-09-18：内置工具按前缀接受并丢弃（补齐 tool_search 等新类型），避免客户端升级即不可用。
 package server
 
 import (
@@ -132,16 +133,45 @@ func requestValidationTools(value any, path string, responses bool) error {
 // 命名空间分组（type=namespace，内含 function/custom 子工具，子层不再允许继续嵌套）。
 // 网关无法实现的内置工具按声明接受、由 responsesTools 丢弃：官方 Codex 0.155 默认
 // 就会带上 web_search，整条请求拒绝会让客户端完全不可用。
+//
+// 两类区别对待：
+//   - 客户端自己执行、默认就会带上的（web_search / tool_search）：接受并丢弃，
+//     拒绝等于整个会话不可用（Codex 0.156 起默认带 tool_search）。
+//   - 需要服务端能力、用户显式声明的（file_search / mcp / image_generation 等）：
+//     继续明确报错。静默丢弃会让用户以为文件检索/图片生成在生效，比报错更难排查。
 var unimplementedBuiltinTools = map[string]bool{
 	"web_search":         true,
 	"web_search_preview": true,
+	"tool_search":        true,
+}
+
+// builtinToolPrefixes 已知内置工具族：官方会发布带日期后缀的版本变体
+// （例如 web_search_2025_08_26），按前缀一并接受，避免每次客户端升级都炸一次。
+var builtinToolPrefixes = []string{
+	"web_search", "tool_search",
+}
+
+// isUnimplementedBuiltinTool 判断是否为"接受但丢弃"的内置工具类型。
+func isUnimplementedBuiltinTool(kind string) bool {
+	if kind == "" {
+		return false
+	}
+	if unimplementedBuiltinTools[kind] {
+		return true
+	}
+	for _, prefix := range builtinToolPrefixes {
+		if strings.HasPrefix(kind, prefix+"_") || strings.HasPrefix(kind, prefix+"-") {
+			return true
+		}
+	}
+	return false
 }
 
 func requestValidationToolSpec(tool map[string]any, toolPath string, responses, allowNamespace bool) error {
 	if err := requestValidationString(tool["type"], toolPath+".type", true); err != nil {
 		return err
 	}
-	if kind, _ := tool["type"].(string); unimplementedBuiltinTools[kind] {
+	if kind, _ := tool["type"].(string); isUnimplementedBuiltinTool(kind) {
 		if !responses {
 			return fmt.Errorf("%s.type %q is not supported; use function or custom tools", toolPath, kind)
 		}

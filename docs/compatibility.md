@@ -20,7 +20,8 @@
 | `background=true` | 不支持，返回 400 |
 | 服务端 `conversation` / `prompt` | 不支持非空值 |
 | 自动 `truncation` | 不支持 |
-| 内置 web search 等工具 | 不支持，返回明确错误 |
+| 客户端自带的内置工具（`web_search`、`tool_search`） | 接受声明但不转发上游。官方 Codex 默认就会带上，拒绝会让整个会话不可用；模型只是不会去调用它们 |
+| 需要服务端能力的工具（`file_search`、`mcp`、`image_generation`、`computer_use`、`local_shell`） | 不支持，返回明确错误。这些是用户显式声明的能力，静默丢弃会让人误以为在生效 |
 | `text.verbosity` | 不支持非空值 |
 
 JSON Schema 校验针对最终文本输出，允许先完成工具调用。外部 schema 引用不受支持。模型拒答、上限截断和上游错误分别处理，不能只依赖 HTTP 200 判断最终业务结果。
