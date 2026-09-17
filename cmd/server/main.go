@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -307,20 +308,33 @@ func main() {
 		Usage:         usageStore,
 	})
 
+	// 管理通道 HTTP 服务：正常运行时就绪；兼容路径下等旧实例释放路径后再起。
+	// adminServer 由后台 goroutine 赋值、由停机路径读取，用锁保护。
+	var adminMu sync.Mutex
 	var adminServer *http.Server
 	serveAdmin := func(listener net.Listener) {
 		mux := http.NewServeMux()
 		mux.Handle("/keys", keyStore.AdminHandler())
 		mux.Handle("/keys/", keyStore.AdminHandler())
 		mux.Handle("/", h.InternalHandler())
-		adminServer = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
-		defer adminServer.Close()
+		server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
+		adminMu.Lock()
+		adminServer = server
+		adminMu.Unlock()
 		go func() {
-			if err := adminServer.Serve(listener); err != nil && err != http.ErrServerClosed {
+			if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 				log.Printf("[api-keys] admin server: %v", err)
 			}
 		}()
 		log.Printf("API key management enabled (%d keys)", len(keyStore.List()))
+	}
+	shutdownAdmin := func(ctx context.Context) {
+		adminMu.Lock()
+		server := adminServer
+		adminMu.Unlock()
+		if server != nil {
+			_ = server.Shutdown(ctx)
+		}
 	}
 	if adminLn != nil {
 		serveAdmin(adminLn)
@@ -375,9 +389,7 @@ func main() {
 		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), wait)
 		defer cancel()
-		if adminServer != nil {
-			_ = adminServer.Shutdown(shutdownCtx)
-		}
+		shutdownAdmin(shutdownCtx)
 		_ = srv.Shutdown(shutdownCtx)
 		if reason != "signal" {
 			// 约定退出码：容器 PID 1 看到它就不再拉起新实例（套接字已在别人手里），
