@@ -968,6 +968,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				if len(detail) > 2000 {
 					detail = logfmt.Truncate(detail, 2000)
 				}
+				// 11155（reasoning_content_missing）归因：上游只看「assistant 消息有没有
+				// reasoning_content 字段」，出错时把出站消息形状压成一行，复现即可定位
+				// 是客户端没带推理项、转换层丢了文本，还是字段缺失。不含任何正文。
+				if strings.Contains(detail, "reasoning_content_missing") || strings.Contains(detail, `"code":11155`) {
+					stats, hasStats := reasoningStatsFrom(r.Context())
+					log.Printf("WARN: [server] upstream 11155 shape uid=%s key=%s %s",
+						logfmt.UID8(acct.UID), st.keyName, chatShapeSummary(body, stats, hasStats))
+				}
 				writeOpenAIError(w, http.StatusBadRequest, "upstream_invalid_request", "upstream rejected request params: "+detail)
 				st.status = http.StatusBadRequest
 				return

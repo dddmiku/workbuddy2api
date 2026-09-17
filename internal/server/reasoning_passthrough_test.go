@@ -131,3 +131,84 @@ func TestReasoningPassthroughSurvivesUpstreamBackfill(t *testing.T) {
 		t.Fatalf("没有 assistant 消息: %s", out)
 	}
 }
+
+// TestReasoningTextlessItemStillMarksTrace 客户端只剩加密推理（summary/content 都没有明文）
+// 时也必须把「本对话走过思考」这件事带出去：上游按字段存在性校验，整条链缺字段就是 11155。
+func TestReasoningTextlessItemStillMarksTrace(t *testing.T) {
+	request := `{"model":"global:deepseek-v4.1-flash","stream":false,"input":[
+	  {"role":"user","content":"读文件"},
+	  {"type":"reasoning","id":"rs_1","summary":[],"content":null,"encrypted_content":"opaque-blob"},
+	  {"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"},
+	  {"type":"function_call_output","call_id":"call_1","output":"结果"}],
+	  "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`
+	body, _, err := responsesToChat([]byte(request))
+	if err != nil {
+		t.Fatalf("转换失败: %v", err)
+	}
+	messages := assistantMessages(t, body)
+	if len(messages) != 1 {
+		t.Fatalf("assistant 消息数 = %d want 1: %s", len(messages), body)
+	}
+	value, present := messages[0]["reasoning_content"]
+	if !present {
+		t.Fatalf("无明文推理时仍必须带 reasoning_content 字段: %s", body)
+	}
+	if text, _ := value.(string); text != "" {
+		t.Errorf("无明文推理应补空串，得到 %q", text)
+	}
+}
+
+// TestReasoningTrailingItemAttachesToLastAssistant 历史以推理项收尾（后面没有新的
+// assistant 输出）时，这段推理要贴到最后一条 assistant 消息上，不能被静默丢弃。
+func TestReasoningTrailingItemAttachesToLastAssistant(t *testing.T) {
+	request := `{"model":"global:deepseek-v4.1-flash","stream":false,"input":[
+	  {"role":"user","content":"第一步"},
+	  {"role":"assistant","content":"第一步答案"},
+	  {"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"收尾推理"}]}]}`
+	body, _, err := responsesToChat([]byte(request))
+	if err != nil {
+		t.Fatalf("转换失败: %v", err)
+	}
+	messages := assistantMessages(t, body)
+	if len(messages) != 1 {
+		t.Fatalf("assistant 消息数 = %d want 1: %s", len(messages), body)
+	}
+	if text, _ := messages[0]["reasoning_content"].(string); text != "收尾推理" {
+		t.Fatalf("尾随推理项未贴到最后一条 assistant: %q (%s)", text, body)
+	}
+}
+
+// TestReasoningFillSkippedForNonDeepSeek 非 deepseek 模型不补 reasoning_content，
+// 避免给 glm/kimi 塞上游不认识的字段。
+func TestReasoningFillSkippedForNonDeepSeek(t *testing.T) {
+	request := `{"model":"global:glm-5.2","stream":false,"input":[
+	  {"role":"user","content":"读文件"},
+	  {"type":"reasoning","id":"rs_1","summary":[],"content":null,"encrypted_content":"opaque-blob"},
+	  {"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"},
+	  {"type":"function_call_output","call_id":"call_1","output":"结果"}],
+	  "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`
+	body, _, err := responsesToChat([]byte(request))
+	if err != nil {
+		t.Fatalf("转换失败: %v", err)
+	}
+	if strings.Contains(string(body), "reasoning_content") {
+		t.Fatalf("非 deepseek 模型不应补 reasoning_content: %s", body)
+	}
+}
+
+// TestReasoningStatsFeedsDiagnostics 转换层要把推理项形态留在请求对象上，
+// 供上游 11155 的归因日志使用。
+func TestReasoningStatsFeedsDiagnostics(t *testing.T) {
+	request := `{"model":"global:deepseek-v4.1-flash","stream":false,"input":[
+	  {"role":"user","content":"hi"},
+	  {"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"有明文"}]},
+	  {"type":"reasoning","id":"rs_2","summary":[],"encrypted_content":"opaque"},
+	  {"role":"assistant","content":"答案"}]}`
+	_, req, err := responsesToChat([]byte(request))
+	if err != nil {
+		t.Fatalf("转换失败: %v", err)
+	}
+	if req.reasoning.Items != 2 || req.reasoning.WithText != 1 {
+		t.Fatalf("reasoning stats = %+v want {Items:2 WithText:1}", req.reasoning)
+	}
+}

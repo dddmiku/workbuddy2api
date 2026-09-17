@@ -115,6 +115,9 @@ type responsesRequest struct {
 	PreviousResponseID string          `json:"previous_response_id"`
 	Store              *bool           `json:"store"`
 	output             *outputContract
+	// reasoning 记录本次历史里的推理项形态（非 JSON 字段，翻译时填充）：
+	// 上游 11155 归因日志要用它区分「客户端根本没带推理项」与「带了但被丢掉」。
+	reasoning reasoningStats
 
 	// customTools 记录被桥接成 function 的 custom 工具名（非 JSON 字段，翻译时填充）。
 	// 出站还原 custom_tool_call 时按它判定，客户端才认得出这是自定义工具调用。
@@ -163,10 +166,11 @@ func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
 	if len(req.Tools) > 0 {
 		chatTools = responsesTools(req.Tools, &req)
 	}
-	msgs, err := responsesMessages(req.Input, req.Instructions, req.toolAliasIndex())
+	msgs, stats, err := responsesMessages(req.Input, req.Instructions, req.toolAliasIndex(), req.Model)
 	if err != nil {
 		return nil, nil, err
 	}
+	req.reasoning = stats
 	if instruction := req.output.instruction(); instruction != "" {
 		msgs = append([]any{map[string]any{"role": "system", "content": instruction}}, msgs...)
 	}
@@ -228,28 +232,39 @@ func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
 	return out, &req, nil
 }
 
+// reasoningStats 统计 Responses 历史里的推理项形态。
+// 一供诊断（上游 11155 形状日志），二供回填判定：只要历史里出现过推理项，deepseek
+// 思考模式就要求所有 assistant 消息都带 reasoning_content
+// （官方客户端 requiresReasoningContentOnAssistantMessages 的匹配规则）。
+type reasoningStats struct {
+	Items    int // 历史 reasoning 项数量
+	WithText int // 其中带可读推理文本（summary/content/reasoning_content）的数量
+}
+
 // responsesMessages 把 Responses 的 input（字符串或 item 数组）+ instructions 折成 chat messages。
 // toolNames 把（命名空间, 名字）映射回出站扁平名；没有命名空间的历史项按原样使用。
-func responsesMessages(input json.RawMessage, instructions string, toolNames map[string]string) ([]any, error) {
+// model 决定要不要补 reasoning_content 字段（仅 deepseek 系思考模型）。
+func responsesMessages(input json.RawMessage, instructions string, toolNames map[string]string, model string) ([]any, reasoningStats, error) {
 	msgs := []any{}
+	var stats reasoningStats
 	if strings.TrimSpace(instructions) != "" {
 		msgs = append(msgs, map[string]any{"role": "system", "content": instructions})
 	}
 	raw := strings.TrimSpace(string(input))
 	if raw == "" || raw == "null" {
-		return msgs, nil
+		return msgs, stats, nil
 	}
 	// input 为纯字符串：等价于一条 user 消息。
 	if strings.HasPrefix(raw, `"`) {
 		var s string
 		if err := json.Unmarshal(input, &s); err != nil {
-			return nil, fmt.Errorf("invalid input string: %w", err)
+			return nil, stats, fmt.Errorf("invalid input string: %w", err)
 		}
-		return append(msgs, map[string]any{"role": "user", "content": s}), nil
+		return append(msgs, map[string]any{"role": "user", "content": s}), stats, nil
 	}
 	var items []json.RawMessage
 	if err := json.Unmarshal(input, &items); err != nil {
-		return nil, fmt.Errorf("input must be a string or an array of items: %w", err)
+		return nil, stats, fmt.Errorf("input must be a string or an array of items: %w", err)
 	}
 	// 同一轮里连续的 function_call 必须并进同一条 assistant 消息的 tool_calls，
 	// 拆成多条 assistant 会被上游拒。
@@ -325,7 +340,9 @@ func responsesMessages(input json.RawMessage, instructions string, toolNames map
 			})
 			continue
 		case "reasoning":
+			stats.Items++
 			if text := responsesReasoningText(m); text != "" {
+				stats.WithText++
 				if pendingReasoning != "" {
 					pendingReasoning += "\n\n" + text
 				} else {
@@ -351,7 +368,59 @@ func responsesMessages(input json.RawMessage, instructions string, toolNames map
 		msgs = append(msgs, message)
 	}
 	flush()
-	return msgs, nil
+	// 历史以推理项结尾（后面没有 assistant 输出）时，把攒下的文本贴到最后一条还缺字段的
+	// assistant 消息上——整段推理被静默丢掉就是上游 11155 的成因之一。
+	if pendingReasoning != "" {
+		if last := lastAssistantWithoutReasoning(msgs); last != nil {
+			last["reasoning_content"] = pendingReasoning
+		}
+	}
+	// deepseek 思考模式：历史只要出现过推理项，所有 assistant 消息都必须带
+	// reasoning_content（拿不到原文的补空串）。上游按「字段是否存在」校验，缺字段即 11155。
+	if stats.Items > 0 && deepSeekModel(model) {
+		for _, item := range msgs {
+			message, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if role, _ := message["role"].(string); role != "assistant" {
+				continue
+			}
+			if _, present := message["reasoning_content"]; present {
+				continue
+			}
+			if text, ok := message["reasoning"].(string); ok {
+				message["reasoning_content"] = text
+			} else {
+				message["reasoning_content"] = ""
+			}
+		}
+	}
+	return msgs, stats, nil
+}
+
+// lastAssistantWithoutReasoning 返回最后一条还没带 reasoning_content 的 assistant 消息。
+func lastAssistantWithoutReasoning(msgs []any) map[string]any {
+	for index := len(msgs) - 1; index >= 0; index-- {
+		message, ok := msgs[index].(map[string]any)
+		if !ok {
+			continue
+		}
+		if role, _ := message["role"].(string); role != "assistant" {
+			continue
+		}
+		if _, present := message["reasoning_content"]; !present {
+			return message
+		}
+	}
+	return nil
+}
+
+// deepSeekModel 判定请求模型是否 deepseek 系（与上游层 isDeepSeekModel 同口径）。
+// 先剥 realm 前缀再前缀匹配，避免 "global:deepseek-*" 被漏判。
+func deepSeekModel(model string) bool {
+	_, bare := resolveModel(model)
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(bare)), "deepseek")
 }
 
 // responsesReasoningText 取 Responses 推理项里的可读推理文本。
@@ -799,7 +868,7 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	chatBody = applyActNote(chatBody, h.cfg.PromptActNote, len(req.Tools) > 0)
 
 	// 让 chatCompletions 从翻译后的 body 读；header/context/方法保持不变。
-	sub := r.Clone(r.Context())
+	sub := r.Clone(withReasoningStats(r.Context(), req.reasoning))
 	sub.Body = io.NopCloser(bytes.NewReader(chatBody))
 	sub.ContentLength = int64(len(chatBody))
 

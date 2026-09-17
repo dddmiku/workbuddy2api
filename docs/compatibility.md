@@ -58,6 +58,24 @@ JSON Schema 校验针对最终文本输出，允许先完成工具调用。外�
 
 `upstream_waf_blocked` 是上游 WAF 的判定结果，不是网关或账号故障。判定看**请求正文**、不看账号：2026-09-17 对国际版 `www.workbuddy.ai` 逐条对照实测，脚本标签与事件处理器、`alert(`/`eval(`、SQL 注入式表达式（`or 1=1`、`union select`、`drop table`）、命令注入片段（`sleep(`、`benchmark(`、`curl http://`）、`${jndi:` 以及 `%3C` / `\x3C` 编码变体返回 403 HTML 拦截页；普通文本、纯标签结构、Markdown 代码块、XML 声明、`information_schema`、`select ... where` 本身都通过。CN 链路上同一批正文全部 200。
 
+## 思考模式的推理回灌（上游 11155）
+
+DeepSeek 系模型在思考模式下，上游要求把上一轮的推理原文随历史带回，缺字段即返回
+`{"code":11155,"extError":{"code":"reasoning_content_missing"}}`（网关包装成
+`upstream_invalid_request`）。Responses 侧的推理项原样翻译成 chat 的 `reasoning_content`：
+
+1. 历史里每个 `reasoning` 项按 `summary[].text` / `content[].text` / 字符串形态取正文，
+   挂到紧随其后的 assistant 消息上；历史以推理项收尾时挂到最后一条 assistant 消息。
+2. 只要历史出现过推理项，deepseek 模型的**所有** assistant 消息都会带 `reasoning_content`
+   （拿不到原文的补空串），对齐官方客户端 `requiresReasoningContentOnAssistantMessages`
+   的匹配规则；非 deepseek 模型零改动。
+3. 只有加密推理（`encrypted_content` 且无明文）时同样会置位，避免整条链缺字段。
+
+上游仍返回 11155 时，网关打一行形状日志（只统计字段，不含正文）：
+`upstream 11155 shape ... assistant=N reasoning_content=N empty=N tool_call_msgs=N last_role=...
+history_reasoning_items=N with_text=N`。据此可区分「客户端没带推理项」「带了但没明文」
+与「assistant 消息缺字段」三种成因。
+
 网关的处理分两步：
 
 1. 原样请求先发一次（正文保真优先）。
