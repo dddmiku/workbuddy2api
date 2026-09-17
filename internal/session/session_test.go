@@ -126,6 +126,14 @@ func TestExtractKeyPriority(t *testing.T) {
 		{`{"conversationId":123}`, ""},                                                 // 数字 conversationId → 空
 		{`{"metadata":{"conversationId":456}}`, ""},                                    // metadata 数字 conversationId → 空
 		{`{"metadata":{"conversationId":"abc","user_id":"mu"}}`, "abc"},                // camel conversationId 优先于 user_id
+		// Codex 客户端（codex-cli 0.155+ / 桌面端）实测形态：会话身份在 client_metadata
+		// 与 prompt_cache_key 里，两者同源；没有这一层，Codex 会话完全没有粘性。
+		{`{"client_metadata":{"thread_id":"t1","session_id":"s1"},"prompt_cache_key":"p1"}`, "t1"},
+		{`{"client_metadata":{"session_id":"s1"},"prompt_cache_key":"p1"}`, "s1"},
+		{`{"client_metadata":{"thread_id":"t1"},"metadata":{"user_id":"mu"}}`, "t1"}, // thread 优先于 user_id
+		{`{"client_metadata":{"thread_id":123},"prompt_cache_key":"p1"}`, "p1"},      // 非字符串 thread → 退到 cache key
+		{`{"prompt_cache_key":"p1","conversation_id":"top"}`, "p1"},                  // cache key 优先于顶层会话键
+		{`{"metadata":{"user_id":"mu"},"prompt_cache_key":""}`, "mu"},                // 空 cache key 不影响 user_id 兜底
 	}
 	for _, c := range cases {
 		if got := ExtractKey([]byte(c.body)); got != c.want {

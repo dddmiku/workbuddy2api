@@ -304,6 +304,7 @@ func ExtractKey(body []byte) string {
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return ""
 	}
+	// 1. 显式会话键（OpenAI 风格 metadata.conversation_id）。
 	if meta, ok := obj["metadata"].(map[string]any); ok {
 		if v := strOrEmpty(meta["conversation_id"]); v != "" {
 			return v
@@ -311,14 +312,36 @@ func ExtractKey(body []byte) string {
 		if v := strOrEmpty(meta["conversationId"]); v != "" {
 			return v
 		}
+	}
+	// 2. Codex 客户端：client_metadata 里带 thread_id / session_id（实测 codex-cli 0.155
+	//    与桌面端都会发）。漏掉这一层的话 Codex 会话完全没有粘性，同一对话会逐轮换号，
+	//    上游 prompt 缓存每轮失效。
+	if meta, ok := obj["client_metadata"].(map[string]any); ok {
+		for _, key := range []string{"thread_id", "threadId", "session_id", "sessionId",
+			"conversation_id", "conversationId"} {
+			if v := strOrEmpty(meta[key]); v != "" {
+				return v
+			}
+		}
+	}
+	// 3. prompt_cache_key：Codex 的线程级缓存键（实测与 client_metadata.thread_id 同源）。
+	if v := strOrEmpty(obj["prompt_cache_key"]); v != "" {
+		return v
+	}
+	// 4. 顶层会话键。
+	if v := strOrEmpty(obj["conversation_id"]); v != "" {
+		return v
+	}
+	if v := strOrEmpty(obj["conversationId"]); v != "" {
+		return v
+	}
+	// 5. 最后才退到 user_id：粒度最粗（一个用户的所有对话会共用一个号）。
+	if meta, ok := obj["metadata"].(map[string]any); ok {
 		if v := strOrEmpty(meta["user_id"]); v != "" {
 			return v
 		}
 	}
-	if v := strOrEmpty(obj["conversation_id"]); v != "" {
-		return v
-	}
-	return strOrEmpty(obj["conversationId"])
+	return ""
 }
 
 // strOrEmpty 把 JSON 字符串字段安全转 string（非字符串类型返回空）。
