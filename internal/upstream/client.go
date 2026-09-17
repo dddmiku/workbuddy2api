@@ -931,46 +931,65 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 + 尾部
 	// 不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
+	pathCount := len(c.chatPaths(a))
 	for attempt, path := range c.chatPaths(a) {
 		url := c.chatBase(a) + path
-		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(prepared))
-		if err != nil {
-			return nil, 0, nil, err
-		}
-		c.ChatHeaders(req, a, clientIP, meta)
-		// 从调用方 ctx 派生：保留取消传播（父 ctx 取消 → 本 ctx 取消），
-		// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
-		reqCtx, cancel := context.WithCancel(ctx)
-		req = req.WithContext(reqCtx)
-		resp, err := c.chatHTTP().Do(req)
-		if err != nil {
-			cancel()
-			log.Printf("ERR: [upstream] chat_stream uid=%s: transport error: %v", logfmt.UID8(a.UID), err)
-			return nil, 0, nil, err
-		}
-		if resp.StatusCode >= 400 {
-			raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-			resp.Body.Close()
-			cancel()
-			// body 读失败（掐流/截断）→ 传输层错误：半截 raw 不交回调用方进 Classify，
-			// 否则 handler 侧 applyErrorPolicy 会按误判分类罚号。
-			if rerr != nil {
-				log.Printf("ERR: [upstream] chat_stream uid=%s: read body: %v", logfmt.UID8(a.UID), rerr)
-				return nil, 0, nil, fmt.Errorf("read body: %w", rerr)
+		// wafNeutralized：同一路径最多用断词版本重发一次（见下方 WAF 分支）。
+		// 原样请求先发，只有真的撞到 WAF 拦截页才改写，正常请求的正文不变。
+		wafNeutralized := false
+	retry:
+		for {
+			req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(prepared))
+			if err != nil {
+				return nil, 0, nil, err
 			}
-			kind := Classify(resp.StatusCode, string(raw))
-			log.Printf("WARN: [upstream] chat_stream uid=%s: upstream %d %s body=%s",
-				logfmt.UID8(a.UID), resp.StatusCode, kind, truncate(string(raw), 200))
-			// global 首次路径 404/405 → 换 fallback 路径重试；其余状态码直接返回。
-			if attempt < len(c.chatPaths(a))-1 && chatFallbackHTTPStatus(resp.StatusCode) {
-				continue
+			c.ChatHeaders(req, a, clientIP, meta)
+			// 从调用方 ctx 派生：保留取消传播（父 ctx 取消 → 本 ctx 取消），
+			// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
+			reqCtx, cancel := context.WithCancel(ctx)
+			req = req.WithContext(reqCtx)
+			resp, err := c.chatHTTP().Do(req)
+			if err != nil {
+				cancel()
+				log.Printf("ERR: [upstream] chat_stream uid=%s: transport error: %v", logfmt.UID8(a.UID), err)
+				return nil, 0, nil, err
 			}
-			return nil, resp.StatusCode, raw, nil
+			if resp.StatusCode >= 400 {
+				raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+				resp.Body.Close()
+				cancel()
+				// body 读失败（掐流/截断）→ 传输层错误：半截 raw 不交回调用方进 Classify，
+				// 否则 handler 侧 applyErrorPolicy 会按误判分类罚号。
+				if rerr != nil {
+					log.Printf("ERR: [upstream] chat_stream uid=%s: read body: %v", logfmt.UID8(a.UID), rerr)
+					return nil, 0, nil, fmt.Errorf("read body: %w", rerr)
+				}
+				kind := Classify(resp.StatusCode, string(raw))
+				log.Printf("WARN: [upstream] chat_stream uid=%s: upstream %d %s body=%s",
+					logfmt.UID8(a.UID), resp.StatusCode, kind, truncate(string(raw), 200))
+				// 国际版 WAF 按正文特征拦截（脚本/事件处理器/SQL 注入式片段等），返回的是
+				// 前置 WAF 的拦截页而非模型答复。此时把命中的模式用零宽字符断开后同路径重发
+				// 一次：正文语义不变（零宽不参与词义），用户不必自己删改内容。
+				// 只重发一次；仍被拦则按请求终态返回，交 handler 回可行错误文案。
+				if kind == ErrUpstreamWAF && !wafNeutralized {
+					if neutralized, changed := NeutralizeWAFTriggers(prepared); changed {
+						prepared = neutralized
+						wafNeutralized = true
+						log.Printf("WARN: [upstream] waf triggers neutralized for retry uid=%s path=%s", logfmt.UID8(a.UID), path)
+						continue retry
+					}
+				}
+				// global 首次路径 404/405 → 换 fallback 路径重试；其余状态码直接返回。
+				if attempt < pathCount-1 && chatFallbackHTTPStatus(resp.StatusCode) {
+					break retry
+				}
+				return nil, resp.StatusCode, raw, nil
+			}
+			// 成功分支：cancel 所有权交给 monitorBody（其 Close 会 cancel）；
+			// IdleTimeout<=0 时 monitorBody 原样返回底流、无人调 cancel——可接受：
+			// 取消传播由 http.Transport 在 body Close / 父 ctx 取消时处理，连接正常清理。
+			return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
 		}
-		// 成功分支：cancel 所有权交给 monitorBody（其 Close 会 cancel）；
-		// IdleTimeout<=0 时 monitorBody 原样返回底流、无人调 cancel——可接受：
-		// 取消传播由 http.Transport 在 body Close / 父 ctx 取消时处理，连接正常清理。
-		return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
 	}
 	panic("unreachable: chatPaths is never empty") // for range 空集时编译器仍要求兜底 return；chatPaths 恒非空（构造保证），永不触达
 }

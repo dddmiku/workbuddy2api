@@ -72,6 +72,6 @@ stream_idle_timeout_ms = 90000
 | 真实 `codex exec` + 默认说明 | 400 `upstream_channel_rejected` |
 | 真实 `codex exec` + `model_instructions_file` 指向本仓库说明 | 200，回答 `OK` |
 
-如果出现 `upstream_channel_rejected`，应保留完整错误并核对上游允许范围；若出现 `upstream_waf_blocked`，说明对话里原样带着 HTML/脚本或 SQL 样式文本被上游 WAF 拦下，删掉那段内容重发即可（换账号无效，判定看正文）；若出现 `invalid_api_key`，检查密钥状态；若请求了不支持的内置工具，按[兼容性说明](compatibility.md)调整客户端能力。
+如果出现 `upstream_channel_rejected`，应保留完整错误并核对上游允许范围；`upstream_waf_blocked` 只会出现在网关断词重试之后仍被拦的情况；网关已自动处理绝大多数命中的正文（见[兼容性说明](compatibility.md)）；若出现 `invalid_api_key`，检查密钥状态；若请求了不支持的内置工具，按[兼容性说明](compatibility.md)调整客户端能力。
 
 配置字段参考：[官方 Codex 配置文档](https://developers.openai.com/codex/config-reference/)。
