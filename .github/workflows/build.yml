@@ -63,6 +63,10 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.image.outputs.tags }}
+          build-args: |
+            VERSION=${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
+            COMMIT=${{ github.sha }}
+            BUILT_AT=${{ github.run_started_at }}
           cache-from: type=gha,scope=gateway
           cache-to: type=gha,mode=max,scope=gateway
 
@@ -70,6 +74,9 @@ jobs:
       - name: Export offline tarball (amd64)
         run: |
           docker buildx build --platform linux/amd64 --file Dockerfile \
+            --build-arg VERSION="${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}" \
+            --build-arg COMMIT="${GITHUB_SHA}" \
+            --build-arg BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --tag wb2api:offline --output type=docker,dest=wb2api-amd64.tar .
           gzip -f wb2api-amd64.tar
 
