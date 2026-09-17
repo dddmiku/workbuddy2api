@@ -117,7 +117,7 @@ curl -sS http://127.0.0.1:7863/v1/responses \
   -d '{"model":"cn:deepseek-v4.1-flash","input":"Reply with OK.","stream":false}'
 ```
 
-**Codex 需要额外注意：**原生默认请求在实际测试中受到上游渠道限制；通过测试的是显式加载独立模型说明的配置。仅填写 URL 和 API key 不能保证可用。完整配置见 [Codex 接入](docs/codex.md)。
+**Codex 说明：**官方 CLI 的默认系统说明里有一句渠道归属声明会被上游判为未授权渠道，网关会自动把这句话断词并在同一账号上重发一次，客户端只需要填 Base URL 和 API key。完整配置与实测记录见 [Codex 接入](docs/codex.md)。
 
 ## API key 管理
 

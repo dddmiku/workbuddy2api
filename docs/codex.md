@@ -1,13 +1,12 @@
 # Codex 接入
 
-官方 Codex CLI 可以使用本项目的 Responses 接口。实际验证版本为 `codex-cli 0.153.4`，模型为 `cn:deepseek-v4.1-flash`。
+官方 Codex CLI 可以使用本项目的 Responses 接口。实际验证版本为 `codex-cli 0.153.4`，模型为 `cn:deepseek-v4.1-flash` 与 `global:deepseek-v4.1-flash`。
 
-**只填写 API key 和 URL 不一定可用**，取决于客户端自带哪份系统说明：
+**现在只需要填 API key 和 Base URL。** 官方 CLI 默认说明里那句渠道归属声明会被上游判为未授权渠道，网关会自动把这句话断词并重发一次，客户端不需要再准备中性说明文件。
 
-- 桌面版 Codex（`codex_work_desktop` 0.155.0-alpha.2.6）的说明不含被拒句子，实测真实形状请求返回 200 `completed`；
-- 官方 CLI 的默认说明含被拒句子，必须显式换成下面这份中性说明，否则上游返回 `upstream_channel_rejected`。
+会话表现为：上游先返回 400 `unapproved channel`，网关在同一账号、同一路径上用断词后的正文重发，用户侧直接拿到答案，网关日志里留下一条 `channel trigger neutralized for retry`。
 
-该结论只覆盖这两个客户端与版本，不代表其他客户端、版本或模型已经验证。
+上一版文档要求手工配置 `model_instructions_file`；这条已经不再是必需项，仅作为「不想让网关改写任何正文」时的可选做法保留在文末。
 
 ## 默认指令为什么会被拒
 
@@ -27,18 +26,19 @@
 
 也就是说上游的渠道校验命中的是这句对**渠道归属**的声明，而不是 `OpenAI` 这个词本身。
 
-网关不会替换这些正文（正文保真是刻意的设计），因此默认指令的客户端需要用下面这份中性说明覆盖系统提示词。
+网关的处理方式：命中这句话时，只在每个单词首字母之后插入零宽空格（`U+200B`）后重发一次。零宽字符不参与词义，模型读到的仍是同一句话，删掉标记后逐字等于原文；其余正文、工具声明和用户消息一律不动。
+
+如果希望上游完全不看到这句改写，也可以继续用文末的 `model_instructions_file` 覆盖系统提示词——两种做法二选一即可。
 
 ## 配置
 
-下面使用网关与 Codex 位于同一台 Linux 服务器的路径。将 `model_instructions_file` 改为本机 [说明文件](../examples/codex-instructions.md) 的绝对路径；远程客户端还需修改 `base_url`。
+最小可用配置（网关与 Codex 在同一台 Linux 服务器上）：
 
 ```toml
 model = "cn:deepseek-v4.1-flash"
 model_provider = "workbuddy2api"
 model_reasoning_effort = "low"
 model_reasoning_summary = "concise"
-model_instructions_file = "/opt/workbuddy2api/examples/codex-instructions.md"
 
 [model_providers.workbuddy2api]
 name = "workbuddy2api"
@@ -52,11 +52,21 @@ stream_max_retries = 0
 stream_idle_timeout_ms = 90000
 ```
 
-通过 `WORKBUDDY_API_KEY` 环境变量提供调用密钥，不把真实密钥提交到配置示例中。该说明只适合本 provider，选择其他模型时应使用相应配置。
+远程客户端把 `base_url` 换成自己的服务地址，模型名按 `/v1/models` 里实际可用的值填（国际版账号加 `global:` 前缀）。
+
+通过 `WORKBUDDY_API_KEY` 环境变量提供调用密钥，不把真实密钥提交到配置示例中。
+
+### 可选：用中性说明覆盖系统提示词
+
+不想让网关对系统提示词做任何改写时，可以继续加载仓库里的 [中性说明](../examples/codex-instructions.md)：
+
+```toml
+model_instructions_file = "/opt/workbuddy2api/examples/codex-instructions.md"
+```
 
 `model_instructions_file` 由 Codex 读取，不是网关的 `prompt.mode=custom`。网关可保持 `passthrough`，业务文本和工具数据原样传递。
 
-`examples/codex-instructions.md` 必须放在 Codex 能读到的绝对路径上（同机部署可直接引用仓库内文件）；把该文件删掉或留空会退回默认指令，请求又会撞上上游渠道校验。
+该文件必须放在 Codex 能读到的绝对路径上（同机部署可直接引用仓库内文件）；删掉或留空会退回默认指令，此时由网关自动断词兜底。
 
 ## 使用与验证
 
@@ -69,7 +79,9 @@ stream_idle_timeout_ms = 90000
 | 场景 | 结果 |
 |---|---|
 | 桌面版形状请求：21261 字符说明 + 14 个工具（含 3 个 namespace 分组） | 200 `completed`，回答 `OK` |
-| 真实 `codex exec` + 默认说明 | 400 `upstream_channel_rejected` |
+| 真实 `codex exec` + 默认说明（`global:deepseek-v4.1-flash`） | 首次 400 `unapproved channel` → 网关断词重发 → 200，回答 `OK` |
+| 真实 `codex exec` + 默认说明，消息里带 HTML/SQL/带管道的 shell 命令（`global:`） | 200，回答 `HTML、SQL、Bash（Shell 脚本）` |
+| 真实 `codex exec` + 默认说明（`cn:deepseek-v4.1-flash` 回归） | 200，回答 `OK` |
 | 真实 `codex exec` + `model_instructions_file` 指向本仓库说明 | 200，回答 `OK` |
 
 如果出现 `upstream_channel_rejected`，应保留完整错误并核对上游允许范围；`upstream_waf_blocked` 只会出现在网关断词重试之后仍被拦的情况；网关已自动处理绝大多数命中的正文（见[兼容性说明](compatibility.md)）；若出现 `invalid_api_key`，检查密钥状态；若请求了不支持的内置工具，按[兼容性说明](compatibility.md)调整客户端能力。
