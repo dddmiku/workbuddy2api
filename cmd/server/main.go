@@ -20,6 +20,7 @@ import (
 	"workbuddy2api/internal/server"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
+	"workbuddy2api/internal/usage"
 )
 
 func main() {
@@ -47,6 +48,20 @@ func main() {
 		if cfg.APIKeysSocket == "" {
 			cfg.APIKeysSocket = filepath.Join(filepath.Dir(cfg.APIKeysFile), "api_keys.sock")
 		}
+	}
+	// 用量账本：按调用密钥累计 token。默认与密钥库同目录（usage.json），
+	// 显式配 usage_file 可在单密钥模式下也记账。
+	var usageStore *usage.Store
+	if cfg.UsageFile == "" && cfg.APIKeysFile != "" {
+		cfg.UsageFile = filepath.Join(filepath.Dir(cfg.APIKeysFile), "usage.json")
+	}
+	if cfg.UsageFile != "" {
+		usageStore, err = usage.Open(cfg.UsageFile, 0)
+		if err != nil {
+			log.Fatalf("load usage ledger: %v", err)
+		}
+		defer usageStore.Close()
+		log.Printf("usage ledger enabled: %s", cfg.UsageFile)
 	}
 	auths, err := auth.LoadDir(cfg.AuthDir)
 	if err != nil {
@@ -221,6 +236,7 @@ func main() {
 		Tasks:        sch,                               // /tasks 端点：排程自省 + 手动触发
 		// global realm 开关（handler 侧第三道闸：modelList 据此决定是否列 global 名单）。
 		GlobalEnabled: cfg.Global.Enabled,
+		Usage:         usageStore,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

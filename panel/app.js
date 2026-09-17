@@ -109,7 +109,9 @@ var PAGE = {
   overview:{ t:'概览', d:'账号池与运行状态' },
   accounts:{ t:'账号', d:'凭证、积分与启停' },
   keys:    { t:'密钥管理', d:'创建与管理客户端的访问密钥' },
+  usage:   { t:'用量统计', d:'按 API key 累计的 token 用量' },
   tasks:   { t:'排程', d:'定时任务开关与手动触发' },
+  logs:    { t:'请求日志', d:'每次请求一行，含调用密钥、账号与耗时' },
   system:  { t:'系统', d:'服务状态、登录账号与运行日志' }
 };
 var sysLoaded = false;
@@ -128,7 +130,10 @@ function go(v){
   history.replaceState(null, '', '#' + v);
   closeNav();
   if (v === 'keys' && typeof loadKeys === 'function') loadKeys();
-  if (v === 'system' && !sysLoaded){ sysLoaded = true; loadLogs(); }
+  if (v === 'usage' && typeof loadUsage === 'function') loadUsage();
+  if (v === 'system' && !sysLoaded){ sysLoaded = true; renderSystem(); }
+  // 日志页：进入即拉一次，并按开关状态维持自动刷新；离开即停，避免后台空转。
+  if (v === 'logs'){ loadLogs(); startLogAuto(); } else { stopLogAuto(); }
 }
 document.addEventListener('click', function(e){
   var b = e.target.closest('button[data-view]');
@@ -627,7 +632,84 @@ async function loadTaskLog(){
   }
 }
 
-/* ── 容器日志 ─────────────────────────────────────── */
+/* ── 请求日志（独立页，表格 + 自动刷新） ───────────── */
+var LOG = { loading:false, timer:null, auto:false };
+
+function logAutoText(){
+  var b = $('#btnLogAuto');
+  if (!b) return;
+  b.textContent = '自动刷新：' + (LOG.auto ? '开' : '关');
+  b.setAttribute('aria-pressed', String(LOG.auto));
+}
+
+function startLogAuto(){
+  if (!LOG.auto || LOG.timer) return;
+  LOG.timer = setInterval(function(){
+    if (document.visibilityState === 'visible') loadLogs();
+  }, 5000);
+}
+
+function stopLogAuto(){
+  if (LOG.timer){ clearInterval(LOG.timer); LOG.timer = null; }
+}
+
+function statusClass(code){
+  var n = parseInt(code, 10);
+  if (!n || n >= 500) return 'st-err';
+  if (n >= 400) return 'st-warn';
+  return 'st-ok';
+}
+
+async function loadLogs(){
+  if (LOG.loading) return;
+  LOG.loading = true;
+  var btn = $('#btnLogs');
+  if (btn) btn.disabled = true;
+  try{
+    var r = await api('api/logs?lines=' + S.logLines);
+    var rows = r.rows || [];
+    if (!rows.length){
+      $('#logRows').innerHTML = '<tr><td colspan="11"><div class="empty">还没有请求记录。</div></td></tr>';
+    } else {
+      $('#logRows').innerHTML = rows.slice().reverse().map(function(it){
+        var cls = statusClass(it.status);
+        return '<tr>' +
+          '<td class="mono">#' + esc(it.seq) + '</td>' +
+          '<td class="mono">' + esc(it.time) + '</td>' +
+          '<td class="mono">' + esc(it.model) + '</td>' +
+          '<td>' + esc(it.mode === 'stream' ? '流式' : '非流式') + '</td>' +
+          '<td class="' + cls + '">' + esc(it.status) + '</td>' +
+          '<td>' + esc(it.key) + '</td>' +
+          '<td class="mono">' + esc(it.uid) + '</td>' +
+          '<td class="mono num">' + esc(it.ttfb) + '</td>' +
+          '<td class="mono num">' + esc(it.tok) + '</td>' +
+          '<td class="mono num">' + esc(it.rate) + '</td>' +
+          '<td class="mono num">' + esc(it.total) + '</td>' +
+          '</tr>';
+      }).join('');
+    }
+    var count = $('#logCount'); if (count) count.textContent = String(rows.length);
+    var updated = $('#logUpdated');
+    if (updated){
+      var now = new Date();
+      function p(x){ return x < 10 ? '0' + x : '' + x; }
+      updated.textContent = '更新于 ' + p(now.getHours()) + ':' + p(now.getMinutes()) + ':' + p(now.getSeconds());
+    }
+    $('#logBox').textContent = (r.other && r.other.length) ? r.other.join('\n') : '（无警告与错误）';
+    var note = $('#logError');
+    if (note){
+      if (r.ok){ note.classList.add('hide'); }
+      else { note.textContent = '读取容器日志失败，请检查面板是否有 docker 权限。'; note.classList.remove('hide'); }
+    }
+  }catch(err){
+    var note = $('#logError');
+    if (note){ note.textContent = '拉取失败：' + (err && err.message || err); note.classList.remove('hide'); }
+  }finally{
+    LOG.loading = false;
+    if (btn) btn.disabled = false;
+  }
+}
+
 $('#logLines').addEventListener('click', function(e){
   var b = e.target.closest('button[data-n]'); if (!b) return;
   S.logLines = parseInt(b.getAttribute('data-n'), 10) || 120;
@@ -636,17 +718,12 @@ $('#logLines').addEventListener('click', function(e){
   });
   loadLogs();
 });
-async function loadLogs(){
-  busy(true);
-  $('#logBox').textContent = '拉取中…';
-  try{
-    var r = await api('api/logs?lines=' + S.logLines);
-    var txt = r.logs || '';
-    $('#logBox').textContent = txt || '（无日志输出）';
-    $('#logBox').scrollTop = $('#logBox').scrollHeight;
-  }catch(err){ $('#logBox').textContent = '拉取失败：' + (err && err.message || err); }
-  finally{ busy(false); }
-}
+$('#btnLogAuto').addEventListener('click', function(){
+  LOG.auto = !LOG.auto;
+  logAutoText();
+  if (LOG.auto){ startLogAuto(); loadLogs(); } else { stopLogAuto(); }
+});
+logAutoText();
 
 /* ── 添加账号 ─────────────────────────────────────── */
 function openDrawer(){

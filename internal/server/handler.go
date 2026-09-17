@@ -27,6 +27,7 @@ import (
 	"workbuddy2api/internal/prompt"
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
+	"workbuddy2api/internal/usage"
 )
 
 // Config handler 依赖。
@@ -61,6 +62,10 @@ type Config struct {
 	// false（显式逃生门）时即便 auth realm=global 也不提供 global: 模型名
 	// （modelList 不列 global 名单）。
 	GlobalEnabled bool
+
+	// Usage 按调用密钥累计的 token 账本（可选；nil = /usage 报未启用）。
+	// 只有成功请求参与累计，数据来自上游 usage，缺失即不记 token（缺失≠0）。
+	Usage *usage.Store
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -108,6 +113,9 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /tasks", h.withAuth(h.tasks))
 	h.mux.HandleFunc("POST /tasks/{key}/run", h.withAuth(h.taskRun))
 	h.mux.HandleFunc("GET /tasks/{key}/log", h.withAuth(h.taskLog))
+	// 用量统计只走本机 Unix socket（管理台「用量统计」页）：普通调用密钥拿不到全量用量，
+	// 单密钥自己的用量在日志与面板里按 key 归属，不需要公开端点。
+	h.mux.HandleFunc("GET /usage", h.requireInternal(h.usageStats))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	return h
 }
@@ -185,6 +193,48 @@ func (h *Handler) InternalHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), internalAdminContextKey{}, true)))
 	})
+}
+
+// requireInternal 限定只允许本机管理 socket（InternalHandler 注入的上下文）访问：
+// 公开端口上同一个 mux 也会匹配这条路由，没有这道闸就等于把全量用量暴露给任一调用密钥。
+func (h *Handler) requireInternal(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Context().Value(internalAdminContextKey{}) != true {
+			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "internal endpoint")
+			return
+		}
+		next(w, r)
+	}
+}
+
+// usageStats 返回按密钥累计的 token 用量（管理台「用量统计」页数据源）。
+func (h *Handler) usageStats(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Usage == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":      false,
+			"message": "用量账本未启用：config 里设置 usage_file 后重启网关",
+		})
+		return
+	}
+	snapshot := h.cfg.Usage.Snapshot()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"file":       h.cfg.Usage.Path(),
+		"since":      snapshot.Since,
+		"updated_at": snapshot.UpdatedAt,
+		"totals":     snapshot.Totals,
+		"keys":       snapshot.Keys,
+	})
+}
+
+// recordUsage 把一次成功请求的用量写进密钥账本。
+// st.toks 为 -1（上游没给 usage）时只累计请求数，不臆造 token。
+func (h *Handler) recordUsage(st *chatStat, model string) {
+	if h.cfg.Usage == nil || st == nil {
+		return
+	}
+	h.cfg.Usage.Record(st.keyID, st.keyName, st.keyMask, model, st.prompt, st.toks,
+		st.credit, st.hasCred, time.Now())
 }
 
 func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
@@ -560,6 +610,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
 	defer st.done()
+	// 调用方密钥身份：请求行 key= 列与用量账本都按它归属（单密钥模式没有 Info）。
+	if info, ok := requestKeyInfo(r); ok {
+		st.keyID, st.keyName, st.keyMask = info.ID, info.Name, info.MaskedKey
+	}
 
 	// 密钥模型绑定：只放行白名单内的模型，拒绝发生在选号之前——不占用账号、不轮转、不冷却。
 	if info, ok := requestKeyInfo(r); ok && !modelAllowedByKey(info, peek.Model) {
@@ -828,6 +882,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
+			st.prompt = stats.PromptTokens()
 			if streamErr != nil {
 				rc.Close()
 				if r.Context().Err() != nil {
@@ -848,11 +903,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 供下次选号把免费/便宜的号排在前面。
 			if credit, ok := stats.Credit(); ok {
 				h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, stats.TotalTokens())
+				st.credit, st.hasCred = credit, true
 			} else if _, hasUsage := stats.Tokens(); hasUsage {
 				// R9(c) 防护观测：usage 存在但 credit 缺失（如 global SSE 末帧未带 credit）。
 				// 不算合法成本观测（缺失≠0），仅记一条 WARN 协助排障，绝不写入账本。
 				log.Printf("WARN: [server] stream usage without credit uid=%s model=%s (no cost observation)", logfmt.UID8(acct.UID), bareModel)
 			}
+			h.recordUsage(st, peek.Model)
 			rc.Close()
 			return
 		}
@@ -879,10 +936,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
+		st.prompt = promptTokens(resp)
 		// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
 		if credit, total, ok := usageCreditTotal(resp); ok {
 			h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
+			st.credit, st.hasCred = credit, true
 		}
+		h.recordUsage(st, peek.Model)
 		return
 	}
 	// 末端错误透传（error-passthrough）：上游返回的错误原样透传，不再规范化成固定文案。

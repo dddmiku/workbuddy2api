@@ -1,6 +1,6 @@
 # 管理台部署
 
-管理台源码在 `panel/`，与网关同仓库、同 Compose 项目发布。它管理上游账号、API key、排程任务和容器日志，必须和网关运行在同一台机器上。
+管理台源码在 `panel/`，与网关同仓库、同 Compose 项目发布。它管理上游账号、API key、排程任务、请求日志与用量统计，必须和网关运行在同一台机器上。
 
 ## Compose 部署
 
@@ -71,8 +71,21 @@ Cookie 路径固定为 `/admin/`，`proxy_pass` 结尾的斜杠不能省。站�
 | 启用 / 停用账号 | 账号列表，改完自动重启网关容器 |
 | 创建 API key | 密钥页 → 创建密钥，可绑定模型白名单 |
 | 调整定时任务 | 任务页开关，改完重启网关生效 |
-| 查看容器日志 | 系统页 → 容器日志 |
+| 查看请求日志 | 请求日志页，带表头（密钥 / 账号 / TTFB / token），可开自动刷新 |
+| 查看 token 用量 | 用量统计页，总量卡片 + 按密钥明细 + 单密钥模型拆分 |
 | 重启网关 | 系统页 → 重启服务 |
+
+## 请求日志与用量统计
+
+网关每完成一次请求就往 stdout 打一行表格日志，形如：
+
+```text
+| #012 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | TTFB=3414ms | tok=110 | 34.3tok/s | total=3.4s |
+```
+
+`key=` 是本次请求使用的 API key 名称（无名称时回落掩码），因此一条日志就能看出是哪个调用方在用网关。请求日志页把这类行解析成表格，行数可在 60/120/300/600 之间切换，「自动刷新」打开后每 5 秒拉一次（只在页面可见时拉）。不匹配的行（启动信息、WARN/ERR）折叠在页面底部的详情里。
+
+用量统计页读取网关闭环记账：每个 key 的请求数、输入/输出/合计 token、最近使用时间，以及该 key 的按模型拆分。账本默认落在密钥库同目录的 `usage.json`，每 5 秒或在进程退出时原子落盘；只有成功请求参与累计，上游没返回 usage 时只累计请求数，不臆造 token。
 
 ## 面板内部接口
 
@@ -86,7 +99,8 @@ Cookie 路径固定为 `/admin/`，`proxy_pass` 结尾的斜杠不能省。站�
 | GET | `/api/state` | 账号状态；`refresh_credit=1` 触发积分刷新 |
 | GET | `/api/models` | 网关模型目录（不受调用密钥的模型绑定限制） |
 | GET | `/api/tasks`、`/api/task/log?key=` | 排程任务与单个任务日志 |
-| GET | `/api/logs?lines=` | 网关容器日志 |
+| GET | `/api/logs?lines=` | 网关容器日志（同时返回解析好的请求行 `rows`） |
+| GET | `/api/usage` | 按 API key 累计的 token 用量（经本机 Unix socket 读网关 `/usage`） |
 | GET | `/api/keys` | 密钥列表 |
 | POST | `/api/auth/login`、`/api/auth/logout`、`/api/auth/password` | 登录、退出、修改管理员账号 |
 | POST | `/api/login/start`、`/api/login/poll` | 上游账号授权 |

@@ -3,6 +3,7 @@
   "api_key": "test_key",
   "api_keys_file": "",
   "api_keys_socket": "",
+  "usage_file": "",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "server": {

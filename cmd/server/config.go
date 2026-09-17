@@ -21,8 +21,11 @@ type Config struct {
 	APIKey        string `json:"api_key"`         // 空 = 不鉴权
 	APIKeysFile   string `json:"api_keys_file"`   // 非空时启用多密钥管理，api_key 仅作首次迁移。
 	APIKeysSocket string `json:"api_keys_socket"` // 本机管理 socket，默认位于密钥文件同目录。
-	AuthDir       string `json:"auth_dir"`        // ./auths
-	StateFile     string `json:"state_file"`      // ./data/state.json
+	// UsageFile 按调用密钥累计的 token 用量账本；留空且启用了密钥库时默认落在
+	// 密钥文件同目录的 usage.json。空 + 无密钥库 = 不记账（/usage 报未启用）。
+	UsageFile string `json:"usage_file"`
+	AuthDir   string `json:"auth_dir"`   // ./auths
+	StateFile string `json:"state_file"` // ./data/state.json
 
 	Server struct {
 		// MaxBodyMB 聊天请求体大小上限（单位 MB，默认 8）。

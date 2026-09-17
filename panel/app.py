@@ -10,6 +10,7 @@
 # 2026-09-16：新增登录保护的多密钥管理路由，使用本机管理通道、严格请求校验并隐藏配置中的完整密钥。
 # 2026-09-17：路径、端口与容器名支持环境变量覆盖，便于与网关同一 Compose 项目部署。
 # 2026-09-17：密钥管理支持模型绑定字段，并新增供前端选择模型的 /api/models。
+# 2026-09-17：新增用量统计通道 /api/usage；容器日志解析成结构化请求行供日志页表格展示。
 
 """workbuddy2api 账号管理面板 —— 后端
 
@@ -58,6 +59,29 @@ LOGIN_WINDOW = 300.0
 COOKIE_NAME = "wb2a_admin"
 
 CONTAINER = os.environ.get("WB2API_CONTAINER", "workbuddy2api")
+
+# 网关请求行（logging.go 的表格日志）：
+# | #012 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | TTFB=3414ms | tok=110 | 34.3tok/s | total=3.4s |
+REQUEST_ROW = re.compile(
+    r"^\|\s*#(?P<seq>\d+)\s*\|\s*(?P<time>[^|]*?)\s*\|\s*(?P<model>[^|]*?)\s*\|\s*(?P<mode>[^|]*?)\s*\|\s*"
+    r"(?P<status>\d+)\s*\|\s*(?:key=(?P<key>[^|]*?)\s*\|\s*)?uid=(?P<uid>[^|]*?)\s*\|\s*TTFB=(?P<ttfb>[^|]*?)\s*\|\s*"
+    r"tok=(?P<tok>[^|]*?)\s*\|\s*(?P<rate>[^|]*?)\s*\|\s*total=(?P<total>[^|]*?)\s*\|\s*$"
+)
+
+
+def parse_request_log(text):
+    """把请求行解析成表格行；其余行（WARN/ERR 等）单独返回，保持原始顺序。"""
+    rows, other = [], []
+    for line in (text or "").splitlines():
+        match = REQUEST_ROW.match(line.strip())
+        if not match:
+            if line.strip():
+                other.append(line)
+            continue
+        item = match.groupdict()
+        item["key"] = (item["key"] or "").strip() or "-"
+        rows.append(item)
+    return rows, other[-60:]
 GATEWAY = os.environ.get("WB2API_GATEWAY_URL", "http://127.0.0.1:7863")
 LISTEN_HOST = os.environ.get("WB2API_ADMIN_HOST", "127.0.0.1")
 try:
@@ -792,6 +816,20 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/keys":
             return self.keys_request("GET", "/keys")
 
+        if path == "/api/usage":
+            # 用量账本只经本机管理通道读取：面板能看到全量，普通调用密钥看不到。
+            try:
+                socket = key_management.socket_path(CONFIG_PATH, BASE)
+            except (OSError, ValueError):
+                return self._json(200, {"ok": False, "message": "无法读取网关配置，用量不可用"})
+            code, result = key_management.request(socket, "GET", "/usage")
+            if code != 200 or not isinstance(result, dict):
+                message = ""
+                if isinstance(result, dict):
+                    message = result.get("message") or ""
+                return self._json(200, {"ok": False, "message": message or "网关未响应用量接口（旧版本网关请先升级）"})
+            return self._json(200, result)
+
         if path == "/api/models":
             # 面板经本机管理通道读取完整模型列表，不受单个调用密钥的绑定限制。
             payload = gateway_get("/v1/models")
@@ -827,7 +865,10 @@ class Handler(BaseHTTPRequestHandler):
             if m:
                 lines = min(int(m.group(1)), 1000)
             rc, out, err = docker(["logs", "--tail", str(lines), CONTAINER], timeout=40)
-            return self._json(200, {"ok": rc == 0, "logs": out or err, "rc": rc})
+            raw = out or err
+            rows, other = parse_request_log(raw)
+            return self._json(200, {"ok": rc == 0, "logs": raw, "rows": rows, "other": other,
+                                    "count": len(rows), "rc": rc})
 
         return self._json(404, {"error": "not found"})
 

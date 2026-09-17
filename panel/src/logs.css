@@ -1,0 +1,12 @@
+/* ══ 请求日志 ═══════════════════════════════════════════════════════ */
+.log-table td,.log-table th{white-space:nowrap}
+.log-table td.mono{font-family:var(--mono);font-size:12px}
+.log-table tbody tr:hover{background:var(--surface-2)}
+.log-table .st-ok{color:var(--ok);font-weight:600}
+.log-table .st-warn{color:var(--warn);font-weight:600}
+.log-table .st-err{color:var(--err);font-weight:600}
+.log-raw{margin-top:14px}
+.log-raw summary{cursor:pointer;padding:10px 14px;font-size:12.5px;color:var(--ink-2)}
+.log-raw[open] summary{border-bottom:1px solid var(--line)}
+.log-raw .term{margin:0;max-height:320px}
+#btnLogAuto[aria-pressed=true]{background:var(--ok-soft);color:var(--ok);border-color:var(--ok)}

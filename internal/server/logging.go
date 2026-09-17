@@ -1,5 +1,6 @@
 // ═══ 更新日志 ═══
 // 2026-09-16：统计读取器保留底层错误，避免带末尾数据的断流被误报为正常 EOF。
+// 2026-09-17：请求行加 key= 列（调用方密钥身份），并带上 prompt/completion 明细供用量账本记账。
 // logging.go 请求级表格日志：每个 /v1/chat/completions 请求结束后打印一行到 stdout。
 package server
 
@@ -31,7 +32,30 @@ type chatStat struct {
 	toks   int // <0 表示 usage 缺失 → 显示 "-"
 	status int
 
+	// 调用方密钥身份（鉴权命中时填，单密钥模式留空 → 显示 "-"）。
+	keyID    string
+	keyName  string
+	keyMask  string
+	prompt   int
+	hasUsage bool
+	credit   float64
+	hasCred  bool
+
 	logged bool
+}
+
+// keyLabel 请求行里的密钥标识：优先名字，其次掩码密钥，都没有则 "-"。
+func (s *chatStat) keyLabel() string {
+	if s == nil {
+		return "-"
+	}
+	if s.keyName != "" {
+		return s.keyName
+	}
+	if s.keyMask != "" {
+		return s.keyMask
+	}
+	return "-"
 }
 
 // newChatStat 以请求进入 handler 的时刻为起点构造统计对象；toks 默认 -1（usage 缺失）。
@@ -49,7 +73,7 @@ func (s *chatStat) done() {
 		return
 	}
 	s.logged = true
-	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks)
+	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks, s.keyLabel())
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -80,6 +104,9 @@ func (s *chatStatsReader) TTFB() time.Duration { return s.ttfb }
 
 // Tokens 返回末帧 usage.completion_tokens 与是否缺失；无 usage 时 ok=false。
 func (s *chatStatsReader) Tokens() (int, bool) { return s.tokens, s.hasUsage }
+
+// PromptTokens 返回末帧 usage.prompt_tokens（缺失为 0，与 completion 一起供用量账本累计）。
+func (s *chatStatsReader) PromptTokens() int { return s.prompt }
 
 // Credit 返回末帧 usage.credit（本次真实扣费）。ok=true 要求 usage 存在**且** credit
 // 字段显式出现——字段缺失时 ok=false（缺失≠0：不能把"缺观测"当"0 成本"写入账本，
@@ -179,6 +206,19 @@ func completionTokens(resp map[string]any) int {
 	return int(v)
 }
 
+// promptTokens 从聚合响应提取 usage.prompt_tokens；缺失返回 -1（缺失≠0）。
+func promptTokens(resp map[string]any) int {
+	u, ok := resp["usage"].(map[string]any)
+	if !ok {
+		return -1
+	}
+	v, ok := u["prompt_tokens"].(float64)
+	if !ok {
+		return -1
+	}
+	return int(v)
+}
+
 // usageCreditTotal 从聚合响应提取本次真实扣费与总 token 数（供成本账本）。
 // ok=false 表示 usage 缺失或字段类型不符——此时不记录观测，避免污染账本。
 func usageCreditTotal(resp map[string]any) (credit float64, total int, ok bool) {
@@ -208,7 +248,7 @@ func uidPrefix(uid string) string {
 
 // logChatRow 打印一行请求级表格日志（直接输出 stdout，无 log 时间戳前缀）。
 // toks<0 表示 usage 缺失，显示 "-"。
-func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks int) {
+func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, toks int, key string) {
 	if !chatLogEnabled {
 		return
 	}
@@ -230,12 +270,13 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
 	}
-	fmt.Fprintf(os.Stdout, "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | total=%.1fs |\n",
+	fmt.Fprintf(os.Stdout, "| #%03d | %s | %s | %s | %d | key=%s | uid=%s | TTFB=%s | tok=%s | %stok/s | total=%.1fs |\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
 		mode,
 		status,
+		key,
 		uidPrefix(uid),
 		ttfbMS,
 		tokField,

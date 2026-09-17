@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
 # 2026-09-16：加入密钥管理页的样式与行为源码，继续生成可直接部署的单文件控制台。
+# 2026-09-17：加入用量统计页的样式与行为源码。
 """把 src/ 里的样式与结构、app.js 拼成单文件 index.html。
 
 index.html 由本脚本生成，改版式请改 src/*.css 与 src/body.html，
@@ -39,11 +40,13 @@ def read(name):
 
 
 def main():
-    css = "".join(read(n) for n in ("css_a.css", "css_b.css", "css_c.css", "keys.css"))
+    css = "".join(read(n) for n in ("css_a.css", "css_b.css", "css_c.css", "keys.css", "usage.css", "logs.css"))
     body = read("body.html")
     with open(os.path.join(HERE, "app.js"), "r", encoding="utf-8") as fh:
         js = fh.read()
     with open(os.path.join(HERE, "keys.js"), "r", encoding="utf-8") as fh:
+        js += "\n" + fh.read()
+    with open(os.path.join(HERE, "usage.js"), "r", encoding="utf-8") as fh:
         js += "\n" + fh.read()
     if "/*__APP_JS__*/" not in body:
         sys.stderr.write("body.html 缺少 /*__APP_JS__*/ 占位符\n")

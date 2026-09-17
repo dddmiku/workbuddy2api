@@ -353,6 +353,35 @@ pre.term{margin:0;padding:12px 14px;background:var(--sunken);color:var(--ink-2);
 .key-model-pick select{flex:1;height:34px;min-width:0;border:1px solid var(--line-2);border-radius:var(--r);padding:0 8px;background:var(--sunken);color:var(--ink)}
 @media(max-width:900px){.key-table td:first-child{display:block}.key-table td:first-child::before{display:none}.key-table td:first-child .key-name{margin-bottom:3px}.key-note{max-width:100%}.key-actions{justify-content:flex-start}}
 @media(max-width:700px){.key-summary{display:block}.key-summary p{margin-top:10px;line-height:1.65}.key-dialog-body{padding:17px}.key-table td:last-child{padding-top:10px}}
+/* ══ 用量统计 ═══════════════════════════════════════════════════════ */
+.usage-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));gap:10px;margin-bottom:14px}
+.usage-tile{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:12px 14px}
+.usage-tile .k{font-size:11px;color:var(--ink-2);letter-spacing:.02em}
+.usage-tile .v{font:600 20px/1.35 var(--mono);margin-top:2px}
+.usage-tile .s{font-size:11px;color:var(--ink-3)}
+.usage-table td.num,.usage-table th.r{text-align:right}
+.usage-key{display:flex;flex-direction:column;gap:2px;min-width:0}
+.usage-key b{font-weight:600}
+.usage-key code{font-size:11px;color:var(--ink-3)}
+.usage-models{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:3px}
+.usage-models li{display:flex;gap:8px;font-size:12px;color:var(--ink-2)}
+.usage-models li span:first-child{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.usage-models li span:last-child{font-family:var(--mono)}
+.usage-note{margin:10px 0 0;font-size:12px;color:var(--ink-3)}
+.usage-bar{height:4px;border-radius:2px;background:var(--sunken);overflow:hidden;margin-top:6px}
+.usage-bar i{display:block;height:100%;background:var(--accent)}
+/* ══ 请求日志 ═══════════════════════════════════════════════════════ */
+.log-table td,.log-table th{white-space:nowrap}
+.log-table td.mono{font-family:var(--mono);font-size:12px}
+.log-table tbody tr:hover{background:var(--surface-2)}
+.log-table .st-ok{color:var(--ok);font-weight:600}
+.log-table .st-warn{color:var(--warn);font-weight:600}
+.log-table .st-err{color:var(--err);font-weight:600}
+.log-raw{margin-top:14px}
+.log-raw summary{cursor:pointer;padding:10px 14px;font-size:12.5px;color:var(--ink-2)}
+.log-raw[open] summary{border-bottom:1px solid var(--line)}
+.log-raw .term{margin:0;max-height:320px}
+#btnLogAuto[aria-pressed=true]{background:var(--ok-soft);color:var(--ok);border-color:var(--ok)}
 </style>
 </head>
 <body>
@@ -382,6 +411,10 @@ pre.term{margin:0;padding:12px 14px;background:var(--sunken);color:var(--ink-2);
         密钥管理
         <i id="tabKeys">—</i>
       </button>
+      <button data-view="usage">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V10"/><path d="M10 20V4"/><path d="M16 20v-7"/><path d="M22 20H2"/></svg>
+        用量统计
+      </button>
     </div>
     <div class="nav-lb">运维</div>
     <div id="tabs2">
@@ -393,6 +426,10 @@ pre.term{margin:0;padding:12px 14px;background:var(--sunken);color:var(--ink-2);
       <button data-view="system">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/></svg>
         系统
+      </button>
+      <button data-view="logs">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5.5h16"/><path d="M4 12h10"/><path d="M4 18.5h13"/></svg>
+        请求日志
       </button>
     </div>
   </nav>
@@ -543,6 +580,35 @@ pre.term{margin:0;padding:12px 14px;background:var(--sunken);color:var(--ink-2);
         <p class="sub key-footnote">完整密钥仅在创建时显示一次。忘记密钥时，请创建新的密钥并停用旧密钥。</p>
       </section>
 
+      <section class="view hide" data-view="usage">
+        <div class="vhead">
+          <h1>用量统计</h1>
+          <div class="d">按 API key 累计的 token 用量</div>
+          <span class="sp"></span>
+          <button class="btn sm" id="btnUsageReload">刷新</button>
+        </div>
+        <div class="usage-tiles" id="usageTiles"></div>
+        <div id="usageError" class="note err hide" role="alert"></div>
+        <div class="panel">
+          <div class="ph">
+            <b>按密钥</b>
+            <span class="sp"></span>
+            <span class="sub" id="usageSince"></span>
+          </div>
+          <div class="tblwrap">
+            <table class="tbl usage-table">
+              <thead><tr>
+                <th>密钥</th><th class="r">请求</th><th class="r">输入 tokens</th>
+                <th class="r">输出 tokens</th><th class="r">合计 tokens</th>
+                <th>最近使用</th><th class="r">模型拆分</th>
+              </tr></thead>
+              <tbody id="usageRows"><tr><td colspan="7"><div class="empty">正在加载用量…</div></td></tr></tbody>
+            </table>
+          </div>
+        </div>
+        <p class="sub usage-note" id="usageFile"></p>
+      </section>
+
       <section class="view hide" data-view="tasks">
         <div class="vhead">
           <h1>排程</h1>
@@ -554,6 +620,45 @@ pre.term{margin:0;padding:12px 14px;background:var(--sunken);color:var(--ink-2);
           </button>
         </div>
         <div class="panel"><div class="tiles" id="taskList"></div></div>
+      </section>
+
+      <section class="view hide" data-view="logs">
+        <div class="vhead">
+          <h1>请求日志</h1>
+          <div class="d">每次请求一行，含调用密钥、账号、TTFB 与 token</div>
+          <span class="sp"></span>
+          <div class="seg" id="logLines">
+            <button data-n="60">60</button>
+            <button data-n="120" aria-pressed="true">120</button>
+            <button data-n="300">300</button>
+            <button data-n="600">600</button>
+          </div>
+          <button class="btn sm" id="btnLogAuto" aria-pressed="false">自动刷新：关</button>
+          <button class="btn sm ico" id="btnLogs" title="立即刷新" aria-label="立即刷新">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M20.5 3.8V9h-5.2"/></svg>
+          </button>
+        </div>
+        <div id="logError" class="note err hide" role="alert"></div>
+        <div class="panel">
+          <div class="ph">
+            <b>最近 <span id="logCount">—</span> 条请求</b>
+            <span class="sp"></span>
+            <span class="sub" id="logUpdated">—</span>
+          </div>
+          <div class="tblwrap">
+            <table class="tbl log-table">
+              <thead><tr>
+                <th>#</th><th>时间</th><th>模型</th><th>模式</th><th>状态</th><th>调用密钥</th>
+                <th>账号</th><th class="r">TTFB</th><th class="r">tok</th><th class="r">tok/s</th><th class="r">total</th>
+              </tr></thead>
+              <tbody id="logRows"><tr><td colspan="11"><div class="empty">正在加载日志…</div></td></tr></tbody>
+            </table>
+          </div>
+        </div>
+        <details class="panel log-raw">
+          <summary>非请求行（启动信息、警告与错误）</summary>
+          <pre class="term" id="logBox">—</pre>
+        </details>
       </section>
 
       <section class="view hide" data-view="system">
@@ -597,19 +702,13 @@ pre.term{margin:0;padding:12px 14px;background:var(--sunken);color:var(--ink-2);
           </div>
           <section class="panel">
             <div class="ph">
-              <h2>容器日志</h2>
+              <h2>容器状态</h2>
               <span class="sp"></span>
-              <div class="seg" id="logLines">
-                <button data-n="60">60</button>
-                <button data-n="120" aria-pressed="true">120</button>
-                <button data-n="300">300</button>
-                <button data-n="600">600</button>
-              </div>
-              <button class="btn sm ico" id="btnLogs" title="拉取日志" aria-label="拉取日志">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M20.5 3.8V9h-5.2"/></svg>
-              </button>
+              <button class="btn sm" data-view="logs">查看请求日志</button>
             </div>
-            <pre class="term" id="logBox">—</pre>
+            <div class="pb">
+              <p class="sub">请求级日志（含调用密钥、uid、TTFB 与 token）已移到独立的「请求日志」页，支持自动刷新。</p>
+            </div>
           </section>
         </div>
       </section>
@@ -797,7 +896,9 @@ var PAGE = {
   overview:{ t:'概览', d:'账号池与运行状态' },
   accounts:{ t:'账号', d:'凭证、积分与启停' },
   keys:    { t:'密钥管理', d:'创建与管理客户端的访问密钥' },
+  usage:   { t:'用量统计', d:'按 API key 累计的 token 用量' },
   tasks:   { t:'排程', d:'定时任务开关与手动触发' },
+  logs:    { t:'请求日志', d:'每次请求一行，含调用密钥、账号与耗时' },
   system:  { t:'系统', d:'服务状态、登录账号与运行日志' }
 };
 var sysLoaded = false;
@@ -816,7 +917,10 @@ function go(v){
   history.replaceState(null, '', '#' + v);
   closeNav();
   if (v === 'keys' && typeof loadKeys === 'function') loadKeys();
-  if (v === 'system' && !sysLoaded){ sysLoaded = true; loadLogs(); }
+  if (v === 'usage' && typeof loadUsage === 'function') loadUsage();
+  if (v === 'system' && !sysLoaded){ sysLoaded = true; renderSystem(); }
+  // 日志页：进入即拉一次，并按开关状态维持自动刷新；离开即停，避免后台空转。
+  if (v === 'logs'){ loadLogs(); startLogAuto(); } else { stopLogAuto(); }
 }
 document.addEventListener('click', function(e){
   var b = e.target.closest('button[data-view]');
@@ -1315,7 +1419,84 @@ async function loadTaskLog(){
   }
 }
 
-/* ── 容器日志 ─────────────────────────────────────── */
+/* ── 请求日志（独立页，表格 + 自动刷新） ───────────── */
+var LOG = { loading:false, timer:null, auto:false };
+
+function logAutoText(){
+  var b = $('#btnLogAuto');
+  if (!b) return;
+  b.textContent = '自动刷新：' + (LOG.auto ? '开' : '关');
+  b.setAttribute('aria-pressed', String(LOG.auto));
+}
+
+function startLogAuto(){
+  if (!LOG.auto || LOG.timer) return;
+  LOG.timer = setInterval(function(){
+    if (document.visibilityState === 'visible') loadLogs();
+  }, 5000);
+}
+
+function stopLogAuto(){
+  if (LOG.timer){ clearInterval(LOG.timer); LOG.timer = null; }
+}
+
+function statusClass(code){
+  var n = parseInt(code, 10);
+  if (!n || n >= 500) return 'st-err';
+  if (n >= 400) return 'st-warn';
+  return 'st-ok';
+}
+
+async function loadLogs(){
+  if (LOG.loading) return;
+  LOG.loading = true;
+  var btn = $('#btnLogs');
+  if (btn) btn.disabled = true;
+  try{
+    var r = await api('api/logs?lines=' + S.logLines);
+    var rows = r.rows || [];
+    if (!rows.length){
+      $('#logRows').innerHTML = '<tr><td colspan="11"><div class="empty">还没有请求记录。</div></td></tr>';
+    } else {
+      $('#logRows').innerHTML = rows.slice().reverse().map(function(it){
+        var cls = statusClass(it.status);
+        return '<tr>' +
+          '<td class="mono">#' + esc(it.seq) + '</td>' +
+          '<td class="mono">' + esc(it.time) + '</td>' +
+          '<td class="mono">' + esc(it.model) + '</td>' +
+          '<td>' + esc(it.mode === 'stream' ? '流式' : '非流式') + '</td>' +
+          '<td class="' + cls + '">' + esc(it.status) + '</td>' +
+          '<td>' + esc(it.key) + '</td>' +
+          '<td class="mono">' + esc(it.uid) + '</td>' +
+          '<td class="mono num">' + esc(it.ttfb) + '</td>' +
+          '<td class="mono num">' + esc(it.tok) + '</td>' +
+          '<td class="mono num">' + esc(it.rate) + '</td>' +
+          '<td class="mono num">' + esc(it.total) + '</td>' +
+          '</tr>';
+      }).join('');
+    }
+    var count = $('#logCount'); if (count) count.textContent = String(rows.length);
+    var updated = $('#logUpdated');
+    if (updated){
+      var now = new Date();
+      function p(x){ return x < 10 ? '0' + x : '' + x; }
+      updated.textContent = '更新于 ' + p(now.getHours()) + ':' + p(now.getMinutes()) + ':' + p(now.getSeconds());
+    }
+    $('#logBox').textContent = (r.other && r.other.length) ? r.other.join('\n') : '（无警告与错误）';
+    var note = $('#logError');
+    if (note){
+      if (r.ok){ note.classList.add('hide'); }
+      else { note.textContent = '读取容器日志失败，请检查面板是否有 docker 权限。'; note.classList.remove('hide'); }
+    }
+  }catch(err){
+    var note = $('#logError');
+    if (note){ note.textContent = '拉取失败：' + (err && err.message || err); note.classList.remove('hide'); }
+  }finally{
+    LOG.loading = false;
+    if (btn) btn.disabled = false;
+  }
+}
+
 $('#logLines').addEventListener('click', function(e){
   var b = e.target.closest('button[data-n]'); if (!b) return;
   S.logLines = parseInt(b.getAttribute('data-n'), 10) || 120;
@@ -1324,17 +1505,12 @@ $('#logLines').addEventListener('click', function(e){
   });
   loadLogs();
 });
-async function loadLogs(){
-  busy(true);
-  $('#logBox').textContent = '拉取中…';
-  try{
-    var r = await api('api/logs?lines=' + S.logLines);
-    var txt = r.logs || '';
-    $('#logBox').textContent = txt || '（无日志输出）';
-    $('#logBox').scrollTop = $('#logBox').scrollHeight;
-  }catch(err){ $('#logBox').textContent = '拉取失败：' + (err && err.message || err); }
-  finally{ busy(false); }
-}
+$('#btnLogAuto').addEventListener('click', function(){
+  LOG.auto = !LOG.auto;
+  logAutoText();
+  if (LOG.auto){ startLogAuto(); loadLogs(); } else { stopLogAuto(); }
+});
+logAutoText();
 
 /* ── 添加账号 ─────────────────────────────────────── */
 function openDrawer(){
@@ -1690,6 +1866,139 @@ $('#keyRows').addEventListener('click', function(event){
 });
 
 init();
+
+"use strict";
+// ═══ 更新日志 ═══
+// 2026-09-17：新增用量统计页：总量卡片 + 按密钥明细 + 单密钥模型拆分，
+//             数据经本机管理通道读取网关记账（/usage）。
+
+var US = {data: null, loading: false, error: '', open: {}};
+
+function compactTokens(value){
+  var n = Number(value) || 0;
+  if (n >= 1000000000) return (n / 1000000000).toFixed(2) + 'B';
+  if (n >= 1000000) return (n / 1000000).toFixed(2) + 'M';
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+  return String(n);
+}
+
+function exactTokens(value){
+  var n = Number(value) || 0;
+  return n.toLocaleString('zh-CN');
+}
+
+function usageTime(value){
+  if (!value) return '—';
+  var d = new Date(value);
+  if (isNaN(d.getTime())) return '—';
+  function pad(x){ return x < 10 ? '0' + x : '' + x; }
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+    ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+
+function renderUsageTiles(totals){
+  var t = totals || {};
+  var tiles = [
+    {k: '请求数', v: exactTokens(t.requests), s: '成功完成的调用'},
+    {k: '合计 tokens', v: compactTokens(t.total_tokens), s: exactTokens(t.total_tokens) + ' tokens'},
+    {k: '输入 tokens', v: compactTokens(t.prompt_tokens), s: exactTokens(t.prompt_tokens) + ' tokens'},
+    {k: '输出 tokens', v: compactTokens(t.completion_tokens), s: exactTokens(t.completion_tokens) + ' tokens'}
+  ];
+  if (t.credit) tiles.push({k: '上游计费', v: String(t.credit), s: 'usage.credit 累计'});
+  $('#usageTiles').innerHTML = tiles.map(function(tile){
+    return '<div class="usage-tile"><div class="k">' + esc(tile.k) + '</div>' +
+      '<div class="v">' + esc(tile.v) + '</div>' +
+      '<div class="s">' + esc(tile.s) + '</div></div>';
+  }).join('');
+}
+
+function renderUsageRows(keys, totals){
+  var rows = keys || [];
+  if (!rows.length){
+    $('#usageRows').innerHTML = '<tr><td colspan="7"><div class="empty">还没有用量记录，客户端发一次请求后这里就有数据。</div></td></tr>';
+    return;
+  }
+  var max = 0;
+  rows.forEach(function(item){ max = Math.max(max, Number(item.totals.total_tokens) || 0); });
+  $('#usageRows').innerHTML = rows.map(function(item){
+    var t = item.totals || {};
+    var share = max > 0 ? Math.round((Number(t.total_tokens) || 0) / max * 100) : 0;
+    var open = !!US.open[item.key_id];
+    var models = (item.models || []).map(function(model){
+      return '<li><span>' + esc(model.model) + '</span><span>' + esc(compactTokens(model.totals.total_tokens)) + '</span></li>';
+    }).join('');
+    var name = item.name ? esc(item.name) : '未命名密钥';
+    var mask = item.masked_key ? '<code>' + esc(item.masked_key) + '</code>' : '';
+    return '<tr>' +
+      '<td><div class="usage-key"><b>' + name + '</b>' + mask +
+        '<div class="usage-bar"><i style="width:' + share + '%"></i></div></div></td>' +
+      '<td class="num">' + esc(exactTokens(t.requests)) + '</td>' +
+      '<td class="num">' + esc(exactTokens(t.prompt_tokens)) + '</td>' +
+      '<td class="num">' + esc(exactTokens(t.completion_tokens)) + '</td>' +
+      '<td class="num">' + esc(exactTokens(t.total_tokens)) + '</td>' +
+      '<td>' + esc(usageTime(item.last_used_at)) + '</td>' +
+      '<td class="r">' + (models
+        ? '<button class="btn sm" data-usage-toggle="' + esc(item.key_id) + '">' + (open ? '收起' : '按模型') + '</button>'
+        : '<span class="sub">—</span>') + '</td>' +
+      '</tr>' + (open && models
+        ? '<tr><td colspan="7"><ul class="usage-models">' + models + '</ul></td></tr>'
+        : '');
+  }).join('');
+}
+
+async function loadUsage(){
+  if (US.loading) return;
+  US.loading = true;
+  var btn = $('#btnUsageReload');
+  if (btn) btn.disabled = true;
+  try{
+    var result = await api('api/usage');
+    US.data = result || {};
+    US.error = '';
+  }catch(error){
+    US.error = error && error.message ? error.message : '加载失败';
+  }finally{
+    US.loading = false;
+    if (btn) btn.disabled = false;
+  }
+  var note = $('#usageError');
+  if (US.error){
+    note.textContent = US.error;
+    note.classList.remove('hide');
+  } else if (!US.data || !US.data.ok){
+    note.textContent = (US.data && US.data.message) || '用量账本未启用：在网关 config.json 里设置 usage_file 后重启容器。';
+    note.classList.remove('hide');
+  } else {
+    note.classList.add('hide');
+  }
+  var payload = (US.data && US.data.ok) ? US.data : {totals: {}, keys: []};
+  renderUsageTiles(payload.totals);
+  renderUsageRows(payload.keys, payload.totals);
+  var since = $('#usageSince');
+  if (since){
+    since.textContent = payload.since
+      ? '统计起始 ' + usageTime(payload.since) + '｜更新于 ' + usageTime(payload.updated_at)
+      : '';
+  }
+  var foot = $('#usageFile');
+  if (foot) foot.textContent = payload.file ? '账本文件：' + payload.file : '';
+}
+
+document.addEventListener('click', function(e){
+  var toggle = e.target.closest('button[data-usage-toggle]');
+  if (toggle){
+    var id = toggle.getAttribute('data-usage-toggle');
+    US.open[id] = !US.open[id];
+    var payload = (US.data && US.data.ok) ? US.data : {keys: []};
+    renderUsageRows(payload.keys, payload.totals);
+  }
+});
+
+function usageInit(){
+  var btn = $('#btnUsageReload');
+  if (btn) btn.addEventListener('click', loadUsage);
+}
+usageInit();
 
 </script>
 </body>

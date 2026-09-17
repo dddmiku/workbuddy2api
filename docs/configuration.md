@@ -10,6 +10,7 @@
 | `api_key` | 空 | 单密钥模式的调用密钥；多密钥模式首次建库时用于迁移 |
 | `api_keys_file` | 空 | 非空时启用持久化密钥库 |
 | `api_keys_socket` | 密钥库同目录下 `api_keys.sock` | 多密钥管理通道 |
+| `usage_file` | 密钥库同目录下 `usage.json`（无密钥库时为不启用） | 按 API key 累计的 token 用量账本 |
 | `auth_dir` | `./auths` | 启动时加载 `workbuddy*.json` |
 | `state_file` | `./data/state.json` | 账号池状态文件 |
 | `server.max_body_mb` | `8` | 入站请求体上限，必须大于 0 |
