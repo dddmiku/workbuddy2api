@@ -1,6 +1,9 @@
 # build.yml 多架构打包发布 ghcr.io（网关 + 管理台）与 amd64 离线 tar.gz artifact。
 # 解决 issue #21「建议打包现成 docker 镜像」：NAS/离线环境拉不到 ghcr 时用 artifact。
 # 推 v* tag 时额外产出同名版本镜像，部署方可以固定版本而不是跟着 latest 漂。
+# 注意：本仓库的 tag push 实测不会触发本工作流（fork 来源下的限制），发版本时用
+# 手动 dispatch 指定 tag ref：
+#   POST /repos/<owner>/<repo>/actions/workflows/build.yml/dispatches  {"ref":"v1.2.0"}
 name: Build & Publish
 
 on:
