@@ -363,6 +363,8 @@ func main() {
 		// （长流式生成合法时长可达数分钟，全局 WriteTimeout 会误杀在途 SSE）。
 		IdleTimeout: 120 * time.Second,
 	}
+	// drainDone 只在"信号停机"路径关闭；热更新路径会直接用约定退出码结束进程。
+	drainDone := make(chan struct{})
 	go func() {
 		reason := "signal"
 		select {
@@ -397,6 +399,7 @@ func main() {
 			log.Printf("[update] handover complete, exiting %d", hotupdate.ExitHandover)
 			os.Exit(hotupdate.ExitHandover)
 		}
+		close(drainDone)
 	}()
 
 	if cfg.Global.Enabled {
@@ -418,5 +421,9 @@ func main() {
 	if err := <-serveErr; err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
 	}
+	// 监听关闭只是收尾的开始：必须等优雅停机真的把在途请求跑完再返回。
+	// 提前 return 会让进程以 0 退出，容器 PID 1 会认为可以结束而销毁容器，
+	// 正在流式输出的请求连同新实例一起被杀掉（实测过）。
+	<-drainDone
 	log.Printf("bye")
 }
