@@ -49,6 +49,8 @@ func TestValidateChatRequestAcceptsCompatibleBodies(t *testing.T) {
 		{"empty_call_list", `{"model":"m","messages":[{"role":"assistant","content":"","tool_calls":[]}]}`},
 		{"basic_scalar_options", `{"model":"m","messages":[],"stream":true,"parallel_tool_calls":false,"temperature":0.2,"top_p":1,"max_tokens":0,"unknown_extension":{"allowed":true}}`},
 		{"large_schema_integer", `{"model":"m","messages":[],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"id":{"enum":[9007199254740993]}}}}}]}`},
+		// 客户端自带的内置工具（web search / 延迟工具发现）按声明接受，不上报错误。
+		{"declared_builtin_tools", `{"model":"m","messages":[],"tools":[{"type":"web_search"},{"type":"tool_search","execution":"client"}]}`},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
@@ -101,7 +103,7 @@ func TestValidateChatRequestRejectsBadStructure(t *testing.T) {
 		{"bad_calls_type", `{"model":"m","messages":[{"role":"assistant","tool_calls":[{"type":"unknown","function":{"name":"f"}}]}]}`, "type"},
 		{"object_tools", `{"model":"m","messages":[],"tools":{}}`, "tools"},
 		{"null_tool_entry", `{"model":"m","messages":[],"tools":[null]}`, "tools[0]"},
-		{"unknown_chat_tool", `{"model":"m","messages":[],"tools":[{"type":"web_search"}]}`, "not supported"},
+		{"unsupported_chat_builtin", `{"model":"m","messages":[],"tools":[{"type":"file_search"}]}`, "not supported"},
 		{"missing_chat_function", `{"model":"m","messages":[],"tools":[{"type":"function","name":"f"}]}`, "function"},
 		{"bad_parameters", `{"model":"m","messages":[],"tools":[{"type":"function","function":{"name":"f","parameters":[]}}]}`, "parameters"},
 		{"bad_description", `{"model":"m","messages":[],"tools":[{"type":"function","function":{"name":"f","description":3}}]}`, "description"},
@@ -143,6 +145,13 @@ func TestValidateResponsesOptionsAcceptsCompatibleBodies(t *testing.T) {
 		{"tool_image_parts", `{"model":"m","input":[{"type":"function_call_output","call_id":"c","output":[{"type":"input_image","image_url":"data:image/png;base64,AA==","detail":"high"},{"type":"input_text","text":"loaded"}]}]}`},
 		{"reasoning_history", `{"model":"m","input":[{"type":"reasoning","id":"r","summary":[{"type":"summary_text","text":"thinking"}],"encrypted_content":"optional"}],"reasoning":{"effort":"low","summary":"concise"}}`},
 		{"strict_output_schema", `{"model":"m","input":"hi","text":{"format":{"type":"json_schema","name":"answer","strict":true,"schema":{"type":"object","properties":{"id":{"type":"integer"}}}}}}`},
+		// 风格/提示类字段：接受声明，网关不转发也不报错。新版 Codex 默认携带这些字段。
+		{"text_verbosity", `{"model":"m","input":"hi","text":{"verbosity":"low"}}`},
+		{"text_verbosity_with_format", `{"model":"m","input":"hi","text":{"verbosity":"high","format":{"type":"text"}}}`},
+		{"automatic_truncation", `{"model":"m","input":"hi","truncation":"auto"}`},
+		{"empty_truncation", `{"model":"m","input":"hi","truncation":""}`},
+		{"allowed_tools_choice", `{"model":"m","input":"hi","tool_choice":{"type":"allowed_tools","tools":[{"type":"function","name":"lookup"}]}}`},
+		{"unknown_history_items", `{"model":"m","input":[{"type":"tool_search_call","call_id":"c1","query":"x"},{"type":"tool_search_output","call_id":"c1","output":"y"},{"type":"web_search_call","id":"ws1","status":"completed"},{"role":"user","content":"hi"}]}`},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
@@ -169,8 +178,6 @@ func TestValidateResponsesOptionsRejectsUnsupportedOrMalformed(t *testing.T) {
 		{"prompt_template", `{"model":"m","input":"hi","prompt":{"id":"pmpt_old","variables":{"x":"y"}}}`, "prompt"},
 		{"prompt_string_reference", `{"model":"m","input":"hi","prompt":"pmpt_old"}`, "prompt"},
 		{"prompt_wrong_type", `{"model":"m","input":"hi","prompt":[]}`, "prompt"},
-		{"automatic_truncation", `{"model":"m","input":"hi","truncation":"auto"}`, "truncation"},
-		{"empty_truncation", `{"model":"m","input":"hi","truncation":""}`, "truncation"},
 		{"numeric_truncation", `{"model":"m","input":"hi","truncation":1}`, "truncation"},
 		{"unimplemented_without_declaration", `{"model":"m","input":"hi","tools":[{"type":"file_search"}]}`, "not supported"},
 		{"mcp_tool", `{"model":"m","input":"hi","tools":[{"type":"mcp","server_url":"https://example.invalid"}]}`, "not supported"},
@@ -183,7 +190,6 @@ func TestValidateResponsesOptionsRejectsUnsupportedOrMalformed(t *testing.T) {
 		{"bad_tool_strict", `{"model":"m","input":"hi","tools":[{"type":"function","name":"lookup","strict":1}]}`, "strict"},
 		{"bad_custom_format", `{"model":"m","input":"hi","tools":[{"type":"custom","name":"patch","format":{"definition":42}}]}`, "definition"},
 		{"builtin_tool_choice", `{"model":"m","input":"hi","tool_choice":{"type":"web_search","name":"fake-function"}}`, "tool_choice"},
-		{"unsupported_allowed_tools", `{"model":"m","input":"hi","tool_choice":{"type":"allowed_tools","tools":[]}}`, "tool_choice"},
 		{"nested_choice_cannot_silently_become_auto", `{"model":"m","input":"hi","tool_choice":{"type":"function","function":{"name":"lookup"}}}`, "tool_choice.name"},
 		{"bad_metadata", `{"model":"m","input":"hi","client_metadata":[]}`, "client_metadata"},
 		{"bad_include_type", `{"model":"m","input":"hi","include":"reasoning.encrypted_content"}`, "include"},

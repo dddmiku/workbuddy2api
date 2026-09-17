@@ -1,5 +1,8 @@
 // ═══ 更新日志 ═══
 // 2026-09-16：映射并校验 Responses 的输出格式，禁用外部 schema 加载，防止格式约束静默丢失。
+// 2026-09-18：text.verbosity 改为接受并忽略：新版 Codex 默认携带，上游没有对应开关，
+//
+//	把它当错误回 400 会让整个会话不可用。
 package server
 
 import (
@@ -30,9 +33,8 @@ func parseOutputContract(raw json.RawMessage) (*outputContract, error) {
 	if err := json.Unmarshal(raw, &text); err != nil {
 		return nil, fmt.Errorf("invalid text options: %w", err)
 	}
-	if text.Verbosity != "" {
-		return nil, fmt.Errorf("text.verbosity is not supported by this gateway")
-	}
+	// text.verbosity 是"输出详略"的风格提示，上游 chat 协议没有对应字段。保留解析、
+	// 不转发也不报错：客户端升级后默认带这个字段，拒绝等于整条请求 400。
 	if len(text.Format) == 0 {
 		return nil, nil
 	}

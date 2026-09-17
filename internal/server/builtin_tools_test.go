@@ -86,9 +86,15 @@ func TestBuiltinToolInsideNamespaceStaysRejected(t *testing.T) {
 	}
 }
 
-func TestChatEndpointStillRejectsBuiltinTools(t *testing.T) {
-	body := []byte(`{"model":"m","messages":[],"tools":[{"type":"tool_search"}]}`)
-	if err := validateChatRequest(body); err == nil {
-		t.Fatal("chat 端点不是 Responses 协议，仍应拒绝内置工具声明")
+// TestChatEndpointToleratesClientSideBuiltins 两个端点策略一致：客户端自带的内置工具
+// 接受声明（上游拿不到，模型不会调用），服务端能力类仍然报错。
+func TestChatEndpointToleratesClientSideBuiltins(t *testing.T) {
+	ok := []byte(`{"model":"m","messages":[],"tools":[{"type":"tool_search"},{"type":"web_search"}]}`)
+	if err := validateChatRequest(ok); err != nil {
+		t.Fatalf("chat 端点不应因客户端自带的内置工具而失败: %v", err)
+	}
+	bad := []byte(`{"model":"m","messages":[],"tools":[{"type":"file_search"}]}`)
+	if err := validateChatRequest(bad); err == nil {
+		t.Fatal("服务端能力类工具（file_search）仍应明确报错")
 	}
 }

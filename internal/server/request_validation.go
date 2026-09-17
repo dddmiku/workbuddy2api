@@ -2,6 +2,10 @@
 // 2026-09-16：在选号前校验请求基础结构并拒绝不支持的 Responses 状态能力，避免坏参数被静默丢弃或触发换号。
 // 2026-09-17：接受 Responses 的命名空间工具分组，并把命名空间名字写回函数调用历史。
 // 2026-09-18：内置工具按前缀接受并丢弃（补齐 tool_search 等新类型），避免客户端升级即不可用。
+// 2026-09-18：只对"能力/状态"类字段报错（background/store/previous_response_id/
+//
+//	服务端工具），风格与提示类字段（text.verbosity、truncation、allowed_tools、
+//	未知历史项）一律接受并忽略，避免客户端升级反复炸在 400 上。
 package server
 
 import (
@@ -172,13 +176,11 @@ func requestValidationToolSpec(tool map[string]any, toolPath string, responses, 
 		return err
 	}
 	if kind, _ := tool["type"].(string); isUnimplementedBuiltinTool(kind) {
-		if !responses {
-			return fmt.Errorf("%s.type %q is not supported; use function or custom tools", toolPath, kind)
-		}
 		if !allowNamespace {
 			return fmt.Errorf("%s.type %q is not supported inside a namespace; use function or custom tools", toolPath, kind)
 		}
-		// 声明本身可以出现，只是不会转发到上游；额外字段不校验，避免绑定未来格式。
+		// 声明本身可以出现，只是不会转发到上游；/v1/chat/completions 与 /v1/responses
+		// 一致：客户端带上默认的内置工具不该让整条请求失败。额外字段不校验，避免绑定未来格式。
 		return nil
 	}
 	switch tool["type"] {
@@ -349,6 +351,11 @@ func requestValidationToolChoice(value any, path string, responses bool) error {
 	}
 	kind := choice["type"].(string)
 	if responses {
+		if kind == "allowed_tools" {
+			// 白名单式选择：responsesToolChoice 会折成 auto。这是"限制模型可调用的工具"
+			// 的提示，网关没有等价物，接受声明但不收缩上游的可选工具集。
+			return nil
+		}
 		if kind != "function" && kind != "custom" {
 			return fmt.Errorf("%s.type %q is not supported; use auto/none/required strings or a named function/custom choice", path, kind)
 		}
@@ -507,8 +514,13 @@ func requestValidationResponsesInput(value any) error {
 		case "reasoning":
 			// Optional reasoning/encrypted history is not required to answer
 			// the full message history supplied by current Codex clients.
-		default:
+		case "item_reference":
+			// 指向服务端保存的内容项：网关无状态，取不到内容，必须让客户端改传完整历史。
 			return fmt.Errorf("%s.type %q is not supported; include full message and function/custom tool history", path, kind)
+		default:
+			// 其它历史项（tool_search_call / web_search_call / mcp_call 等）本网关不会产生，
+			// 但客户端切换过上游时可能带上。历史是信息性的，忽略比整条请求 400 好；
+			// 与之配对的 output 项同样会被忽略，模型看到的历史保持一致。
 		}
 	}
 	return nil
@@ -572,9 +584,8 @@ func validateResponsesOptions(object map[string]json.RawMessage, req *responsesR
 			return err
 		}
 	}
-	if truncation, present := fields["truncation"]; present && truncation != nil && truncation != "disabled" {
-		return fmt.Errorf("truncation only supports disabled; automatic server-side truncation is not supported")
-	}
+	// truncation 是"上下文超限时怎么办"的策略提示。网关本身不保存会话，auto 与 disabled
+	// 在行为上只差上游报错时机，因此按声明接受、不转发，避免客户端带上默认值时整条 400。
 	for _, key := range []string{"metadata", "client_metadata", "reasoning", "text"} {
 		if value := fields[key]; value != nil {
 			if _, err := requestValidationObject(value, key); err != nil {
