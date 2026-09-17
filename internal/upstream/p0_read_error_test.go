@@ -164,7 +164,7 @@ func TestChatStreamContextSinglePathNoPanic(t *testing.T) {
 
 // cancelObserver 断言 fallback 场景下每条路径的 cancel 均被调用。
 func TestChatStreamContextFallbackCancelsEachAttempt(t *testing.T) {
-	// global 账号走双路径 [console, /v2]：首路径 404 → fallback；两路径的
+	// global 账号走双路径 [/v2, console]：首路径 404 → fallback；两路径的
 	// reqCtx cancel 都必须被调用（路径一在 continue 前、路径二在返回前/monitorBody 持有）。
 	cancelled := make(chan struct{}, 4)
 	c := &Client{
@@ -175,7 +175,7 @@ func TestChatStreamContextFallbackCancelsEachAttempt(t *testing.T) {
 				cancelled <- struct{}{}
 			}()
 			switch r.URL.Path {
-			case "/console/chat/completions":
+			case "/v2/chat/completions":
 				return jsonResp(404, `{"code":404,"msg":"not found"}`), nil
 			default:
 				return &http.Response{

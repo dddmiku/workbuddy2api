@@ -116,8 +116,8 @@ func TestChatRealmSelectionAndBodyRewrite(t *testing.T) {
 	if gotModel != "gpt-5.4" {
 		t.Errorf("global chat outbound model=%q want gpt-5.4 (prefix stripped)", gotModel)
 	}
-	if gotPath != "/console/chat/completions" {
-		t.Errorf("global chat path=%q want /console/chat/completions", gotPath)
+	if gotPath != "/v2/chat/completions" {
+		t.Errorf("global chat path=%q want /v2/chat/completions", gotPath)
 	}
 	if gotMsgs != 2 { // ensureConsoleSystem：user 前置补 system
 		t.Errorf("global chat messages=%d want 2 (system fallback)", gotMsgs)

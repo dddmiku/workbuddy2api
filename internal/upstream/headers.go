@@ -15,7 +15,7 @@ import (
 
 const (
 	// defaultClientVersion 出站 WorkBuddy 客户端版本段（UA 的 `WorkBuddy/<ver>` 与
-	// 白名单头组的 X-IDE-Version）。对齐官方 WorkBuddy Desktop 分发包版本
+	// X-IDE-Version）。对齐官方 WorkBuddy Desktop 分发包版本
 	// （/tmp/wb-ua-fp/step1-fingerprint.md §1.2：WORKBUDDY_CLIENT_VERSION = 桌面端
 	// package.json version，5.5.4 分发包即 5.5.4）。config upstream.client_version
 	// 可覆盖（空 = 内置默认）。
@@ -57,26 +57,23 @@ func (c *Client) cliVersion() string {
 }
 
 // defaultWorkBuddyUAFor 组装默认客户端出站 UA（官方桌面端 RestOperations 层形状）：
-// `WorkBuddy/<clientVersion> <platform>/<clientVersion> CLI/<cliVersion>`
+// `WorkBuddy/<clientVersion> WorkBuddy/<clientVersion> CLI/<cliVersion>`
 // （step1 §1.3：applicationName/version + platform/version + CLI/<cliVersion>）。
-// 平台段（第二段）品牌按 realm 切换——CN 用 applicationName 同值 `WorkBuddy`，
-// global 用官方国际版 productName `WorkBuddy AI`（intl 项目逆向证据
-// ANALYSIS-global-chat-solutions.md：`WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2`）。
-// global 账号送错平台段（`WorkBuddy` 非 `WorkBuddy AI`）可能触发上游 403 code 11140
-// "request illegal" 风控。官方无任何 UA 随机化（step1 §4），故默认确定性。
-// realm 判定委托 auth.Realm()（含全局开关逃生门）。
+//
+// 平台段（第二段）两 realm 同值 `WorkBuddy`。早前按逆向文档把 global 段写成
+// `WorkBuddy AI`，2026-09-17 对国际版客户端 5.5.2 抓包（本机 CLI host 实发
+// /v2/chat/completions）得到的原文是 `WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/2.137.1`，
+// 即国际版分发包同样用 `WorkBuddy`，不存在 `WorkBuddy AI` 平台段。官方无任何 UA
+// 随机化（step1 §4），故默认确定性。realm 判定委托 auth.Realm()（含全局开关逃生门）。
 func (c *Client) defaultWorkBuddyUAFor(a *auth.Auth) string {
-	platform := "WorkBuddy"
-	if a != nil && a.IsGlobal() {
-		platform = "WorkBuddy AI"
-	}
-	return "WorkBuddy/" + c.clientVersion() + " " + platform + "/" + c.clientVersion() + " CLI/" + c.cliVersion()
+	_ = a
+	return "WorkBuddy/" + c.clientVersion() + " WorkBuddy/" + c.clientVersion() + " CLI/" + c.cliVersion()
 }
 
 // userAgent 返回当前出站 UA（客户端出站路径：chat/refresh/FetchModels）。
 // 优先级：Client.UserAgent（config user_agent）显式覆盖 > 按账号 realm 的默认 WorkBuddy 三段式。
 // 显式覆盖兼容既有覆盖逻辑：用户配了即以用户值为准（自定义品牌/版本），
-// 未配则走官方桌面端默认形态（global 换 `WorkBuddy AI` 平台段）。
+// 未配则走官方桌面端默认形态（两 realm 同为 `WorkBuddy` 平台段）。
 func (c *Client) userAgent(a *auth.Auth) string {
 	if c != nil && c.UserAgent != "" {
 		return c.UserAgent
@@ -162,7 +159,7 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	origin := originRefererFor(a)
 	req.Header.Set("Origin", origin)
 	req.Header.Set("Referer", origin+"/")
-	// User-Agent 按账号 realm 切换品牌段（global → `WorkBuddy AI`，见 defaultWorkBuddyUAFor）。
+	// User-Agent 用官方桌面端三段式（两 realm 同形，见 defaultWorkBuddyUAFor）。
 	req.Header.Set("User-Agent", c.userAgent(a))
 	// X-CodeBuddy-Request: 1（官方客户端风控闸门头，所有 API 请求必带，D1）。
 	req.Header.Set("X-CodeBuddy-Request", "1")
@@ -259,6 +256,10 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	// 默认（ClientName 空）即伪造 WorkBuddy 桌面端头组（见 injectAttribution）；
 	// 显式 ClientName="SaaS" 还原旧行为（仅 X-Product="SaaS"）。
 	c.injectAttribution(req)
+	// 意图/角色头与 SDK 指纹头：官方 CLI 每条模型请求固定携带（见两个 injector 注释，
+	// 取值来自 2026-09-17 国际版客户端抓包）。补齐后网关出站头组与官方客户端同形。
+	c.injectAgentIntentHeaders(req)
+	c.injectSDKFingerprintHeaders(req)
 	// 客户端 IP 透传：仅当 PassthroughIP=true 且本次请求 clientIP 参数非空（见 handler 设置）。
 	// 缺省 false（反代安全边界：不把内网/代理 IP 暴露给上游）。
 	c.injectClientIP(req, clientIP)
@@ -305,8 +306,19 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 		b3Trace = messageID // 非法 B3 TraceId → 回落恒 32 hex 的消息级 ID
 	}
 	req.Header.Set("X-B3-TraceId", b3Trace)
-	req.Header.Set("X-B3-SpanId", messageID[:16])
+	spanID := messageID[:16]
+	req.Header.Set("X-B3-SpanId", spanID)
 	req.Header.Set("X-B3-Sampled", "1")
+	// 官方抓包（2026-09-17）里链路族是四件套，除 X-B3-* 外还有 W3C 的 traceparent、b3
+	// 单行头与父跨度 ID。父跨度取本轮聚合键前 16 位（同一 user send 内所有出站一致），
+	// 聚合键不是合法 32 hex 时回落消息级 span，保证三处取值同形且互相自洽。
+	parentSpan := spanID
+	if validTraceID(convReqID) && len(convReqID) >= 16 {
+		parentSpan = convReqID[:16]
+	}
+	req.Header.Set("X-B3-ParentSpanId", parentSpan)
+	req.Header.Set("traceparent", "00-"+b3Trace+"-"+spanID+"-01")
+	req.Header.Set("b3", b3Trace+"-"+spanID+"-1-"+parentSpan)
 }
 
 // validTraceID 判断 B3 TraceId 是否合法：16 或 32 位 hex（全新大小写均可）。
@@ -337,11 +349,13 @@ func (c *Client) attributionClientName() string {
 // injectAttribution 注入用量归属头（X-Agent-Purpose / X-IDE-* / X-Product）。
 // 仅在 chat/completions 路径生效（ChatHeaders 调用）。
 //
-// 默认（ClientName 空）即伪造官方 WorkBuddy 桌面端指纹：X-Agent-Purpose="conversation"
-// + X-IDE-Name/Type/Product="WorkBuddy" + X-IDE-Version=client_version。该头组与官方
-// banner 白名单头组完全同形（application-manifest.js:27590-27601），上游用量归因从此
-// 不再出现 client/agentPurpose 为空的「网关特征」。显式 ClientName="SaaS" 还原旧行为
-// （仅 X-Product="SaaS"，不设 X-IDE-*）；配其他值则四头跟随该值。
+// 默认（ClientName 空）即对齐官方 WorkBuddy 桌面端实发头组：X-Agent-Purpose="conversation"
+// + X-IDE-Name/Type="WorkBuddy" + X-IDE-Version=client_version，而 X-Product 固定 "SaaS"。
+// X-Product 的取值来自 2026-09-17 国际版客户端抓包原文（本机 CLI host 实发
+// /v2/chat/completions）：`X-Product: SaaS`（部署形态 deploymentType），不是产品名。
+// X-IDE-* 仍用产品名 `WorkBuddy`，与抓包中的 `X-IDE-Type: WorkBuddy` /
+// `X-IDE-Name: WorkBuddy` 一致。显式 ClientName="SaaS" 还原旧行为（仅 X-Product="SaaS"，
+// 不设 X-IDE-*）；配其他值则 X-IDE-* 三头跟随该值，X-Product 仍为 "SaaS"。
 func (c *Client) injectAttribution(req *http.Request) {
 	name := c.attributionClientName()
 	if name == "SaaS" {
@@ -352,7 +366,42 @@ func (c *Client) injectAttribution(req *http.Request) {
 	req.Header.Set("X-IDE-Name", name)
 	req.Header.Set("X-IDE-Type", name)
 	req.Header.Set("X-IDE-Version", c.clientVersion())
-	req.Header.Set("X-Product", name)
+	req.Header.Set("X-Product", "SaaS")
+}
+
+// injectAgentIntentHeaders 注入官方 CLI 在每次模型请求上固定携带的意图/角色头：
+//   - X-Agent-Intent: craft      当前交互模式（default 模式，超时/自动档同值）
+//   - X-Agent-Type:   main       顶层会话 agent（subagent 为 "subagent"，团队为 "team"）
+//
+// 取值来自 2026-09-17 国际版客户端抓包原文（CLI host 实发 /v2/chat/completions）。
+// 缺这两个头时上游后台按未知来源归类，且与官方客户端指纹不一致，故默认补齐。
+func (c *Client) injectAgentIntentHeaders(req *http.Request) {
+	req.Header.Set("X-Agent-Intent", "craft")
+	req.Header.Set("X-Agent-Type", "main")
+}
+
+// injectSDKFingerprintHeaders 注入官方模型请求里的 OpenAI Node SDK 输出头
+// （x-stainless-*）。官方桌面端走 @openai/* SDK 发 chat/completions，SDK 会自动带上
+// 这组头；抓包原文（2026-09-17）为：
+//
+//	x-stainless-arch: x64
+//	x-stainless-lang: js
+//	x-stainless-os: Windows
+//	x-stainless-package-version: 6.25.0
+//	x-stainless-retry-count: 0
+//	x-stainless-runtime: node
+//	x-stainless-runtime-version: v22.21.1
+//
+// 网关是 Go 实现，这组头是纯指纹对齐（与 UA/X-IDE-* 同性质），用于让上游看到的
+// 请求形态与官方客户端一致。retry-count 每次出站都为 0（官方单次请求不重试）。
+func (c *Client) injectSDKFingerprintHeaders(req *http.Request) {
+	req.Header.Set("x-stainless-arch", "x64")
+	req.Header.Set("x-stainless-lang", "js")
+	req.Header.Set("x-stainless-os", "Windows")
+	req.Header.Set("x-stainless-package-version", "6.25.0")
+	req.Header.Set("x-stainless-retry-count", "0")
+	req.Header.Set("x-stainless-runtime", "node")
+	req.Header.Set("x-stainless-runtime-version", "v22.21.1")
 }
 
 // injectClientIP 在 PassthroughIP 开启时把 clientIP 参数透传给上游。

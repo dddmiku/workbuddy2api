@@ -882,12 +882,14 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 }
 
 // chatPath 按 realm 返回 chat 端点路径（不含 base）：
-// global → /console/chat/completions（404/405 时由 ChatStream fallback /v2/chat/completions）；
+// global → /v2/chat/completions（404/405 时由 ChatStream fallback /console/chat/completions）；
 // cn → /v2/chat/completions（现状逐字，零回归）。
+//
+// 2026-09-17 国际版客户端抓包：官方 CLI host 实发 /v2/chat/completions（同域其它接口走
+// /v2/…、/console/as/… 混排，chat 只走 /v2）。global 早前优先 /console 是上游新旧
+// 路径分叉期的兼容顺序，与官方客户端不一致；WAF 按路径分规则，非官方路径更易被判。
+// 现改为官方顺序：先 /v2，仅 404/405 才回落 /console。
 func (c *Client) chatPath(a *auth.Auth) string {
-	if c.globalOn(a) {
-		return globalChatConsolePath
-	}
 	return chatCompletionsPath
 }
 
@@ -907,7 +909,8 @@ func chatFallbackHTTPStatus(status int) bool { return status == 404 || status ==
 // 等价于 ChatStreamContext(context.Background(), ...)：不带调用方取消语义。
 // 新调用方应优先用 ChatStreamContext 传入请求 ctx（客户端断连即中断在途调用、释放租约）。
 //
-// global realm：先打 /console/chat/completions，404/405 时同一 base 二次换 /v2/chat/completions
+// global realm：先打 /v2/chat/completions（官方客户端实测路径），404/405 时同一 base
+// 二次换 /console/chat/completions（旧路径兜底）
 // （上游新旧路径分叉，PLAN R9 fallback 顺序）。cn：/v2/chat/completions 现状不变。
 func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	return c.ChatStreamContext(context.Background(), a, body, clientIP, meta)
@@ -1015,10 +1018,11 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 }
 
 // chatPaths 返回按 realm 的 chat 路径候选序列：
-// global → [console, /v2]（向 Fallback 迭代）；cn → [/v2]（单元素，现状）。
+// global → [/v2, console]（向 Fallback 迭代，官方路径优先）；
+// cn → [/v2]（单元素，现状）。
 func (c *Client) chatPaths(a *auth.Auth) []string {
 	if c.globalOn(a) {
-		return []string{globalChatConsolePath, chatCompletionsPath}
+		return []string{chatCompletionsPath, globalChatConsolePath}
 	}
 	return []string{chatCompletionsPath}
 }

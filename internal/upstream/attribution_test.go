@@ -50,7 +50,7 @@ func TestAgentPurposeHeadersSet(t *testing.T) {
 		{"X-Agent-Purpose", "conversation"},
 		{"X-IDE-Name", "WorkBuddy"},
 		{"X-IDE-Type", "WorkBuddy"},
-		{"X-Product", "WorkBuddy"},
+		{"X-Product", "SaaS"},
 	} {
 		if got := h.Get(tc.header); got != tc.want {
 			t.Errorf("%s = %q want %q", tc.header, got, tc.want)
@@ -72,7 +72,7 @@ func TestAttributionIncludesIDEVersion(t *testing.T) {
 		{"X-IDE-Name", "WorkBuddy"},
 		{"X-IDE-Type", "WorkBuddy"},
 		{"X-IDE-Version", "6.0.0"},
-		{"X-Product", "WorkBuddy"},
+		{"X-Product", "SaaS"},
 	} {
 		if got := h.Get(tc.header); got != tc.want {
 			t.Errorf("%s = %q want %q", tc.header, got, tc.want)
@@ -92,22 +92,47 @@ func TestAttributionIncludesIDEVersion(t *testing.T) {
 	}
 }
 
-// TestProductDefaultWorkBuddyFingerprint ClientName 空（缺省）时伪造官方桌面端指纹：
-// X-Product=WorkBuddy 且 X-IDE-* / X-Agent-Purpose 四头齐全（本 PR 核心变更）。
+// TestProductDefaultWorkBuddyFingerprint ClientName 空（缺省）时对齐官方桌面端指纹：
+// X-Product=SaaS（部署形态，抓包原文）且 X-IDE-* / X-Agent-Purpose 四头齐全。
 func TestProductDefaultWorkBuddyFingerprint(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
 	c := &Client{} // ClientName 空 → 默认 WorkBuddy 指纹
 	h := chatHeadersReq(t, c, a, "")
 	for hdr, want := range map[string]string{
-		"X-Product":       "WorkBuddy",
+		"X-Product":       "SaaS",
 		"X-IDE-Name":      "WorkBuddy",
 		"X-IDE-Type":      "WorkBuddy",
 		"X-IDE-Version":   "5.5.4",
 		"X-Agent-Purpose": "conversation",
+		"X-Agent-Intent":  "craft",
+		"X-Agent-Type":    "main",
 	} {
 		if got := h.Get(hdr); got != want {
 			t.Errorf("%s = %q want %q (default fingerprint)", hdr, got, want)
 		}
+	}
+	// SDK 指纹头：官方走 @openai Node SDK，出站必带 x-stainless-* 组。
+	for hdr, want := range map[string]string{
+		"x-stainless-lang":            "js",
+		"x-stainless-runtime":         "node",
+		"x-stainless-os":              "Windows",
+		"x-stainless-arch":            "x64",
+		"x-stainless-package-version": "6.25.0",
+		"x-stainless-retry-count":     "0",
+	} {
+		if got := h.Get(hdr); got != want {
+			t.Errorf("%s = %q want %q (sdk fingerprint)", hdr, got, want)
+		}
+	}
+	// 链路族四件套：traceparent / b3 / 父跨度。
+	if tp := h.Get("traceparent"); len(tp) != 55 || tp[:3] != "00-" {
+		t.Errorf("traceparent = %q want W3C 55-char form", tp)
+	}
+	if b3 := h.Get("b3"); b3 == "" {
+		t.Errorf("b3 = %q want single-line b3", b3)
+	}
+	if ps := h.Get("X-B3-ParentSpanId"); len(ps) != 16 {
+		t.Errorf("X-B3-ParentSpanId = %q want 16 hex", ps)
 	}
 }
 
@@ -127,19 +152,23 @@ func TestProductSaaSOptOut(t *testing.T) {
 	}
 }
 
-// TestProductWorkBuddy_WhenConfigured client_name=WorkBuddy 时 X-Product 跟随（等价覆盖首测，保独立命名）。
+// TestProductWorkBuddy_WhenConfigured client_name 只手写 X-IDE-*；X-Product 恒为
+// 部署形态 "SaaS"（官方抓包），不跟随 client_name。
 func TestProductWorkBuddy_WhenConfigured(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
 	c := &Client{ClientName: "WorkBuddy"}
 	h := chatHeadersReq(t, c, a, "")
-	if got := h.Get("X-Product"); got != "WorkBuddy" {
-		t.Errorf("X-Product = %q want %q", got, "WorkBuddy")
+	if got := h.Get("X-Product"); got != "SaaS" {
+		t.Errorf("X-Product = %q want %q", got, "SaaS")
 	}
-	// client_name 其他值也应跟随。
+	// client_name 其他值：X-IDE-* 跟随，X-Product 仍是 SaaS。
 	c2 := &Client{ClientName: "MyEditor"}
 	h2 := chatHeadersReq(t, c2, a, "")
-	if got := h2.Get("X-Product"); got != "MyEditor" {
-		t.Errorf("X-Product = %q want %q", got, "MyEditor")
+	if got := h2.Get("X-Product"); got != "SaaS" {
+		t.Errorf("X-Product = %q want %q", got, "SaaS")
+	}
+	if got := h2.Get("X-IDE-Name"); got != "MyEditor" {
+		t.Errorf("X-IDE-Name = %q want %q", got, "MyEditor")
 	}
 }
 
