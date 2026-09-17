@@ -21,14 +21,47 @@ const (
 	EnvListenFD = "WB2API_LISTEN_FD"
 	// EnvReadyFD 新实例就绪后往该 FD 写一行，父进程据此判断可以停旧实例。
 	EnvReadyFD = "WB2API_READY_FD"
+	// EnvAdminFD 新实例从该 FD 继承管理 socket（Unix domain）。老进程还在跑的时候
+	// 新进程没法重新 bind 同一个路径，只能继承；不配管理 socket 时该变量不存在。
+	EnvAdminFD = "WB2API_ADMIN_FD"
 	// inheritedFDBase 传给子进程的第一个额外 FD 编号（0/1/2 是标准流）。
 	inheritedFDBase = 3
+	// adminFDNumber 管理 socket 占用的额外 FD 编号（listener=3、ready=4 之后）。
+	adminFDNumber = inheritedFDBase + 2
 	// readyTimeout 新实例从启动到开始服务的等待上限。
 	readyTimeout = 30 * time.Second
 )
 
 // Inherited 判断本进程是否由热更新启动（继承了监听套接字）。
 func Inherited() bool { return strings.TrimSpace(os.Getenv(EnvListenFD)) != "" }
+
+// InheritedAdminFD 返回继承来的管理 socket FD；没有继承时第二个返回值为 false。
+func InheritedAdminFD() (int, bool) {
+	raw := strings.TrimSpace(os.Getenv(EnvAdminFD))
+	if raw == "" {
+		return 0, false
+	}
+	fd, err := strconv.Atoi(raw)
+	if err != nil || fd < 0 {
+		return 0, false
+	}
+	return fd, true
+}
+
+// ListenerFromFD 把继承的 FD 还原成监听器（listener 与管理 socket 通用）。
+func ListenerFromFD(fd int, name string) (net.Listener, error) {
+	file := os.NewFile(uintptr(fd), name)
+	if file == nil {
+		return nil, fmt.Errorf("invalid inherited fd %d", fd)
+	}
+	// net.FileListener 会 dup 一份，随后关掉原 file 不影响监听。
+	ln, err := net.FileListener(file)
+	_ = file.Close()
+	if err != nil {
+		return nil, fmt.Errorf("inherit fd %d: %w", fd, err)
+	}
+	return ln, nil
+}
 
 // Listen 返回监听器：有继承 FD 就用它（热更新切换后的新实例），否则正常监听。
 // 第二个返回值表示是否来自继承。
@@ -42,15 +75,9 @@ func Listen(addr string) (net.Listener, bool, error) {
 	if err != nil {
 		return nil, false, fmt.Errorf("invalid %s=%q: %w", EnvListenFD, raw, err)
 	}
-	file := os.NewFile(uintptr(fd), "inherited-listener")
-	if file == nil {
-		return nil, false, fmt.Errorf("invalid inherited listener fd %d", fd)
-	}
-	// net.FileListener 会 dup 一份，随后关掉原 file 不影响监听。
-	ln, err := net.FileListener(file)
-	_ = file.Close()
+	ln, err := ListenerFromFD(fd, "inherited-listener")
 	if err != nil {
-		return nil, false, fmt.Errorf("inherit listener fd %d: %w", fd, err)
+		return nil, false, err
 	}
 	return ln, true, nil
 }
@@ -80,16 +107,30 @@ func NotifyReady() error {
 //
 // 调用方在返回后应当停止接受新连接并等待在途请求收尾（srv.Shutdown）：
 // 此刻新实例已经在同一个套接字上 accept，旧连接继续由本进程服务到结束。
-func Handover(binary string, args []string, ln net.Listener, wait time.Duration) error {
-	tcp, ok := ln.(*net.TCPListener)
-	if !ok {
+func Handover(binary string, args []string, ln net.Listener, adminLn net.Listener, wait time.Duration) error {
+	if _, ok := ln.(*net.TCPListener); !ok {
 		return fmt.Errorf("listener is %T, need *net.TCPListener", ln)
 	}
-	file, err := tcp.File()
+	file, err := listenerFile(ln)
 	if err != nil {
 		return fmt.Errorf("dup listener: %w", err)
 	}
 	defer file.Close()
+
+	// 管理 socket（Unix domain）也要交给新实例：旧进程还在跑的时候，同一个路径没法
+	// 重新 bind（apikeys.ListenUnix 会判定 already in use），只能继承 FD。
+	var adminFile *os.File
+	if adminLn != nil {
+		if unixLn, ok := adminLn.(*net.UnixListener); ok {
+			// 关掉"关闭时删除 socket 文件"：老进程收尾时不能把新进程正服务的路径删掉。
+			unixLn.SetUnlinkOnClose(false)
+		}
+		adminFile, err = listenerFile(adminLn)
+		if err != nil {
+			return fmt.Errorf("dup admin listener: %w", err)
+		}
+		defer adminFile.Close()
+	}
 
 	readPipe, writePipe, err := os.Pipe()
 	if err != nil {
@@ -98,15 +139,21 @@ func Handover(binary string, args []string, ln net.Listener, wait time.Duration)
 	defer readPipe.Close()
 
 	cmd := exec.Command(binary, args...)
-	cmd.Env = append(stripHandoverEnv(os.Environ()),
+	env := append(stripHandoverEnv(os.Environ()),
 		fmt.Sprintf("%s=%d", EnvListenFD, inheritedFDBase),
 		fmt.Sprintf("%s=%d", EnvReadyFD, inheritedFDBase+1),
 	)
+	// ExtraFiles[0] → fd 3（listener），[1] → fd 4（ready 管道写端），[2] → fd 5（管理 socket）。
+	extra := []*os.File{file, writePipe}
+	if adminFile != nil {
+		env = append(env, fmt.Sprintf("%s=%d", EnvAdminFD, adminFDNumber))
+		extra = append(extra, adminFile)
+	}
+	cmd.Env = env
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = nil
-	// ExtraFiles[0] → fd 3（listener），ExtraFiles[1] → fd 4（ready 管道写端）。
-	cmd.ExtraFiles = []*os.File{file, writePipe}
+	cmd.ExtraFiles = extra
 	if err := cmd.Start(); err != nil {
 		_ = writePipe.Close()
 		return fmt.Errorf("start new instance: %w", err)
@@ -142,12 +189,25 @@ func Handover(binary string, args []string, ln net.Listener, wait time.Duration)
 	return nil
 }
 
+// listenerFile 取监听器的可传递副本（TCP 与 Unix domain 都支持）。
+func listenerFile(ln net.Listener) (*os.File, error) {
+	switch item := ln.(type) {
+	case *net.TCPListener:
+		return item.File()
+	case *net.UnixListener:
+		return item.File()
+	default:
+		return nil, fmt.Errorf("listener is %T, need *net.TCPListener or *net.UnixListener", ln)
+	}
+}
+
 // stripHandoverEnv 去掉继承来的交接环境变量，避免子进程里出现重复键
 // （重复时取值行为依赖具体实现，显式清理更可控）。
 func stripHandoverEnv(env []string) []string {
 	out := make([]string, 0, len(env))
 	for _, item := range env {
-		if strings.HasPrefix(item, EnvListenFD+"=") || strings.HasPrefix(item, EnvReadyFD+"=") {
+		if strings.HasPrefix(item, EnvListenFD+"=") || strings.HasPrefix(item, EnvReadyFD+"=") ||
+			strings.HasPrefix(item, EnvAdminFD+"=") {
 			continue
 		}
 		out = append(out, item)

@@ -58,15 +58,13 @@ func TestUpdateStatusWithoutManagerReportsDisabled(t *testing.T) {
 }
 
 func TestUpdateStatusCarriesVersionAndHandoverFlags(t *testing.T) {
-	original := version.Version
-	version.Version = "1.3.0"
-	defer func() { version.Version = original }()
-
 	handler := updateTestHandler(t, hotupdate.NewManager(hotupdate.Options{Enabled: true, Dir: t.TempDir()}))
 	recorder := httptest.NewRecorder()
 	handler.InternalHandler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/update", nil))
 	body := recorder.Body.String()
-	for _, want := range []string{`"ok":true`, `"current":"1.3.0"`, `"state":"idle"`, `"inherited_fd":false`, hotupdate.DefaultRepo} {
+	// 不改全局 version.Version：它被后台 goroutine 读，改了会触发数据竞争。
+	for _, want := range []string{`"ok":true`, `"current":"` + version.Version + `"`, `"state":"idle"`,
+		`"inherited_fd":false`, hotupdate.DefaultRepo} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("/update payload missing %q: %s", want, body)
 		}
@@ -76,7 +74,10 @@ func TestUpdateStatusCarriesVersionAndHandoverFlags(t *testing.T) {
 // TestUpdateApplyWithoutPriorCheckStartsAnUpdate 未先点「检查更新」时，触发动作要自己去查
 // 远端版本（否则管理台的「立即更新」会先回一句莫名其妙的"已经是最新版本"）。
 func TestUpdateApplyWithoutPriorCheckStartsAnUpdate(t *testing.T) {
-	handler := updateTestHandler(t, hotupdate.NewManager(hotupdate.Options{Enabled: true, Dir: t.TempDir()}))
+	// 后台 goroutine 会去查远端：指向不存在的仓库，让它在测试里立刻失败，
+	// 既不真的碰 GitHub，也不会长时间留一个读取全局状态的 goroutine。
+	manager := hotupdate.NewManager(hotupdate.Options{Enabled: true, Dir: t.TempDir(), Repo: "invalid/repo"})
+	handler := updateTestHandler(t, manager)
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/update/apply", strings.NewReader("{}"))
 	handler.InternalHandler().ServeHTTP(recorder, request)
@@ -114,22 +115,16 @@ func withSubtest(t *testing.T, name string, fn func(*testing.T)) {
 }
 
 func TestHealthzReportsVersion(t *testing.T) {
-	original := version.Version
-	version.Version = "1.3.0"
-	version.Commit = "abcdef1234567890"
-	defer func() {
-		version.Version = original
-		version.Commit = ""
-	}()
-
 	handler := updateTestHandler(t, nil)
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("healthz status=%d", recorder.Code)
 	}
+	// 部署脚本靠这两个字段核对切换是否生效，所以必须真的透出编译期注入的值。
 	body := recorder.Body.String()
-	for _, want := range []string{`"version":"1.3.0"`, `"commit":"abcdef1234567890"`, ServiceName} {
+	for _, want := range []string{`"version":"` + version.Version + `"`,
+		`"commit":"` + version.Commit + `"`, ServiceName} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("healthz payload missing %q: %s", want, body)
 		}

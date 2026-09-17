@@ -58,14 +58,17 @@ type Status struct {
 
 // Options 构造参数。
 type Options struct {
-	Enabled    bool
-	Repo       string
-	Token      string
-	Dir        string
-	Binary     string   // 当前可执行文件路径（作为新实例的候选；实际用下载件）
-	Args       []string // 新实例命令行参数（沿用本进程）
-	Listener   net.Listener
-	OnSwitched func() // 交接成功后的回调（main 用它触发优雅停机）
+	Enabled  bool
+	Repo     string
+	Token    string
+	Dir      string
+	Binary   string   // 当前可执行文件路径（作为新实例的候选；实际用下载件）
+	Args     []string // 新实例命令行参数（沿用本进程）
+	Listener net.Listener
+	// AdminListener 管理 socket（Unix domain）。新实例没法重新 bind 同一个路径，
+	// 必须一并继承；nil = 本次部署没有管理通道。
+	AdminListener net.Listener
+	OnSwitched    func() // 交接成功后的回调（main 用它触发优雅停机）
 }
 
 // Manager 热更新管理器。
@@ -234,7 +237,7 @@ func (m *Manager) Apply(ctx context.Context, target string) (Status, error) {
 	if len(args) == 0 {
 		args = []string{"-config", "/app/config.json"}
 	}
-	if err := Handover(path, args, m.opts.Listener, readyTimeout); err != nil {
+	if err := Handover(path, args, m.opts.Listener, m.opts.AdminListener, readyTimeout); err != nil {
 		m.fail(err)
 		return m.Status(), err
 	}

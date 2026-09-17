@@ -47,6 +47,19 @@ func TestHandoverHelperProcess(t *testing.T) {
 		_, _ = io.WriteString(w, "child-ok")
 	})}
 	go func() { _ = server.Serve(listener) }()
+
+	// 管理 socket（Unix domain）同样要继承：老进程还在跑时没法重新 bind 同一路径。
+	if fd, ok := InheritedAdminFD(); ok {
+		adminLn, err := ListenerFromFD(fd, "inherited-admin")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "helper admin listener:", err)
+			os.Exit(2)
+		}
+		adminServer := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, "admin-ok")
+		})}
+		go func() { _ = adminServer.Serve(adminLn) }()
+	}
 	if err := NotifyReady(); err != nil {
 		fmt.Fprintln(os.Stderr, "helper notify ready:", err)
 		os.Exit(2)
@@ -71,13 +84,13 @@ func TestHandoverHelperProcess(t *testing.T) {
 // 停止文件放在系统临时目录而不是 t.TempDir()：TempDir 在测试收尾时会被删掉，
 // 子进程可能因此错过停止信号并一直握着 go test 的 stdout 管道，
 // 让整个包以「Test I/O incomplete」失败。
-func startHandover(t *testing.T, ln net.Listener) func() {
+func startHandover(t *testing.T, ln net.Listener, adminLn net.Listener) func() {
 	t.Helper()
 	requireListenerInheritance(t)
 	stop := filepath.Join(os.TempDir(), fmt.Sprintf("wb2api-hotupdate-stop-%d-%d", os.Getpid(), time.Now().UnixNano()))
 	t.Setenv(helperEnv, "1")
 	t.Setenv(helperStopEnv, stop)
-	if err := Handover(os.Args[0], []string{"-test.run=^TestHandoverHelperProcess$", "-test.timeout=90s"}, ln, 20*time.Second); err != nil {
+	if err := Handover(os.Args[0], []string{"-test.run=^TestHandoverHelperProcess$", "-test.timeout=90s"}, ln, adminLn, 20*time.Second); err != nil {
 		t.Fatalf("handover: %v", err)
 	}
 	return func() {
@@ -136,7 +149,7 @@ func TestHandoverPassesListenerToNewInstance(t *testing.T) {
 	defer ln.Close()
 	addr := ln.Addr().String()
 
-	stopHelper := startHandover(t, ln)
+	stopHelper := startHandover(t, ln, nil)
 	defer stopHelper()
 
 	if body := dialBody(t, addr); body != "child-ok" {
@@ -181,7 +194,7 @@ func TestHandoverKeepsInFlightRequestAlive(t *testing.T) {
 	}()
 	<-started
 
-	stopHelper := startHandover(t, ln)
+	stopHelper := startHandover(t, ln, nil)
 	defer stopHelper()
 	close(release)
 
@@ -220,6 +233,72 @@ func TestHandoverKeepsInFlightRequestAlive(t *testing.T) {
 	}
 }
 
+// TestHandoverPassesAdminSocket 管理 socket 必须一并继承：老进程还在跑的时候，
+// 新进程没法重新 bind 同一个 Unix domain 路径（生产上表现为启动即失败）。
+func TestHandoverPassesAdminSocket(t *testing.T) {
+	requireListenerInheritance(t)
+	dir := t.TempDir()
+	socket := filepath.Join(dir, "admin.sock")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	adminLn, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatalf("admin listen: %v", err)
+	}
+	defer adminLn.Close()
+
+	stopHelper := startHandover(t, ln, adminLn)
+	defer stopHelper()
+
+	if body := unixBody(t, socket); body != "admin-ok" {
+		t.Fatalf("inherited admin body = %q want admin-ok", body)
+	}
+	// 旧进程收尾：关闭自己的管理监听不能把新进程正在服务的 socket 文件删掉。
+	if err := adminLn.Close(); err != nil {
+		t.Fatalf("close admin listener: %v", err)
+	}
+	if _, err := os.Stat(socket); err != nil {
+		t.Fatalf("socket file must survive the old process shutdown: %v", err)
+	}
+	if body := unixBody(t, socket); body != "admin-ok" {
+		t.Fatalf("admin body after old process shutdown = %q want admin-ok", body)
+	}
+}
+
+// unixBody 经 Unix domain socket 发一个 HTTP GET，返回响应体。
+func unixBody(t *testing.T, socket string) string {
+	t.Helper()
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", socket)
+			},
+		},
+	}
+	var lastErr error
+	for attempt := 0; attempt < 50; attempt++ {
+		resp, err := client.Get("http://admin/keys")
+		if err != nil {
+			lastErr = err
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			return string(body)
+		}
+		lastErr = fmt.Errorf("status %d", resp.StatusCode)
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("no response from the inherited admin socket: %v", lastErr)
+	return ""
+}
+
 // TestHandoverFailsFastWhenChildDies 新实例启动即崩时不能干等到超时。
 func TestHandoverFailsFastWhenChildDies(t *testing.T) {
 	requireListenerInheritance(t)
@@ -232,7 +311,7 @@ func TestHandoverFailsFastWhenChildDies(t *testing.T) {
 	t.Setenv(helperFailEnv, "1")
 
 	begin := time.Now()
-	err = Handover(os.Args[0], []string{"-test.run=^TestHandoverHelperProcess$"}, ln, 20*time.Second)
+	err = Handover(os.Args[0], []string{"-test.run=^TestHandoverHelperProcess$"}, ln, nil, 20*time.Second)
 	if err == nil {
 		t.Fatal("handover must fail when the new instance exits before ready")
 	}
@@ -253,7 +332,19 @@ func TestInheritedAndStripHandoverEnv(t *testing.T) {
 	if !Inherited() {
 		t.Fatal("fd env must be detected as inherited")
 	}
-	env := stripHandoverEnv([]string{"PATH=/bin", EnvListenFD + "=3", EnvReadyFD + "=4", "HOME=/root"})
+	if _, ok := InheritedAdminFD(); ok {
+		t.Fatal("no admin env must mean no inherited admin socket")
+	}
+	t.Setenv(EnvAdminFD, "5")
+	if fd, ok := InheritedAdminFD(); !ok || fd != 5 {
+		t.Fatalf("admin fd = %d/%v want 5/true", fd, ok)
+	}
+	t.Setenv(EnvAdminFD, "not-a-number")
+	if _, ok := InheritedAdminFD(); ok {
+		t.Fatal("broken admin fd must not be treated as inherited")
+	}
+	env := stripHandoverEnv([]string{"PATH=/bin", EnvListenFD + "=3", EnvReadyFD + "=4",
+		EnvAdminFD + "=5", "HOME=/root"})
 	want := []string{"PATH=/bin", "HOME=/root"}
 	if len(env) != len(want) || env[0] != want[0] || env[1] != want[1] {
 		t.Fatalf("stripHandoverEnv = %v want %v", env, want)

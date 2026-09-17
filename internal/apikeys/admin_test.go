@@ -1,13 +1,18 @@
 package apikeys
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAdminTransportAndSecretDisclosure(t *testing.T) {
@@ -77,5 +82,58 @@ func TestAdminSocketPermissionAndConflict(t *testing.T) {
 	data, _ := os.ReadFile(file)
 	if string(data) != "keep" {
 		t.Fatal("regular file changed")
+	}
+}
+
+// TestWaitUnixTakesOverAfterRelease 热更新兼容路径：旧实例（不会传管理 socket FD）
+// 收尾释放路径后，新实例要能重新 bind 并继续提供管理接口。
+func TestWaitUnixTakesOverAfterRelease(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix socket deployment check")
+	}
+	path := filepath.Join(t.TempDir(), "admin.sock")
+	previous, err := ListenUnix(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if duplicate, err := ListenUnix(path); !errors.Is(err, ErrSocketBusy) {
+		if duplicate != nil {
+			duplicate.Close()
+		}
+		t.Fatalf("err = %v want ErrSocketBusy", err)
+	}
+
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		_ = previous.Close()
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	current, err := WaitUnix(path, 8*time.Second, 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	defer current.Close()
+	if elapsed := time.Since(deadline.Add(-10 * time.Second)); elapsed < 200*time.Millisecond {
+		t.Fatalf("wait returned after %s; must wait for the previous instance to exit", elapsed)
+	}
+
+	store, err := Open(filepath.Join(t.TempDir(), "keys.json"), "legacy-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: store.AdminHandler()}
+	go func() { _ = server.Serve(current) }()
+	defer server.Close()
+	client := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", path)
+		}}}
+	response, err := client.Get("http://admin/keys")
+	if err != nil {
+		t.Fatalf("get over the re-bound socket: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != 200 {
+		t.Fatalf("status = %d want 200", response.StatusCode)
 	}
 }

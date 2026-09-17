@@ -1,11 +1,15 @@
 // ═══ 更新日志 ═══
 // 2026-09-16：增加仅通过本机 Unix socket 访问的密钥管理接口，避免把管理能力暴露给普通调用密钥。
 // 2026-09-17：管理接口支持模型绑定字段，与密钥库校验保持一致。
+// 2026-09-17：拆分"路径被活着的进程占用"这一种失败，并支持等旧进程释放后重绑，
+//
+//	供热更新时新实例接手管理 socket（旧版本不会传 FD）。
 package apikeys
 
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -115,6 +119,9 @@ func reply(w http.ResponseWriter, code int, body any) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
+// ErrSocketBusy 目标路径上已有正在服务的 socket（通常是上一个进程还没退出）。
+var ErrSocketBusy = errors.New("API key socket is already in use")
+
 func ListenUnix(path string) (net.Listener, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, err
@@ -126,7 +133,7 @@ func ListenUnix(path string) (net.Listener, error) {
 		conn, dialErr := net.DialTimeout("unix", path, 300*time.Millisecond)
 		if dialErr == nil {
 			conn.Close()
-			return nil, errors.New("API key socket is already in use")
+			return nil, ErrSocketBusy
 		}
 		if err := os.Remove(path); err != nil {
 			return nil, err
@@ -143,4 +150,29 @@ func ListenUnix(path string) (net.Listener, error) {
 		return nil, err
 	}
 	return listener, nil
+}
+
+// WaitUnix 在 deadline 内轮询绑定 Unix socket。
+//
+// 热更新时新实例先于旧实例退出就启动，旧实例（v1.3.1 及更早）不会把管理 socket 交出来，
+// 只能等它收尾关闭监听、路径被释放后再绑。不能用同步等待替代：旧实例要等新实例报告
+// 就绪才开始收尾，同步等会直接卡到超时。
+func WaitUnix(path string, deadline, interval time.Duration) (net.Listener, error) {
+	if interval <= 0 {
+		interval = 500 * time.Millisecond
+	}
+	end := time.Now().Add(deadline)
+	for {
+		listener, err := ListenUnix(path)
+		if err == nil {
+			return listener, nil
+		}
+		if !errors.Is(err, ErrSocketBusy) {
+			return nil, err
+		}
+		if time.Now().After(end) {
+			return nil, fmt.Errorf("admin socket still busy after %s: %w", deadline, err)
+		}
+		time.Sleep(interval)
+	}
 }

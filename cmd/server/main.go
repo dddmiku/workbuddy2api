@@ -3,8 +3,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -237,16 +239,46 @@ func main() {
 			os.Getenv(hotupdate.EnvListenFD))
 	}
 
+	// 管理 socket：热更新后的新实例同样不能重新 bind 旧进程还在服务的路径，
+	// 有继承 FD 就用它，否则照常监听（启动时会清掉上次遗留的死 socket 文件）。
+	var adminLn net.Listener
+	adminPending := false
+	if keyStore != nil {
+		if fd, ok := hotupdate.InheritedAdminFD(); ok {
+			adminLn, err = hotupdate.ListenerFromFD(fd, "inherited-admin-socket")
+			if err != nil {
+				log.Fatalf("inherit API key admin socket: %v", err)
+			}
+			log.Printf("[update] inherited admin socket from the previous instance (fd=%s)", os.Getenv(hotupdate.EnvAdminFD))
+		} else {
+			adminLn, err = apikeys.ListenUnix(cfg.APIKeysSocket)
+			switch {
+			case err == nil:
+			case errors.Is(err, apikeys.ErrSocketBusy):
+				// 旧实例（v1.3.1 及更早）不会把管理 socket 交出来，而它要等本实例报告
+				// 就绪才开始收尾，没法同步等；改成后台重试，等它关掉监听后接手。
+				adminPending = true
+				log.Printf("WARN: [api-keys] admin socket busy; will rebind once the previous instance releases %s", cfg.APIKeysSocket)
+			default:
+				log.Fatalf("listen API key admin socket: %v", err)
+			}
+		}
+		if adminLn != nil {
+			defer adminLn.Close()
+		}
+	}
+
 	// 热更新管理器：查版本、下载校验、交接。OnSwitched 触发本进程优雅停机——
 	// 新实例已经在同一套接字上 accept，本进程只负责把在途请求跑完。
 	handoverDone := make(chan string, 1)
 	updateManager := hotupdate.NewManager(hotupdate.Options{
-		Enabled:  cfg.Update.Enabled,
-		Repo:     cfg.Update.Repo,
-		Token:    cfg.Update.Token,
-		Dir:      updateDir(cfg),
-		Args:     os.Args[1:],
-		Listener: mainLn,
+		Enabled:       cfg.Update.Enabled,
+		Repo:          cfg.Update.Repo,
+		Token:         cfg.Update.Token,
+		Dir:           updateDir(cfg),
+		Args:          os.Args[1:],
+		Listener:      mainLn,
+		AdminListener: adminLn,
 		OnSwitched: func() {
 			select {
 			case handoverDone <- "hot update":
@@ -276,12 +308,7 @@ func main() {
 	})
 
 	var adminServer *http.Server
-	if keyStore != nil {
-		adminLn, err := apikeys.ListenUnix(cfg.APIKeysSocket)
-		if err != nil {
-			log.Fatalf("listen API key admin socket: %v", err)
-		}
-		defer adminLn.Close()
+	serveAdmin := func(listener net.Listener) {
 		mux := http.NewServeMux()
 		mux.Handle("/keys", keyStore.AdminHandler())
 		mux.Handle("/keys/", keyStore.AdminHandler())
@@ -289,11 +316,24 @@ func main() {
 		adminServer = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
 		defer adminServer.Close()
 		go func() {
-			if err := adminServer.Serve(adminLn); err != nil && err != http.ErrServerClosed {
+			if err := adminServer.Serve(listener); err != nil && err != http.ErrServerClosed {
 				log.Printf("[api-keys] admin server: %v", err)
 			}
 		}()
 		log.Printf("API key management enabled (%d keys)", len(keyStore.List()))
+	}
+	if adminLn != nil {
+		serveAdmin(adminLn)
+	} else if adminPending {
+		go func() {
+			listener, waitErr := apikeys.WaitUnix(cfg.APIKeysSocket, 5*time.Minute, 500*time.Millisecond)
+			if waitErr != nil {
+				log.Printf("ERROR: [api-keys] %v", waitErr)
+				return
+			}
+			log.Printf("[api-keys] took over the admin socket after the previous instance exited")
+			serveAdmin(listener)
+		}()
 	}
 	go sch.Run(ctx)
 
