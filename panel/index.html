@@ -2113,13 +2113,14 @@ function renderUpdate(){
   box.innerHTML = rows;
   $('#updState').innerHTML = upState(s.state);
   $('#btnUpdCheck').disabled = busy;
-  $('#btnUpdApply').disabled = busy || !s.update_ready;
+  // 未检查过远端时也允许点「立即更新」：网关自己会先查一次远端版本。
+  $('#btnUpdApply').disabled = busy;
   var hint;
   if (s.state === 'failed') hint = s.last_error || '更新失败';
   else if (busy) hint = '正在' + (UP_STATE[s.state].t) + '…升级期间现有对话不会中断';
   else if (s.update_ready) hint = '可升级到 ' + s.latest_tag;
   else if (s.checked_at) hint = '已是最新版本';
-  else hint = s.inherited_fd ? '尚未检查远端版本' : '尚未检查远端版本（当前进程不是热更新交接启动）';
+  else hint = '点「立即更新」会先检查远端版本';
   $('#updHint').textContent = hint;
 }
 

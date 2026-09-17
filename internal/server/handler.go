@@ -2,10 +2,12 @@
 // 2026-09-17：合并模型级避让与完整响应校验，仅在确认成功后解除模型负缓存。
 // 2026-09-17：密钥可绑定模型白名单，超出范围的请求在选号前拒绝。
 // 2026-09-16：保留调用者指令，停止全局自动降级；校验输入并按真实流结果记录成功。
+// 2026-09-17：热更新触发不再要求先手动检查远端版本（没查过时由 Apply 自己查）。
 // Package server 暴露 OpenAI 兼容 HTTP 接口，内部驱动 pool 挑号 + upstream 转发。
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -291,7 +293,23 @@ func (h *Handler) updateApply(w http.ResponseWriter, r *http.Request) {
 		Tag string `json:"tag"`
 	}
 	if r.Body != nil {
-		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<12)).Decode(&body)
+		// 载荷可以完全省略（管理台发 {}），但一旦带了内容就必须是合法的小 JSON，
+		// 否则一次手滑的请求会静默变成"升到最新版"。
+		raw, readErr := io.ReadAll(io.LimitReader(r.Body, (1<<12)+1))
+		if readErr != nil {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "读取请求体失败"})
+			return
+		}
+		if len(raw) > 1<<12 {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "请求体过大"})
+			return
+		}
+		if len(bytes.TrimSpace(raw)) > 0 {
+			if err := json.Unmarshal(raw, &body); err != nil {
+				writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": "请求体不是合法 JSON"})
+				return
+			}
+		}
 	}
 	status := h.cfg.Update.Status()
 	switch status.State {
@@ -300,9 +318,12 @@ func (h *Handler) updateApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	target := strings.TrimSpace(body.Tag)
-	if !status.UpdateReady && target == "" {
+	// 只有「已经查过远端、且确认没有新版本」才直接拒绝。没查过就交给 Apply 自己去查，
+	// 否则管理台必须先点一次「检查更新」才能升级，用户看到的是莫名其妙的"已经是最新"。
+	if !status.UpdateReady && target == "" && !status.CheckedAt.IsZero() {
 		writeJSON(w, http.StatusOK, map[string]any{
-			"ok": false, "message": "已经是最新版本（可先点「检查更新」确认远端版本）", "status": status,
+			"ok": false, "message": fmt.Sprintf("已经是最新版本（当前 %s，远端 %s）", status.Current, status.LatestTag),
+			"status": status,
 		})
 		return
 	}

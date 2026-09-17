@@ -73,7 +73,9 @@ func TestUpdateStatusCarriesVersionAndHandoverFlags(t *testing.T) {
 	}
 }
 
-func TestUpdateApplyWithoutPendingReleaseIsRefused(t *testing.T) {
+// TestUpdateApplyWithoutPriorCheckStartsAnUpdate 未先点「检查更新」时，触发动作要自己去查
+// 远端版本（否则管理台的「立即更新」会先回一句莫名其妙的"已经是最新版本"）。
+func TestUpdateApplyWithoutPriorCheckStartsAnUpdate(t *testing.T) {
 	handler := updateTestHandler(t, hotupdate.NewManager(hotupdate.Options{Enabled: true, Dir: t.TempDir()}))
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/update/apply", strings.NewReader("{}"))
@@ -81,23 +83,34 @@ func TestUpdateApplyWithoutPendingReleaseIsRefused(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body)
 	}
-	if !strings.Contains(recorder.Body.String(), `"ok":false`) {
-		t.Fatalf("apply without a checked release must be refused: %s", recorder.Body)
+	if !strings.Contains(recorder.Body.String(), `"ok":true`) {
+		t.Fatalf("apply must be accepted and let the manager query the release: %s", recorder.Body)
 	}
 }
 
 func TestUpdateApplyRejectsBadTagPayload(t *testing.T) {
 	handler := updateTestHandler(t, hotupdate.NewManager(hotupdate.Options{Enabled: true, Dir: t.TempDir()}))
-	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/update/apply",
-		strings.NewReader(strings.Repeat("x", 1<<13)))
-	handler.InternalHandler().ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body)
+	// 载荷一旦带了内容就必须是合法的小 JSON：否则一次手滑的请求会静默升到最新版。
+	cases := []string{strings.Repeat("x", 1<<13), "{not json"}
+	names := []string{"oversize", "broken-json"}
+	for index, payload := range cases {
+		withSubtest(t, names[index], func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "/update/apply", strings.NewReader(payload))
+			handler.InternalHandler().ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body)
+			}
+			if !strings.Contains(recorder.Body.String(), `"ok":false`) {
+				t.Fatalf("非法载荷必须被拒绝: %s", recorder.Body)
+			}
+		})
 	}
-	if !strings.Contains(recorder.Body.String(), `"ok":false`) {
-		t.Fatalf("oversize/能解析失败的载荷必须被拒绝: %s", recorder.Body)
-	}
+}
+
+func withSubtest(t *testing.T, name string, fn func(*testing.T)) {
+	t.Helper()
+	t.Run(name, fn)
 }
 
 func TestHealthzReportsVersion(t *testing.T) {
