@@ -1,6 +1,9 @@
 // ═══ 更新日志 ═══
 // 2026-09-17：锁定用量账本的累计、按模型拆分、原子落盘与重启恢复语义。
 // 2026-09-17：锁定热更新期间新旧进程共用账本时的合并语义（取大不丢不重）。
+// 2026-09-17：锁定跨进程可见性：另一个进程落盘的记录要立刻出现在本进程快照里，
+//
+//	且不会因为"把它算成自己的增量"而重复计数。
 package usage
 
 import (
@@ -192,6 +195,68 @@ func TestConcurrentStoresMergeInsteadOfOverwrite(t *testing.T) {
 	snapshot := reopened.Snapshot()
 	if snapshot.Totals.Requests != 2 || snapshot.Totals.TotalTokens != 150 {
 		t.Fatalf("reloaded totals = %+v want requests=2 tokens=150", snapshot.Totals)
+	}
+}
+
+// TestSnapshotSeesOtherProcessRecords 热更新窗口里旧进程的收尾记录必须立刻可见。
+func TestSnapshotSeesOtherProcessRecords(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "usage.json")
+	idle, err := Open(path, time.Hour)
+	if err != nil {
+		t.Fatalf("open idle: %v", err)
+	}
+	defer idle.Close()
+
+	// 另一个进程（交接窗口里的旧实例）记一笔并落盘；本进程没有任何流量。
+	other, err := Open(path, time.Hour)
+	if err != nil {
+		t.Fatalf("open other: %v", err)
+	}
+	at := time.Date(2026, 9, 17, 16, 25, 0, 0, time.UTC)
+	other.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:deepseek-v4.1-flash", 308, 7948, 0, false, at)
+	if err := other.Flush(); err != nil {
+		t.Fatalf("other flush: %v", err)
+	}
+	if err := other.Close(); err != nil {
+		t.Fatalf("other close: %v", err)
+	}
+
+	snapshot := idle.Snapshot()
+	if snapshot.Totals.Requests != 1 || snapshot.Totals.TotalTokens != 8256 {
+		t.Fatalf("idle process snapshot = %+v want 1 request / 8256 tokens", snapshot.Totals)
+	}
+	if len(snapshot.Keys) != 1 || snapshot.Keys[0].KeyID != "key_a" {
+		t.Fatalf("idle process keys = %+v", snapshot.Keys)
+	}
+
+	// 本进程再记一笔并落盘：盘上应是两笔之和，且不会把对方那笔重复计入。
+	idle.Record("key_b", "团队 B", "wb2a_ef…gh", "cn:deepseek-v4.1-flash", 10, 20, 0, false, at.Add(time.Minute))
+	if err := idle.Flush(); err != nil {
+		t.Fatalf("idle flush: %v", err)
+	}
+	after := idle.Snapshot()
+	if after.Totals.Requests != 2 || after.Totals.TotalTokens != 8286 {
+		t.Fatalf("after own write = %+v want 2 requests / 8286 tokens", after.Totals)
+	}
+	if len(after.Keys) != 2 {
+		t.Fatalf("after own write keys = %+v want both", after.Keys)
+	}
+
+	// 再落一次盘仍是同样数字（基线与增量都对得上，不会滚雪球）。
+	if err := idle.Flush(); err != nil {
+		t.Fatalf("second flush: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var doc document
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if doc.Totals.Requests != 2 || doc.Totals.TotalTokens != 8286 {
+		t.Fatalf("on-disk totals = %+v want 2 requests / 8286 tokens", doc.Totals)
 	}
 }
 

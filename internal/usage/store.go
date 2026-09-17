@@ -235,15 +235,27 @@ func (s *Store) Record(keyID, name, maskedKey, model string, prompt, completion 
 }
 
 // Snapshot 返回当前累计值的深拷贝快照。
+//
+// 视图 = 盘上账本 + 本进程尚未落盘的新增量。为什么不能只看内存：热更新期间旧进程
+// 收尾时会把在途请求记进同一个文件，新进程如果没有流量就不会再落盘，只看内存会让
+// 面板一直少算那几条（实测 v1.3.4→v1.3.5 少算了 8256 token）。读盘失败时退回内存视图。
 func (s *Store) Snapshot() Snapshot {
 	if s == nil {
 		return Snapshot{}
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := Snapshot{Since: s.doc.Since, UpdatedAt: s.doc.UpdatedAt, Totals: s.doc.Totals}
-	out.Keys = make([]KeyUsage, 0, len(s.doc.Keys))
-	for id, record := range s.doc.Keys {
+	mine := cloneDocument(s.doc)
+	written := cloneDocument(s.written)
+	s.mu.Unlock()
+
+	view := mine
+	if disk, ok := s.readDisk(); ok {
+		view = addDocument(disk, deltaDocument(mine, written))
+	}
+
+	out := Snapshot{Since: view.Since, UpdatedAt: view.UpdatedAt, Totals: view.Totals}
+	out.Keys = make([]KeyUsage, 0, len(view.Keys))
+	for id, record := range view.Keys {
 		entry := KeyUsage{
 			KeyID:       id,
 			Name:        record.Name,
@@ -341,7 +353,7 @@ func (s *Store) persistDocument(doc document, merge bool) error {
 	if err := os.Rename(tmp, s.path); err != nil {
 		return err
 	}
-	s.setWritten(doc)
+	s.commit(doc, merge)
 	return nil
 }
 
@@ -364,28 +376,31 @@ func (s *Store) mergeDelta(mine document) document {
 	} else {
 		defer unlock()
 	}
-	base := s.readDisk()
+	base, ok := s.readDisk()
+	if !ok {
+		// 读不到盘上账本就退回"只写本方增量"，避免把别人的数据当成不存在。
+		base = document{Version: Version, Keys: map[string]*keyRecord{}}
+	}
 	mine.Version = Version
 	merged := addDocument(base, deltaDocument(mine, s.writtenSnapshot()))
-	s.setWritten(mine)
 	return merged
 }
 
 // readDisk 读回盘上账本；缺失或损坏时返回空账本（不阻断落盘）。
-func (s *Store) readDisk() document {
+func (s *Store) readDisk() (document, bool) {
 	empty := document{Version: Version, Keys: map[string]*keyRecord{}}
 	raw, err := os.ReadFile(s.path)
 	if err != nil || len(raw) == 0 || len(raw) > 1<<20 {
-		return empty
+		return empty, false
 	}
 	var disk document
 	if json.Unmarshal(raw, &disk) != nil {
-		return empty
+		return empty, false
 	}
 	if disk.Keys == nil {
 		disk.Keys = map[string]*keyRecord{}
 	}
-	return disk
+	return disk, true
 }
 
 // writtenSnapshot 本进程上次提交的累计值（深拷贝，防止后续写入改到它）。
@@ -395,10 +410,21 @@ func (s *Store) writtenSnapshot() document {
 	return cloneDocument(s.written)
 }
 
-func (s *Store) setWritten(doc document) {
+// commit 记录本次落盘后的账本基线。
+//
+// adoptDisk 为真（增量合并路径）说明盘上可能还有别的进程的贡献：把这些贡献加进内存视图，
+// 面板才能立刻看到合并后的真实数字；同时把基线提到合并结果，下一次的新增量只算本方
+// 新记录，不会重复计入别人的部分。
+func (s *Store) commit(mine document, adoptDisk bool) {
 	s.mu.Lock()
-	s.written = cloneDocument(doc)
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	if !adoptDisk {
+		s.written = cloneDocument(mine)
+		return
+	}
+	extra := deltaDocument(mine, s.doc)
+	s.doc = addDocument(s.doc, extra)
+	s.written = cloneDocument(mine)
 }
 
 // deltaDocument 本进程自上次提交以来的新增量（累计量单调不减，负数按 0 处理）。
