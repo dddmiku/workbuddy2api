@@ -1,6 +1,7 @@
 services:
   wb2api:
     build: .
+    image: workbuddy2api-wb2api:local
     container_name: workbuddy2api
     restart: unless-stopped
     environment:
@@ -22,3 +23,29 @@ services:
       #   chown -R 10001:10001 ./data
       - ./data:/app/data
       - ./config.json:/app/config.json:ro
+
+  # 管理面板：账号、API key、排程与日志。与网关同项目启动，共享 auths/ 与 data/。
+  # 需要访问宿主 docker.sock（重启网关容器、读取日志、执行登录工具）。
+  wb2api-admin:
+    build: ./panel
+    image: workbuddy2api-panel:local
+    container_name: wb2api-admin
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+      - WB2API_GATEWAY_DIR=/gateway
+      - WB2API_ADMIN_DIR=/data
+      - WB2API_ADMIN_HOST=0.0.0.0
+      - WB2API_GATEWAY_URL=http://wb2api:7863
+      - WB2API_CONTAINER=workbuddy2api
+    ports:
+      - "127.0.0.1:7864:7864"
+    volumes:
+      # 面板不直接调用公网接口，所有管理动作都经容器管理或本机管理通道完成。
+      - /var/run/docker.sock:/var/run/docker.sock
+      # 网关目录整体挂载：面板需要读写 config.json、auths/、data/（含密钥管理 socket）。
+      - ./:/gateway
+      # 面板自身凭证独立存放，不进镜像也不进仓库。
+      - ./panel-data:/data
+    depends_on:
+      - wb2api

@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>登录 · workbuddy2api</title>
+<style>
+:root{
+  --line:#dfe3e8; --line2:#c8ced6; --bg:#f2f4f6; --surface:#fff; --surface2:#f8f9fb;
+  --text:#14171a; --text2:#5b636b; --text3:#8d959d; --accent:#d95b1f; --accent-soft:#fdefe8;
+  --err:#c8352c; --err-soft:#fdeceb; --ok:#1a8b52;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  --font:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+}
+html[data-theme=dark]{
+  --line:#25282d; --line2:#343940; --bg:#0b0c0e; --surface:#121417; --surface2:#171a1e;
+  --text:#e9ebee; --text2:#9aa2ab; --text3:#6b737b; --accent:#f0743a; --accent-soft:#2a1a12;
+  --err:#ff6b60; --err-soft:#2a1614; --ok:#43d17f;
+}
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);
+  font:400 14px/1.55 var(--font);-webkit-font-smoothing:antialiased;display:grid;place-items:center;padding:24px}
+.card{width:100%;max-width:384px;background:var(--surface);border:1px solid var(--line);
+  border-top:2px solid var(--accent)}
+.head{display:flex;align-items:center;gap:11px;padding:20px 22px 16px;border-bottom:1px solid var(--line)}
+.mark{width:30px;height:30px;flex:none;background:var(--accent);color:#fff;display:grid;place-items:center;
+  font-size:11px;font-weight:700;letter-spacing:.02em}
+.title{font-size:15px;font-weight:600;line-height:1.25}
+.sub{font-size:11.5px;color:var(--text3);line-height:1.35}
+form{padding:20px 22px 18px;margin:0}
+label{display:block;margin-bottom:14px}
+label .k{display:block;font-size:11.5px;color:var(--text2);margin-bottom:6px}
+input{width:100%;height:36px;padding:0 11px;border:1px solid var(--line);border-radius:3px;
+  background:var(--surface2);color:var(--text);font:13px/1 var(--font);outline:none}
+.pw{position:relative;display:block}
+.pw input{padding-right:38px}
+.eye{position:absolute;right:0;top:50%;transform:translateY(-50%);width:34px;height:32px;margin:0;
+  display:grid;place-items:center;background:none;border:0;color:var(--text3);cursor:pointer}
+.eye:hover{color:var(--text2)}
+input:focus{border-color:var(--accent)}
+input::placeholder{color:var(--text3)}
+button{width:100%;height:38px;margin-top:4px;border:0;border-radius:3px;background:var(--accent);
+  color:#fff;font:600 13px/1 var(--font);cursor:pointer}
+button:hover{filter:brightness(1.06)}
+button[disabled]{opacity:.6;cursor:default}
+.msg{display:none;align-items:flex-start;gap:9px;margin-bottom:14px;padding:10px 12px;border-radius:3px;
+  border:1px solid var(--err);background:var(--err-soft);color:var(--err);font-size:12.5px}
+.msg.on{display:flex}
+.foot{padding:13px 22px;border-top:1px solid var(--line);display:flex;align-items:center;
+  justify-content:space-between;gap:10px;font-size:11.5px;color:var(--text3)}
+.foot code{font-family:var(--mono);font-size:11px}
+.themebtn{background:none;border:0;color:var(--text3);cursor:pointer;width:auto;height:auto;margin:0;
+  font:inherit;font-size:11.5px;padding:0}
+.themebtn:hover{color:var(--text2)}
+.spin{width:12px;height:12px;border:2px solid rgba(255,255,255,.45);border-top-color:#fff;
+  border-radius:50%;display:inline-block;vertical-align:-2px;margin-right:7px;animation:sp .7s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="head">
+    <div class="mark">WB</div>
+    <div>
+      <div class="title">workbuddy2api</div>
+      <div class="sub">管理台登录</div>
+    </div>
+  </div>
+  <form id="f" autocomplete="on">
+    <div class="msg" id="msg"><span id="msgText"></span></div>
+    <label>
+      <span class="k">用户名</span>
+      <input id="u" name="username" autocomplete="username" spellcheck="false" autofocus>
+    </label>
+    <label>
+      <span class="k">密码</span>
+      <span class="pw">
+        <input id="p" name="password" type="password" autocomplete="current-password">
+        <button class="eye" id="eye" type="button" aria-label="显示密码" title="显示密码">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2.2 12S5.8 5.4 12 5.4 21.8 12 21.8 12 18.2 18.6 12 18.6 2.2 12 2.2 12Z"/><circle cx="12" cy="12" r="2.7"/></svg>
+        </button>
+      </span>
+    </label>
+    <button id="go" type="submit">登录</button>
+  </form>
+  <div class="foot">
+    <span id="hint">会话有效期 12 小时</span>
+    <button class="themebtn" id="theme" type="button">切换主题</button>
+  </div>
+</div>
+<script>
+"use strict";
+var $ = function(s){ return document.querySelector(s); };
+function setTheme(t){
+  document.documentElement.setAttribute('data-theme', t);
+  try{ localStorage.setItem('wb2a-theme', t); }catch(e){}
+}
+(function(){
+  var t = 'light';
+  try{ var v = localStorage.getItem('wb2a-theme'); if (v) t = v; }catch(e){}
+  setTheme(t);
+})();
+$('#theme').addEventListener('click', function(){
+  setTheme(document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
+});
+$('#eye').addEventListener('click', function(){
+  var p = $('#p'), on = p.type === 'password';
+  p.type = on ? 'text' : 'password';
+  this.setAttribute('aria-label', on ? '隐藏密码' : '显示密码');
+  this.setAttribute('title', on ? '隐藏密码' : '显示密码');
+  p.focus();
+});
+function show(text){
+  $('#msgText').textContent = text;
+  $('#msg').classList.add('on');
+}
+$('#f').addEventListener('submit', async function(e){
+  e.preventDefault();
+  var go = $('#go');
+  go.disabled = true;
+  go.innerHTML = '<span class="spin"></span>登录中';
+  $('#msg').classList.remove('on');
+  try{
+    var r = await fetch('api/auth/login', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      cache:'no-store',
+      body: JSON.stringify({ username: $('#u').value, password: $('#p').value })
+    });
+    var d = await r.json().catch(function(){ return {}; });
+    if (r.ok && d.ok){ location.replace('./'); return; }
+    show(d.message || ('登录失败（HTTP ' + r.status + '）'));
+    $('#p').value = '';
+    $('#p').focus();
+  }catch(err){
+    show('无法连接面板：' + (err && err.message || err));
+  }finally{
+    go.disabled = false;
+    go.textContent = '登录';
+  }
+});
+</script>
+</body>
+</html>

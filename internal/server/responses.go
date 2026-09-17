@@ -13,6 +13,7 @@
 // 2026-09-16：保留真实 Codex 参数并校验结构化输出，错误与截断使用真实终态。
 // 2026-09-16：缓存迟到工具元数据与参数，保留 refusal/legacy 调用，并在终态确定后收口输出。
 // 2026-09-17：合并 fork 的 Responses/图片工具兼容，保留严格终态、schema控制与数字保真扩展。
+// 2026-09-17：展开命名空间工具分组，出站用扁平名、回程还原 namespace + name。
 package server
 
 import (
@@ -56,7 +57,20 @@ type responsesRequest struct {
 	// customTools 记录被桥接成 function 的 custom 工具名（非 JSON 字段，翻译时填充）。
 	// 出站还原 custom_tool_call 时按它判定，客户端才认得出这是自定义工具调用。
 	customTools map[string]bool
+	// toolAliases 记录命名空间工具的出站扁平名 → Responses 名字映射（非 JSON 字段）。
+	// 上游只认扁平函数名，回程要拆回 namespace + name，客户端才找得到工具。
+	toolAliases map[string]toolAlias
 }
+
+// toolAlias 命名空间工具在出站扁平名与 Responses 名字之间的映射。
+type toolAlias struct {
+	Namespace string
+	Name      string
+	Custom    bool
+}
+
+// namespaceSeparator 命名空间扁平名的分隔符，与 MCP 的 mcp__server__tool 习惯一致。
+const namespaceSeparator = "__"
 
 // responsesToChat 把 Responses 请求体翻译成 chat completions 请求体。
 func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
@@ -82,7 +96,12 @@ func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
 	if outputErr != nil {
 		return nil, nil, outputErr
 	}
-	msgs, err := responsesMessages(req.Input, req.Instructions)
+	// 工具先展开：命名空间分组的扁平名要先定下来，历史里的命名空间调用才能写回同名。
+	var chatTools []any
+	if len(req.Tools) > 0 {
+		chatTools = responsesTools(req.Tools, &req)
+	}
+	msgs, err := responsesMessages(req.Input, req.Instructions, req.toolAliasIndex())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -129,11 +148,9 @@ func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
 	if req.TopP != nil {
 		chat["top_p"] = *req.TopP
 	}
-	customNames := map[string]bool{}
-	if tools := responsesTools(req.Tools, customNames); len(tools) > 0 {
-		chat["tools"] = tools
-		req.customTools = customNames
-		if tc := responsesToolChoice(req.ToolChoice); tc != nil {
+	if len(chatTools) > 0 {
+		chat["tools"] = chatTools
+		if tc := responsesToolChoice(req.ToolChoice, req.toolAliasIndex()); tc != nil {
 			chat["tool_choice"] = tc
 		}
 	}
@@ -150,7 +167,8 @@ func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
 }
 
 // responsesMessages 把 Responses 的 input（字符串或 item 数组）+ instructions 折成 chat messages。
-func responsesMessages(input json.RawMessage, instructions string) ([]any, error) {
+// toolNames 把（命名空间, 名字）映射回出站扁平名；没有命名空间的历史项按原样使用。
+func responsesMessages(input json.RawMessage, instructions string, toolNames map[string]string) ([]any, error) {
 	msgs := []any{}
 	if strings.TrimSpace(instructions) != "" {
 		msgs = append(msgs, map[string]any{"role": "system", "content": instructions})
@@ -189,6 +207,7 @@ func responsesMessages(input json.RawMessage, instructions string) ([]any, error
 		switch typ {
 		case "function_call":
 			name, _ := m["name"].(string)
+			name = upstreamToolName(toolNames, namespaceOf(m), name)
 			args, _ := m["arguments"].(string)
 			callID, _ := m["call_id"].(string)
 			if callID == "" {
@@ -212,6 +231,7 @@ func responsesMessages(input json.RawMessage, instructions string) ([]any, error
 			// 不处理的话，客户端把上一轮的 custom 调用写回历史时会被整条丢掉，
 			// 模型看不到自己刚做过什么，于是重复劳动或空转。
 			name, _ := m["name"].(string)
+			name = upstreamToolName(toolNames, namespaceOf(m), name)
 			input, _ := m["input"].(string)
 			callID, _ := m["call_id"].(string)
 			if callID == "" {
@@ -388,41 +408,178 @@ func responsesToolOutput(v any) any {
 // customNames 回填被桥接的工具名，供出站还原 custom_tool_call 时判定。
 //
 // 其余非 function 类型（web_search / file_search / mcp）网关侧确无对应实现，仍丢弃。
-func responsesTools(tools []any, customNames map[string]bool) []any {
+func responsesTools(tools []any, req *responsesRequest) []any {
 	out := make([]any, 0, len(tools))
-	for _, t := range tools {
-		tm, ok := t.(map[string]any)
+	customNames := map[string]bool{}
+	aliases := map[string]toolAlias{}
+	taken := map[string]bool{}
+	// 第一遍预占顶层工具名：命名空间扁平名不得与它们撞名，否则回程无法判断调用归属。
+	for _, raw := range tools {
+		tm, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch typ, _ := tm["type"].(string); typ {
+		case "function", "custom":
+			if name := chatToolName(tm); name != "" {
+				taken[name] = true
+			}
+		}
+	}
+	for _, raw := range tools {
+		tm, ok := raw.(map[string]any)
 		if !ok {
 			continue
 		}
 		typ, _ := tm["type"].(string)
-		if typ == "custom" {
-			if fn := customToolToFunction(tm); fn != nil {
-				out = append(out, fn)
-				if customNames != nil {
-					if name, _ := fn["function"].(map[string]any)["name"].(string); name != "" {
-						customNames[name] = true
-					}
+		switch typ {
+		case "namespace":
+			namespace, _ := tm["name"].(string)
+			children, _ := tm["tools"].([]any)
+			for _, rawChild := range children {
+				child, ok := rawChild.(map[string]any)
+				if !ok {
+					continue
 				}
+				inner, _ := child["name"].(string)
+				if strings.TrimSpace(namespace) == "" || inner == "" {
+					continue
+				}
+				kind, _ := child["type"].(string)
+				custom := kind == "custom"
+				var fn map[string]any
+				if custom {
+					fn = customToolToFunction(child)
+				} else {
+					fn = responsesFunctionTool(child)
+				}
+				if fn == nil {
+					continue
+				}
+				flat := flatToolName(namespace, inner, taken)
+				taken[flat] = true
+				setChatToolName(fn, flat)
+				out = append(out, fn)
+				if custom {
+					customNames[flat] = true
+				}
+				aliases[flat] = toolAlias{Namespace: namespace, Name: inner, Custom: custom}
 			}
 			continue
-		}
-		if typ != "function" {
-			continue // web_search / file_search / mcp 等网关侧无对应实现，丢弃
-		}
-		if fn, ok := tm["function"].(map[string]any); ok && fn != nil {
-			out = append(out, tm) // 已是 chat 形状，原样保留
+		case "custom":
+			fn := customToolToFunction(tm)
+			if fn == nil {
+				continue
+			}
+			out = append(out, fn)
+			if name := chatToolName(fn); name != "" {
+				customNames[name] = true
+				taken[name] = true
+			}
+			continue
+		case "function":
+			if name := chatToolName(tm); name == "" {
+				continue
+			}
+			if fn, ok := tm["function"].(map[string]any); ok && fn != nil {
+				out = append(out, tm) // 已是 chat 形状，原样保留
+				continue
+			}
+			out = append(out, responsesFunctionTool(tm))
 			continue
 		}
-		fn := map[string]any{}
-		for _, k := range []string{"name", "description", "parameters", "strict"} {
-			if v, ok := tm[k]; ok && v != nil {
-				fn[k] = v
-			}
-		}
-		out = append(out, map[string]any{"type": "function", "function": fn})
+		// web_search / file_search 等网关侧无对应实现，保持丢弃。
+	}
+	if req != nil {
+		req.customTools = customNames
+		req.toolAliases = aliases
 	}
 	return out
+}
+
+// responsesFunctionTool 把 Responses 的扁平 function 定义转成 chat 的嵌套定义。
+func responsesFunctionTool(tm map[string]any) map[string]any {
+	fn := map[string]any{}
+	for _, k := range []string{"name", "description", "parameters", "strict"} {
+		if v, ok := tm[k]; ok && v != nil {
+			fn[k] = v
+		}
+	}
+	return map[string]any{"type": "function", "function": fn}
+}
+
+// chatToolName 读取 chat/Responses 两种形状里的工具名。
+func chatToolName(tm map[string]any) string {
+	if fn, ok := tm["function"].(map[string]any); ok {
+		if name, _ := fn["name"].(string); name != "" {
+			return name
+		}
+	}
+	name, _ := tm["name"].(string)
+	return name
+}
+
+// setChatToolName 只改写 chat 形状里的函数名，保留描述与参数原文。
+func setChatToolName(tool map[string]any, name string) {
+	if fn, ok := tool["function"].(map[string]any); ok {
+		fn["name"] = name
+	}
+}
+
+// flatToolName 生成命名空间工具的扁平名 namespace__name；撞名时追加 __2、__3……
+func flatToolName(namespace, name string, taken map[string]bool) string {
+	base := namespace + namespaceSeparator + name
+	if !taken[base] {
+		return base
+	}
+	for index := 2; ; index++ {
+		candidate := fmt.Sprintf("%s%s%d", base, namespaceSeparator, index)
+		if !taken[candidate] {
+			return candidate
+		}
+	}
+}
+
+// toolAliasIndex 返回「命名空间 + 工具名」→ 出站扁平名的索引，供历史调用写回使用。
+func (req *responsesRequest) toolAliasIndex() map[string]string {
+	if req == nil || len(req.toolAliases) == 0 {
+		return nil
+	}
+	index := make(map[string]string, len(req.toolAliases))
+	for flat, alias := range req.toolAliases {
+		index[alias.Namespace+"\x00"+alias.Name] = flat
+	}
+	return index
+}
+
+// upstreamToolName 把 Responses 历史项的（命名空间, 名字）还原成出站扁平名。
+// 没有命名空间时保持原样：顶层工具名就是上游名。
+func upstreamToolName(toolNames map[string]string, namespace, name string) string {
+	if namespace == "" {
+		return name
+	}
+	if flat, ok := toolNames[namespace+"\x00"+name]; ok {
+		return flat
+	}
+	return namespace + namespaceSeparator + name
+}
+
+// namespaceOf 读取调用项上的 namespace 字段。
+func namespaceOf(item map[string]any) string {
+	namespace, _ := item["namespace"].(string)
+	return namespace
+}
+
+// responsesToolName 把上游工具名还原成 Responses 的（名字, 命名空间, 是否 custom）。
+// 未登记的顶层工具原样返回，custom 判定回落到 customTools。
+func (req *responsesRequest) responsesToolName(upstream string) (string, string, bool) {
+	if req == nil {
+		return upstream, "", false
+	}
+	if alias, ok := req.toolAliases[upstream]; ok {
+		return alias.Name, alias.Namespace, alias.Custom
+	}
+	return upstream, "", req.customTools[upstream]
 }
 
 // customToolToFunction 把一条 custom 工具定义桥接成 chat 的 function 形状。
@@ -475,7 +632,8 @@ func customInputFromArgs(args string) string {
 }
 
 // responsesToolChoice 把 Responses 的 tool_choice 转成 chat 形状。
-func responsesToolChoice(raw json.RawMessage) any {
+// toolNames 用于把命名空间内的指名选择翻译成出站扁平名。
+func responsesToolChoice(raw json.RawMessage, toolNames map[string]string) any {
 	s := strings.TrimSpace(string(raw))
 	if s == "" || s == "null" {
 		return nil
@@ -492,6 +650,7 @@ func responsesToolChoice(raw json.RawMessage) any {
 		return nil
 	}
 	if name, ok := m["name"].(string); ok && name != "" {
+		name = upstreamToolName(toolNames, namespaceOf(m), name)
 		return map[string]any{"type": "function", "function": map[string]any{"name": name}}
 	}
 	if t, _ := m["type"].(string); t == "allowed_tools" || t == "function" {
@@ -709,11 +868,7 @@ func (rw *responsesWriter) finishJSON() {
 		writeOpenAIError(rw.inner, http.StatusBadGateway, "upstream_parse", "upstream response is not valid JSON")
 		return
 	}
-	var customNames map[string]bool
-	if rw.req != nil {
-		customNames = rw.req.customTools
-	}
-	result := chatToResponses(chat, rw.resolvedModel(), customNames)
+	result := chatToResponses(chat, rw.resolvedModel(), rw.req)
 	if rw.req != nil {
 		rw.req.applyEcho(result)
 		if err := rw.validateJSONCompletion(chat, result); err != nil {
@@ -1211,7 +1366,7 @@ func (rw *responsesWriter) ValidateCompletion(chat map[string]any) error {
 	if rw.req == nil {
 		return nil
 	}
-	return rw.validateJSONCompletion(chat, chatToResponses(chat, rw.resolvedModel(), rw.req.customTools))
+	return rw.validateJSONCompletion(chat, chatToResponses(chat, rw.resolvedModel(), rw.req))
 }
 
 func (rw *responsesWriter) validateJSONCompletion(chat, result map[string]any) error {
@@ -1294,24 +1449,33 @@ func (rw *responsesWriter) messageItem(status string) map[string]any {
 }
 
 func (rw *responsesWriter) callItem(call *respToolCall, status string) map[string]any {
-	if call.custom {
+	name, namespace, custom := rw.req.responsesToolName(call.name)
+	if custom {
 		input := ""
 		if status != "in_progress" {
 			input = customInputFromArgs(call.args.String())
 		}
-		return map[string]any{
+		item := map[string]any{
 			"id": call.id, "type": "custom_tool_call", "status": status,
-			"call_id": call.callID, "name": call.name, "input": input,
+			"call_id": call.callID, "name": name, "input": input,
 		}
+		if namespace != "" {
+			item["namespace"] = namespace
+		}
+		return item
 	}
 	args := ""
 	if status != "in_progress" {
 		args = call.args.String()
 	}
-	return map[string]any{
+	item := map[string]any{
 		"id": call.id, "type": "function_call", "status": status,
-		"call_id": call.callID, "name": call.name, "arguments": args,
+		"call_id": call.callID, "name": name, "arguments": args,
 	}
+	if namespace != "" {
+		item["namespace"] = namespace
+	}
+	return item
 }
 
 // outputItems 按已分配的 output_index 排列；尚无名称、从未开出的工具不能伪装成输出项。
@@ -1413,7 +1577,8 @@ func (rw *responsesWriter) usageObject() map[string]any {
 }
 
 // chatToResponses 把一次完整的 chat completion 翻成 Responses 对象（非流式路径）。
-func chatToResponses(chat map[string]any, model string, customNames map[string]bool) map[string]any {
+// req 提供工具名还原信息；为 nil 时按顶层工具处理。
+func chatToResponses(chat map[string]any, model string, req *responsesRequest) map[string]any {
 	respID := newRespID("resp_")
 	created := time.Now().Unix()
 	if v, ok := chat["created"].(float64); ok && v > 0 {
@@ -1476,17 +1641,26 @@ func chatToResponses(chat map[string]any, model string, customNames map[string]b
 					name, _ = fn["name"].(string)
 					args, _ = fn["arguments"].(string)
 				}
-				if customNames[name] {
-					items = append(items, map[string]any{
+				callName, namespace, custom := req.responsesToolName(name)
+				if custom {
+					item := map[string]any{
 						"id": newRespID("ctc_"), "type": "custom_tool_call", "status": status,
-						"call_id": callID, "name": name, "input": customInputFromArgs(args),
-					})
+						"call_id": callID, "name": callName, "input": customInputFromArgs(args),
+					}
+					if namespace != "" {
+						item["namespace"] = namespace
+					}
+					items = append(items, item)
 					continue
 				}
-				items = append(items, map[string]any{
+				item := map[string]any{
 					"id": newRespID("fc_"), "type": "function_call", "status": status,
-					"call_id": callID, "name": name, "arguments": args,
-				})
+					"call_id": callID, "name": callName, "arguments": args,
+				}
+				if namespace != "" {
+					item["namespace"] = namespace
+				}
+				items = append(items, item)
 			}
 		}
 	}

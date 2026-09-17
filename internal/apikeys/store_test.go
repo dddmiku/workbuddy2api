@@ -9,6 +9,55 @@ import (
 	"testing"
 )
 
+// TestModelBindingValidationAndPersistence 覆盖模型白名单的校验、更新、清空与重载。
+func TestModelBindingValidationAndPersistence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "api_keys.json")
+	s, err := Open(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, key, err := s.Create("bound", "", []string{"cn:deepseek-v4.1-flash", "glm-5.2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, ok := s.Resolve(key)
+	if !ok || len(resolved.Models) != 2 || resolved.Models[0] != "cn:deepseek-v4.1-flash" {
+		t.Fatalf("models not stored: %+v", resolved.Models)
+	}
+	for _, bad := range [][]string{{""}, {"a b"}, {strings.Repeat("x", 65)}, {"dup", "dup"}, {"bad\nname"}} {
+		if _, _, err := s.Create("x", "", bad); !errors.Is(err, ErrInvalidModels) {
+			t.Errorf("invalid models accepted: %q (err=%v)", bad, err)
+		}
+	}
+	too := make([]string, MaxBoundModels+1)
+	for i := range too {
+		too[i] = "m" + string(rune('a'+i%26)) + string(rune('a'+i/26))
+	}
+	if _, _, err := s.Create("x", "", too); !errors.Is(err, ErrInvalidModels) {
+		t.Error("oversize model list accepted")
+	}
+	updated := []string{"glm-5.2"}
+	if _, err := s.Update(info.ID, nil, nil, nil, &updated); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, ok := reopened.Resolve(key)
+	if !ok || len(entry.Models) != 1 || entry.Models[0] != "glm-5.2" {
+		t.Fatalf("binding not persisted: %+v", entry.Models)
+	}
+	empty := []string{}
+	if _, err := reopened.Update(info.ID, nil, nil, nil, &empty); err != nil {
+		t.Fatal(err)
+	}
+	cleared, _ := reopened.Resolve(key)
+	if len(cleared.Models) != 0 {
+		t.Fatalf("binding not cleared: %+v", cleared.Models)
+	}
+}
+
 func TestKeyLifecycleAndRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "api_keys.json")
 	legacy := "old-existing-secret-keep-working"
@@ -19,7 +68,7 @@ func TestKeyLifecycleAndRestart(t *testing.T) {
 	if !s.Authenticate(legacy) || s.Authenticate("") {
 		t.Fatal("legacy migration failed")
 	}
-	info, key, err := s.Create("测试客户端", "工作电脑")
+	info, key, err := s.Create("测试客户端", "工作电脑", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +84,7 @@ func TestKeyLifecycleAndRestart(t *testing.T) {
 		t.Fatalf("permissions=%o", stat.Mode().Perm())
 	}
 	enabled := false
-	if _, err = s.Update(info.ID, nil, nil, &enabled); err != nil {
+	if _, err = s.Update(info.ID, nil, nil, &enabled, nil); err != nil {
 		t.Fatal(err)
 	}
 	if s.Authenticate(key) {
@@ -50,7 +99,7 @@ func TestKeyLifecycleAndRestart(t *testing.T) {
 	}
 	enabled = true
 	name := "新的名称"
-	if _, err = s.Update(info.ID, &name, nil, &enabled); err != nil {
+	if _, err = s.Update(info.ID, &name, nil, &enabled, nil); err != nil {
 		t.Fatal(err)
 	}
 	if !s.Authenticate(key) {
@@ -77,11 +126,11 @@ func TestPersistenceFailureDoesNotPublishMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.persist = func(document) error { return errors.New("simulated disk failure") }
-	if _, key, err := s.Create("new", ""); err == nil || key != "" {
+	if _, key, err := s.Create("new", "", nil); err == nil || key != "" {
 		t.Fatal("failed write returned a usable key")
 	}
 	enabled := false
-	if _, err = s.Update("legacy", nil, nil, &enabled); err == nil {
+	if _, err = s.Update("legacy", nil, nil, &enabled, nil); err == nil {
 		t.Fatal("write failure ignored")
 	}
 	if err = s.Delete("legacy"); err == nil {
@@ -110,11 +159,11 @@ func TestKeyLabelValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"", strings.Repeat("界", 65), "header\nvalue"} {
-		if _, _, err := s.Create(name, ""); !errors.Is(err, ErrInvalid) {
+		if _, _, err := s.Create(name, "", nil); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("name accepted: %q", name)
 		}
 	}
-	if _, _, err := s.Create("合法", strings.Repeat("x", 257)); !errors.Is(err, ErrInvalid) {
+	if _, _, err := s.Create("合法", strings.Repeat("x", 257), nil); !errors.Is(err, ErrInvalid) {
 		t.Fatal("oversize note accepted")
 	}
 }
@@ -124,7 +173,7 @@ func TestConcurrentAuthenticationAndManagement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	info, key, err := s.Create("concurrent", "")
+	info, key, err := s.Create("concurrent", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +190,7 @@ func TestConcurrentAuthenticationAndManagement(t *testing.T) {
 	}
 	for i := 0; i < 12; i++ {
 		enabled := i%2 == 0
-		if _, err := s.Update(info.ID, nil, nil, &enabled); err != nil {
+		if _, err := s.Update(info.ID, nil, nil, &enabled, nil); err != nil {
 			t.Fatal(err)
 		}
 	}

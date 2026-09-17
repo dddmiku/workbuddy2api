@@ -139,10 +139,24 @@ func TestResponsesToolsAndChoice(t *testing.T) {
 	}
 }
 
-func TestResponsesUnsupportedToolIsExplicitlyRejected(t *testing.T) {
+// 官方 Codex 0.155 默认声明 web_search；网关不实现它，但必须接受整条请求并丢弃该工具。
+func TestResponsesDeclaredBuiltinIsAcceptedAndDropped(t *testing.T) {
 	body := []byte(`{"model":"cn:auto","input":"hi","tools":[{"type":"function","name":"f1","parameters":{"type":"object"}},{"type":"web_search"}]}`)
-	if _, _, err := responsesToChat(body); err == nil {
-		t.Fatal("unsupported web_search must not disappear from an otherwise accepted request")
+	chatBody, _, err := responsesToChat(body)
+	if err != nil {
+		t.Fatalf("declared builtin must not fail the request: %v", err)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(chatBody, &chat); err != nil {
+		t.Fatal(err)
+	}
+	tools := chat["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("web_search must not be forwarded upstream: %v", tools)
+	}
+	// 未知类型仍然明确拒绝，避免静默丢掉真正的工具。
+	if _, _, err := responsesToChat([]byte(`{"model":"cn:auto","input":"hi","tools":[{"type":"future_builtin","name":"x"}]}`)); err == nil {
+		t.Fatal("unknown tool type must stay rejected")
 	}
 }
 
@@ -619,7 +633,7 @@ func TestChatToResponsesCustomToolNonStream(t *testing.T) {
 			},
 		}},
 	}
-	obj := chatToResponses(chat, "cn:auto", map[string]bool{"apply_patch": true})
+	obj := chatToResponses(chat, "cn:auto", &responsesRequest{customTools: map[string]bool{"apply_patch": true}})
 	// 按类型取，不按序号：message 条目在非流式路径恒产出（既有行为），
 	// 序号断言会被它带偏。
 	var patch, plain map[string]any

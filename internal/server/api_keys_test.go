@@ -15,7 +15,7 @@ func TestManagedKeysAuthorizeAndRevokeAllPublicRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	info, key, err := store.Create("test", "")
+	info, key, err := store.Create("test", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,7 +30,7 @@ func TestManagedKeysAuthorizeAndRevokeAllPublicRoutes(t *testing.T) {
 		}
 	}
 	enabled := false
-	if _, err := store.Update(info.ID, nil, nil, &enabled); err != nil {
+	if _, err := store.Update(info.ID, nil, nil, &enabled, nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, route := range []struct{ method, path string }{{"GET", "/v1/models"}, {"POST", "/v1/responses"}, {"POST", "/v1/chat/completions"}, {"GET", "/status"}} {

@@ -1,0 +1,1696 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>workbuddy2api · 控制台</title>
+<style>
+/* ══ 令牌 ═══════════════════════════════════════════════════════════ */
+:root{
+  --rail:216px; --head:60px; --r:4px; --r2:3px;
+  --font:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+}
+html[data-theme=light]{
+  --accent:#2563eb; --accent-2:#1d4ed8;
+  --ok:#0f8a4c; --warn:#b5761a; --err:#c5342b; --info:#2563eb;
+  --ok-soft:rgba(15,138,76,.10); --warn-soft:rgba(181,118,26,.10);
+  --err-soft:rgba(197,52,43,.10); --info-soft:rgba(37,99,235,.10);
+  --canvas:#f5f6f8; --surface:#fff; --surface-2:#fafbfc; --sunken:#f0f2f4;
+  --line:#e4e7ea; --line-2:#cbd1d7;
+  --ink:#0f1319; --ink-2:#59616b; --ink-3:#8b939c;
+  --rail-bg:#0e1116; --rail-ink:#e7ebf0; --rail-ink-2:#8b949f; --rail-line:#1e242b; --rail-hover:#171c23;
+  --shadow:0 1px 2px rgba(16,20,26,.06);
+}
+html[data-theme=dark]{
+  --accent:#4c8dff; --accent-2:#6ba0ff;
+  --ok:#3fbf7f; --warn:#e0a83c; --err:#ff6f63; --info:#4c8dff;
+  --ok-soft:rgba(63,191,127,.12); --warn-soft:rgba(224,168,60,.12);
+  --err-soft:rgba(255,111,99,.12); --info-soft:rgba(76,141,255,.12);
+  --canvas:#0b0d10; --surface:#14181c; --surface-2:#181d22; --sunken:#0f1317;
+  --line:#232a31; --line-2:#323a43;
+  --ink:#e8ecf1; --ink-2:#9aa4af; --ink-3:#6c757f;
+  --rail-bg:#0a0c0f; --rail-ink:#e8ecf1; --rail-ink-2:#838c96; --rail-line:#1d2329; --rail-hover:#151a1f;
+  --shadow:0 1px 2px rgba(0,0,0,.5);
+}
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--canvas);color:var(--ink);
+  font:400 13.5px/1.5 var(--font);-webkit-font-smoothing:antialiased;display:flex}
+h1,h2,h3{margin:0;font-weight:600;letter-spacing:0}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+input{font:inherit;color:inherit}
+svg{display:block;flex:none}
+code,pre,.mono,.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:var(--r2)}
+.sp{flex:1}
+.hide{display:none !important}
+
+/* ══ 左侧固定导航 ═══════════════════════════════════════════════════ */
+.side{position:fixed;inset:0 auto 0 0;z-index:40;width:var(--rail);display:flex;flex-direction:column;
+  background:var(--rail-bg);color:var(--rail-ink);border-right:1px solid var(--rail-line)}
+.side-top{height:var(--head);display:flex;align-items:center;gap:10px;padding:0 16px;
+  border-bottom:1px solid var(--rail-line);flex:none}
+.mark{width:26px;height:26px;flex:none;border-radius:3px;background:var(--accent);color:#fff;
+  display:grid;place-items:center;font:700 10.5px/1 var(--font)}
+.mark:hover{background:var(--accent-2)}
+.wm{min-width:0}
+.wm b{display:block;font-size:13px;font-weight:600;line-height:1.25;white-space:nowrap}
+.wm span{display:block;font-size:10.5px;color:var(--rail-ink-2);line-height:1.3;white-space:nowrap}
+.nav{flex:1;overflow-y:auto;padding:12px 10px 16px}
+.nav-lb{font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--rail-ink-2);padding:0 8px;margin:14px 0 6px}
+.nav-lb:first-child{margin-top:0}
+#tabs,#tabs2{display:block}
+#tabs button,#tabs2 button{display:flex;align-items:center;gap:9px;width:100%;height:32px;padding:0 9px;
+  border-radius:var(--r2);font-size:13px;color:var(--rail-ink-2);text-align:left}
+#tabs button:hover,#tabs2 button:hover{background:var(--rail-hover);color:var(--rail-ink)}
+#tabs button.on,#tabs2 button.on{background:rgba(37,99,235,.16);color:#fff}
+#tabs button.on svg,#tabs2 button.on svg{color:var(--accent-2)}
+html[data-theme=dark] #tabs button.on,html[data-theme=dark] #tabs2 button.on{background:rgba(76,141,255,.16)}
+#tabs button i,#tabs2 button i{font:11px/1 var(--mono);font-style:normal;color:var(--rail-ink-2);margin-left:auto}
+#tabs button.on i,#tabs2 button.on i{color:#cdd6e0}
+.side-conn{padding:12px 16px;border-top:1px solid var(--rail-line);display:flex;flex-direction:column;gap:8px}
+.cell{display:flex;align-items:center;gap:7px;min-width:0}
+.cell .k{font-size:10px;letter-spacing:.03em;color:var(--rail-ink-2);white-space:nowrap}
+.cell code{flex:1;font-size:11px;color:#b9c2cc;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mini{width:22px;height:22px;flex:none;display:grid;place-items:center;border-radius:2px;color:var(--rail-ink-2)}
+.mini:hover{background:var(--rail-hover);color:#fff}
+.mini[disabled]{opacity:.3;pointer-events:none}
+.side-foot{display:flex;align-items:center;gap:8px;padding:10px 16px;border-top:1px solid var(--rail-line)}
+.side-foot button{display:flex;align-items:center;gap:7px;height:28px;padding:0 9px;border-radius:var(--r2);
+  font-size:12px;color:var(--rail-ink-2)}
+.side-foot button:hover{background:var(--rail-hover);color:var(--rail-ink)}
+/* ══ 主区 ═══════════════════════════════════════════════════════════ */
+.main{flex:1;min-width:0;margin-left:var(--rail);display:flex;flex-direction:column}
+.top{height:var(--head);flex:none;display:flex;align-items:center;gap:12px;padding:0 22px;
+  background:var(--surface);border-bottom:1px solid var(--line)}
+.ptitle{font-size:16px;font-weight:600;line-height:1.2}
+.pdesc{font-size:11.5px;color:var(--ink-3);line-height:1.3;margin-top:1px}
+.chips{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.chip{display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 10px;border:1px solid var(--line);
+  border-radius:999px;font-size:11.5px;color:var(--ink-2);background:var(--surface-2);white-space:nowrap}
+.chip i{width:6px;height:6px;border-radius:50%;background:var(--ink-3);flex:none}
+.chip.ok i{background:var(--ok)} .chip.ok{color:var(--ok)}
+.chip.e i{background:var(--err)} .chip.e{color:var(--err)}
+.chip.w i{background:var(--warn)} .chip.w{color:var(--warn)}
+.vbtn{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;flex:none;
+  border:1px solid var(--line);border-radius:var(--r2);color:var(--ink-2);background:var(--surface)}
+.vbtn:hover{border-color:var(--line-2);color:var(--ink);background:var(--surface-2)}
+.vbtn.danger:hover{color:var(--err);border-color:var(--err)}
+.vbtn[disabled]{opacity:.45;pointer-events:none}
+.body{flex:1;overflow-y:auto}
+.inner{max-width:1360px;margin:0 auto;padding:18px 22px 72px}
+.notes{display:flex;flex-direction:column;gap:8px}
+.notes:not(:empty){margin-bottom:16px}
+
+/* ══ 页头 / 面板 ════════════════════════════════════════════════════ */
+.vhead{display:flex;align-items:center;gap:12px;margin:0 0 11px}
+.vhead h1{font-size:13.5px;font-weight:600}
+.vhead .d{font-size:11.5px;color:var(--ink-3)}
+.rule{height:1px;background:var(--line);margin:20px 0 0}
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow)}
+.ph{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.ph h2{font-size:12.5px;font-weight:600}
+.ph .sub{font-size:11px;color:var(--ink-3)}
+.pb{padding:14px}
+.pb.flush{padding:0}
+.pairs{display:grid;grid-template-columns:minmax(0,340px) minmax(0,1fr);gap:14px;align-items:start}
+.pairs.wide{grid-template-columns:minmax(0,320px) minmax(0,1fr)}
+
+/* ══ 指标行 ═════════════════════════════════════════════════════════ */
+.mrow{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:8px 0;
+  border-bottom:1px solid var(--line);font-size:12.5px}
+.mrow:last-child{border-bottom:0}
+.mrow .k{color:var(--ink-3);flex:none}
+.mrow .v{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right;min-width:0}
+.mrow .v.ok{color:var(--ok)} .mrow .v.w{color:var(--warn)} .mrow .v.e{color:var(--err)}
+.big{display:flex;align-items:flex-end;gap:7px}
+.big .v{font:600 30px/1 var(--mono);font-variant-numeric:tabular-nums}
+.big .u{font-size:11.5px;color:var(--ink-3);padding-bottom:4px}
+.comp{display:flex;height:5px;overflow:hidden;background:var(--sunken);margin:12px 0 14px}
+.comp i{display:block;height:100%}
+.comp .a{background:var(--ok)} .comp .b{background:var(--warn)} .comp .c{background:var(--line-2)}
+.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));background:var(--surface);
+  border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow)}
+.metric{padding:13px 15px;border-right:1px solid var(--line);min-width:0}
+.metric:last-child{border-right:0}
+.metric .k{font-size:10px;letter-spacing:.07em;text-transform:uppercase;color:var(--ink-3)}
+.metric .v{display:flex;align-items:baseline;gap:6px;margin-top:8px;flex-wrap:wrap}
+.metric .v b{font:600 21px/1 var(--mono);font-variant-numeric:tabular-nums}
+.metric .v small{font-size:11.5px;color:var(--ink-3)}
+.metric .s{font-size:11px;color:var(--ink-3);margin-top:6px}
+.metric .s.ok{color:var(--ok)} .metric .s.w{color:var(--warn)} .metric .s.e{color:var(--err)}
+.metric .bar{height:4px;background:var(--sunken);margin-top:9px;overflow:hidden}
+.metric .bar i{display:block;height:100%;background:var(--ok)}
+.metric .bar i.w{background:var(--warn)} .metric .bar i.e{background:var(--err)}
+/* ══ 按钮 / 分段 / 开关 / 状态 ══════════════════════════════════════ */
+.btn{display:inline-flex;align-items:center;gap:6px;height:29px;padding:0 11px;border:1px solid var(--line);
+  border-radius:var(--r2);font-size:12.5px;background:var(--surface);color:var(--ink);white-space:nowrap}
+.btn:hover{border-color:var(--line-2);background:var(--surface-2)}
+.btn.pri{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.pri:hover{background:var(--accent-2);border-color:var(--accent-2)}
+.btn.sm{height:26px;padding:0 9px;font-size:12px}
+.btn.ico{width:29px;padding:0;justify-content:center}
+.btn.sm.ico{width:26px}
+.btn.ghost{border-color:transparent;background:transparent;color:var(--ink-2)}
+.btn.ghost:hover{background:var(--sunken);color:var(--ink)}
+.btn.dgr:hover{color:var(--err);border-color:var(--err);background:var(--surface)}
+.btn[disabled]{opacity:.45;pointer-events:none}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:var(--r2);background:var(--sunken);padding:2px;gap:2px}
+.seg button{padding:3px 10px;border-radius:2px;font-size:12px;color:var(--ink-2);white-space:nowrap}
+.seg button:hover{color:var(--ink)}
+.seg button[aria-pressed=true]{background:var(--surface);color:var(--ink);box-shadow:var(--shadow)}
+.seg.grow{display:flex}
+.seg.grow button{flex:1;text-align:center}
+.sw{width:32px;height:18px;flex:none;border-radius:999px;background:var(--line-2);position:relative;transition:background .15s}
+.sw::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;
+  background:#fff;transition:transform .15s;box-shadow:0 1px 2px rgba(0,0,0,.25)}
+.sw[aria-checked=true]{background:var(--ok)}
+.sw[aria-checked=true]::after{transform:translateX(14px)}
+.sw[disabled]{opacity:.4;pointer-events:none}
+.bdg{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--ink-2);white-space:nowrap}
+.bdg i{width:6px;height:6px;border-radius:50%;background:var(--ink-3);flex:none}
+.bdg.ok{color:var(--ok)} .bdg.ok i{background:var(--ok)}
+.bdg.w{color:var(--warn)} .bdg.w i{background:var(--warn)}
+.bdg.e{color:var(--err)} .bdg.e i{background:var(--err)}
+.bdg.a{color:var(--info)} .bdg.a i{background:var(--info)}
+.note{display:flex;align-items:center;padding:10px 13px;background:var(--surface);
+  border:1px solid var(--line);border-left:3px solid var(--warn);border-radius:var(--r2);
+  font-size:12.5px;color:var(--ink-2);box-shadow:var(--shadow)}
+.note svg{margin-right:10px}
+.note.e{border-left-color:var(--err)}
+.note.a{border-left-color:var(--info)}
+.note.ok{border-left-color:var(--ok)}
+.note b{color:var(--ink);font-weight:600}
+.note .g{flex:1;min-width:0;margin-right:10px}
+
+/* ══ 时间轴 ═════════════════════════════════════════════════════════ */
+.tl-row{display:flex;align-items:center;border-bottom:1px solid var(--line);min-height:46px}
+.tl-row:last-child{border-bottom:0}
+.tl-row:hover{background:var(--surface-2)}
+.tl-time{width:62px;flex:none;padding-left:14px;font:12.5px/1 var(--mono);color:var(--ink-2)}
+.tl-main{flex:1;min-width:0;padding:9px 14px 9px 0}
+.tl-nm{font-size:13px;font-weight:500}
+.tl-meta{font-size:11px;color:var(--ink-3);margin-top:1px}
+.tl-acts{display:flex;align-items:center;gap:8px;padding-right:14px}
+
+/* ══ 表格 ═══════════════════════════════════════════════════════════ */
+.tblwrap{overflow-x:auto}
+.tbl{width:100%;border-collapse:collapse}
+.tbl th{padding:9px 14px;border-bottom:1px solid var(--line);font-size:10px;font-weight:600;
+  letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3);text-align:left;white-space:nowrap}
+.tbl td{padding:11px 14px;border-bottom:1px solid var(--line);vertical-align:middle;font-size:13px}
+.tbl tbody tr:last-child td{border-bottom:0}
+.tbl tbody tr:hover{background:var(--surface-2)}
+.tbl .r{text-align:right}
+.tbl .acts{display:flex;gap:6px;justify-content:flex-end}
+.who{font-size:13px;font-weight:500}
+.sub{font-size:11.5px;color:var(--ink-3)}
+.cell-in{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;min-width:0}
+.cell-in.act{flex-direction:column;align-items:flex-start;gap:2px}
+.cred{display:flex;flex-direction:column;align-items:flex-end;gap:5px}
+.cred .v{font:13.5px/1 var(--mono);font-variant-numeric:tabular-nums}
+.cred .m{font-size:11px;color:var(--ink-3);font-family:var(--mono)}
+.cred .bar{width:88px;height:3px;background:var(--sunken);overflow:hidden}
+.cred .bar i{display:block;height:100%;background:var(--info)}
+.search{display:flex;align-items:center;gap:8px;height:29px;padding:0 10px;border:1px solid var(--line);
+  border-radius:var(--r2);background:var(--sunken);color:var(--ink-3);min-width:220px}
+.search:focus-within{border-color:var(--accent);background:var(--surface)}
+.search input{flex:1;min-width:0;border:0;background:none;outline:none;font-size:12.5px;color:var(--ink)}
+.search input::placeholder{color:var(--ink-3)}
+.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(272px,1fr))}
+.tile{display:flex;flex-direction:column;gap:9px;padding:14px;border-right:1px solid var(--line);
+  border-bottom:1px solid var(--line);min-width:0}
+.tile-t{display:flex;align-items:center;gap:9px}
+.tile .detail{font-size:11.5px;color:var(--ink-3);min-height:17px}
+.hours{display:flex;gap:5px;flex-wrap:wrap}
+.hour{padding:2px 6px;border:1px solid var(--line);border-radius:2px;background:var(--sunken);
+  font:11px/1.5 var(--mono);color:var(--ink-2)}
+.tile-f{display:flex;align-items:center;gap:8px;margin-top:auto}
+.tile-f .meta{font-size:11px;color:var(--ink-3);font-family:var(--mono)}
+.empty{padding:48px 20px;text-align:center;color:var(--ink-3)}
+.empty-t{margin-top:10px;font-size:13px;color:var(--ink-2)}
+.empty-s{font-size:11.5px;margin-top:4px}
+
+/* ══ 日志 / 账号表单 ════════════════════════════════════════════════ */
+pre.term{margin:0;padding:12px 14px;background:var(--sunken);color:var(--ink-2);
+  font:11.5px/1.62 var(--mono);white-space:pre-wrap;word-break:break-word;max-height:58vh;overflow:auto}
+.cred-form .fld{display:block;margin-bottom:11px}
+.cred-form .fld .k{display:block;font-size:10px;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--ink-3);margin-bottom:5px}
+.cred-form input{width:100%;height:30px;padding:0 9px;border:1px solid var(--line);border-radius:var(--r2);
+  background:var(--sunken);color:var(--ink);font-size:12.5px;outline:none}
+.cred-form input:focus{border-color:var(--accent);background:var(--surface)}
+.frow{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+
+/* ══ 抽屉 / 弹窗 / 提示 ═════════════════════════════════════════════ */
+.scrim{position:fixed;inset:0;z-index:50;background:rgba(8,10,13,.55);opacity:0;pointer-events:none;
+  transition:opacity .18s}
+.scrim.on{opacity:1;pointer-events:auto}
+.drawer{position:fixed;top:0;right:0;bottom:0;z-index:60;width:min(404px,100vw);display:flex;
+  flex-direction:column;background:var(--surface);border-left:1px solid var(--line);
+  transform:translateX(101%);transition:transform .22s ease}
+.drawer.on{transform:none}
+.dh{display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--line)}
+.dh h3{flex:1;font-size:14px}
+.dbody{flex:1;overflow:auto;padding:16px}
+.dfoot{display:flex;justify-content:flex-end;gap:9px;padding:12px 16px;border-top:1px solid var(--line)}
+.modal{position:fixed;z-index:70;left:50%;top:50%;width:min(420px,calc(100vw - 32px));
+  background:var(--surface);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow);
+  opacity:0;pointer-events:none;transform:translate(-50%,-47%);transition:opacity .18s,transform .18s}
+.modal.on{opacity:1;pointer-events:auto;transform:translate(-50%,-50%)}
+.modal.wide{width:min(760px,calc(100vw - 32px))}
+.mh{display:flex;align-items:center;gap:11px;padding:14px 16px;border-bottom:1px solid var(--line)}
+.mh h3{flex:1;font-size:14px}
+.mh .mic{width:30px;height:30px;flex:none;display:grid;place-items:center;border-radius:var(--r2)}
+.mh .mic.w{background:var(--warn-soft);color:var(--warn)}
+.mh .mic.e{background:var(--err-soft);color:var(--err)}
+.mbody{padding:16px}
+.mtext{font-size:12.5px;line-height:1.65;color:var(--ink-2)}
+.mfoot{display:flex;justify-content:flex-end;gap:9px;padding:12px 16px;border-top:1px solid var(--line)}
+.qr-box{display:grid;place-items:center;padding:14px;background:#fff;border:1px solid var(--line);border-radius:var(--r2)}
+.url-box{margin-top:12px;padding:9px 11px;border:1px solid var(--line);border-radius:var(--r2);
+  background:var(--sunken);font:11.5px/1.5 var(--mono);color:var(--ink-2);word-break:break-all}
+.wait{display:flex;align-items:center;gap:9px;margin-top:12px;font-size:12.5px;color:var(--ink-2)}
+.spin{width:13px;height:13px;flex:none;border-radius:50%;border:2px solid var(--line-2);
+  border-top-color:var(--accent);animation:sp .8s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+.toasts{position:fixed;right:18px;bottom:18px;z-index:90;display:flex;flex-direction:column;gap:8px;
+  align-items:flex-end}
+.toast{display:flex;align-items:center;gap:9px;padding:10px 13px;background:var(--surface);
+  border:1px solid var(--line);border-left:3px solid var(--ink-3);border-radius:var(--r2);
+  box-shadow:0 6px 20px rgba(10,14,20,.14);font-size:12.5px;max-width:min(420px,calc(100vw - 36px))}
+.toast.ok{border-left-color:var(--ok)}
+.toast.err{border-left-color:var(--err)}
+.toast.w{border-left-color:var(--warn)}
+.scrim-m{position:fixed;inset:0;z-index:39;background:rgba(8,10,13,.5);opacity:0;pointer-events:none;
+  transition:opacity .18s;display:none}
+
+/* ══ 窄屏 ═══════════════════════════════════════════════════════════ */
+.menu{display:none}
+@media (max-width:1120px){
+  .pairs,.pairs.wide{grid-template-columns:minmax(0,1fr)}
+}
+@media (max-width:900px){
+  .side{transform:translateX(-101%);transition:transform .2s ease;box-shadow:0 0 40px rgba(0,0,0,.4)}
+  .side.open{transform:none}
+  .scrim-m{display:block}
+  .scrim-m.on{opacity:1;pointer-events:auto}
+  .main{margin-left:0}
+  .menu{display:inline-flex}
+  .top{padding:0 14px;gap:9px}
+  .ptitle{font-size:15px}
+  .pdesc{display:none}
+  .chip span.lbl{display:none}
+  .inner{padding:14px 14px 64px}
+  .metrics{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .metric:nth-child(2n){border-right:0}
+  .metric:nth-child(-n+2){border-bottom:1px solid var(--line)}
+  .tiles{grid-template-columns:minmax(0,1fr)}
+  .tile{border-right:0}
+  .tl-row{flex-wrap:wrap}
+  .tl-time{width:56px;padding:10px 0 0 14px}
+  .tl-main{padding:10px 14px 0 0}
+  .tl-acts{width:100%;justify-content:flex-end;padding:8px 14px 10px 0}
+  .tblwrap{overflow:visible}
+  .tbl thead{display:none}
+  .tbl tbody tr{display:block;margin:0 0 -1px;padding:11px 13px;border:1px solid var(--line);background:var(--surface)}
+  .tbl tbody tr:hover{background:var(--surface)}
+  .tbl td{display:flex;align-items:baseline;justify-content:space-between;gap:14px;padding:4px 0;border-bottom:0}
+  .tbl td::before{content:attr(data-l);color:var(--ink-3);font-size:11px;flex:none}
+  .tbl td.acts{justify-content:flex-end}
+  .tbl td.acts::before{content:""}
+  .tbl td[data-l=""]::before{display:none}
+  .ph .search{min-width:0;flex:1 1 100%}
+  .toasts{left:14px;right:14px;align-items:stretch}
+}
+@media (max-width:520px){
+  .metrics{grid-template-columns:minmax(0,1fr)}
+  .metric{border-right:0;border-bottom:1px solid var(--line)}
+  .metric:last-child{border-bottom:0}
+}
+/* 2026-09-16：密钥页及一次性密钥窗口，复用原有主题与移动端表格。 */
+/* 2026-09-17：模型绑定列的标签样式与表单里的模型选择器。 */
+.key-summary{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:2px 0 18px}
+.key-summary p{margin:0}.key-count{font:600 25px/1 var(--mono);letter-spacing:-1px;color:var(--ink)}
+.key-name{font-weight:600;display:flex;align-items:center;gap:7px;overflow-wrap:anywhere}
+.key-note{margin-top:4px;max-width:310px;white-space:normal;overflow-wrap:anywhere}
+.key-legacy{font-size:10px;font-weight:400;padding:1px 5px;border:1px solid var(--line-2);border-radius:3px;color:var(--ink-2);white-space:nowrap}
+.key-mask{white-space:nowrap;font-size:12px}.key-date{font-size:11px;color:var(--ink-2);white-space:nowrap}
+.key-actions{display:flex;justify-content:flex-end;gap:6px;flex-wrap:wrap}.key-table th:last-child{width:178px}
+.key-footnote{line-height:1.7;margin:13px 1px}.key-dialog{margin:auto;padding:0;border:1px solid var(--line-2);border-radius:7px;width:min(500px,calc(100% - 28px));max-height:calc(100dvh - 40px);overflow:auto;color:var(--ink);background:var(--surface);box-shadow:0 18px 70px rgba(0,0,0,.35)}
+.key-dialog::backdrop{background:rgba(0,0,0,.55)}.key-dialog-head{display:flex;align-items:center;justify-content:space-between;padding:17px 20px;border-bottom:1px solid var(--line)}
+.key-dialog-head h3{font-size:16px}.key-dialog-head .vbtn{font-size:24px}.key-dialog-body{padding:20px}
+.key-dialog .fld{display:flex;flex-direction:column;gap:7px;margin-bottom:16px}.key-dialog .fld input{width:100%;height:38px;border:1px solid var(--line-2);border-radius:var(--r);padding:0 10px;background:var(--sunken);color:var(--ink)}
+.key-dialog-foot{display:flex;justify-content:flex-end;gap:8px;padding:14px 20px;border-top:1px solid var(--line)}
+.key-secret{width:100%;padding:12px;border:1px solid var(--line-2);border-radius:var(--r);background:var(--sunken);color:var(--ink);font:13px/1.8 var(--mono);resize:none;overflow-wrap:anywhere;word-break:break-all}
+.key-secret-hint{margin:15px 0;color:var(--ink-2);line-height:1.7}.key-form-error{margin:15px 0 0;color:var(--err);line-height:1.65}
+.key-model-tags{display:flex;flex-wrap:wrap;gap:4px;max-width:230px}
+.key-model-tag{font:11px/1.7 var(--mono);padding:1px 6px;border:1px solid var(--line-2);border-radius:3px;color:var(--ink-2);background:var(--sunken);overflow-wrap:anywhere}
+.key-model-pick{display:flex;align-items:center;gap:8px;margin:-8px 0 16px}
+.key-model-pick select{flex:1;height:34px;min-width:0;border:1px solid var(--line-2);border-radius:var(--r);padding:0 8px;background:var(--sunken);color:var(--ink)}
+@media(max-width:900px){.key-table td:first-child{display:block}.key-table td:first-child::before{display:none}.key-table td:first-child .key-name{margin-bottom:3px}.key-note{max-width:100%}.key-actions{justify-content:flex-start}}
+@media(max-width:700px){.key-summary{display:block}.key-summary p{margin-top:10px;line-height:1.65}.key-dialog-body{padding:17px}.key-table td:last-child{padding-top:10px}}
+</style>
+</head>
+<body>
+<aside class="side" id="side">
+  <div class="side-top">
+    <button class="mark" id="btnHome" title="回到概览">WB</button>
+    <div class="wm">
+      <b>workbuddy2api</b>
+      <span id="brandVer">网关控制台</span>
+    </div>
+  </div>
+
+  <nav class="nav">
+    <div class="nav-lb">总览</div>
+    <div id="tabs">
+      <button data-view="overview" class="on">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7.5" height="7.5" rx="1"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1"/></svg>
+        概览
+      </button>
+      <button data-view="accounts">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="9.5" cy="8" r="3.4"/><path d="M3.2 19.5a6.3 6.3 0 0 1 12.6 0"/><path d="M17 6.2a3.4 3.4 0 0 1 0 6.6"/><path d="M18.6 19.5a6.3 6.3 0 0 0-2.2-4.4"/></svg>
+        账号
+        <i id="tabAcct">0</i>
+      </button>
+      <button data-view="keys">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="9" r="4.5"/><path d="m11.3 12.3 8 8 2-2-2-2 1.5-1.5-2-2-1.5 1.5-2.7-2.7"/></svg>
+        密钥管理
+        <i id="tabKeys">—</i>
+      </button>
+    </div>
+    <div class="nav-lb">运维</div>
+    <div id="tabs2">
+      <button data-view="tasks">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.6"/><path d="M12 7.4V12l3.2 2"/></svg>
+        排程
+        <i id="tabTask">—</i>
+      </button>
+      <button data-view="system">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/></svg>
+        系统
+      </button>
+    </div>
+  </nav>
+
+  <div class="side-conn">
+    <div class="cell" id="cellBase">
+      <span class="k">URL</span>
+      <code title="">—</code>
+      <button class="mini" disabled title="复制" aria-label="复制 Base URL">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>
+      </button>
+    </div>
+    <div class="cell" id="cellKey">
+      <span class="k">KEY</span>
+      <code title="">—</code>
+      <button class="mini" data-view="keys" title="管理密钥" aria-label="打开密钥管理">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>
+      </button>
+    </div>
+    <div class="cell" id="cellHealth">
+      <span class="k">HLT</span>
+      <code title="">—</code>
+      <button class="mini" disabled title="复制" aria-label="复制健康检查地址">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <div class="side-foot">
+    <button id="btnTheme" title="切换主题">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" id="icTheme"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+      <span id="themeLabel">暗色</span>
+    </button>
+  </div>
+</aside>
+
+<div class="scrim-m" id="scrimNav"></div>
+
+<div class="main">
+  <header class="top">
+    <button class="vbtn menu" id="btnMenu" title="菜单" aria-label="菜单">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3.5 6.5h17M3.5 12h17M3.5 17.5h17"/></svg>
+    </button>
+    <div>
+      <div class="ptitle" id="pgTitle">概览</div>
+      <div class="pdesc" id="pgDesc">账号池与运行状态</div>
+    </div>
+    <span class="sp"></span>
+    <div class="chips">
+      <span class="chip" id="svcBadge"><i></i><span id="svcText">连接中</span></span>
+    </div>
+    <button class="vbtn" id="btnRefresh" title="刷新数据" aria-label="刷新数据">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M20.5 3.8V9h-5.2"/></svg>
+    </button>
+    <button class="vbtn danger" id="btnRestart" title="重启网关" aria-label="重启网关">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.6v8"/><path d="M7.5 6.7a7 7 0 1 0 9 0"/></svg>
+    </button>
+    <button class="vbtn" id="btnLogout" title="退出登录" aria-label="退出登录">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 20.5H5.5A1.5 1.5 0 0 1 4 19V5a1.5 1.5 0 0 1 1.5-1.5h4"/><path d="m16 16.5 4.5-4.5L16 7.5"/><path d="M20.5 12H9"/></svg>
+    </button>
+  </header>
+
+  <div class="body">
+    <div class="inner">
+      <div class="notes" id="notes"></div>
+      <section class="view" data-view="overview">
+        <div class="metrics" id="metrics"></div>
+        <div class="rule"></div>
+        <div class="vhead" style="margin-top:20px">
+          <h1>账号池与积分</h1>
+          <div class="d">运行时状态</div>
+        </div>
+        <div class="pairs">
+          <section class="panel">
+            <div class="ph"><h2>账号池</h2><span class="sp"></span><span class="sub">按区域</span></div>
+            <div class="pb" id="poolPanel"></div>
+          </section>
+          <section class="panel">
+            <div class="ph"><h2>积分</h2><span class="sp"></span><span class="sub">全部账号合计</span></div>
+            <div class="pb" id="creditPanel"></div>
+          </section>
+        </div>
+        <div class="vhead" style="margin-top:22px">
+          <h1>今日排程</h1>
+          <div class="d">按时间顺序</div>
+          <span class="sp"></span>
+          <button class="btn sm ghost" id="btnGoTasks">全部任务</button>
+        </div>
+        <div class="panel"><div class="pb flush" id="ovTasks"></div></div>
+      </section>
+
+      <section class="view hide" data-view="accounts">
+        <div class="vhead">
+          <h1>账号</h1>
+          <div class="d">凭证、积分与启停</div>
+        </div>
+        <div class="panel">
+          <div class="ph">
+            <div class="search">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="6.4"/><path d="m15.8 15.8 4.4 4.4"/></svg>
+              <input id="acctSearch" placeholder="搜索昵称或 UID" autocomplete="off" spellcheck="false">
+            </div>
+            <div class="seg" id="acctFilter">
+              <button data-f="all" aria-pressed="true">全部</button>
+              <button data-f="on">启用</button>
+              <button data-f="off">停用</button>
+            </div>
+            <span class="sp"></span>
+            <button class="btn sm pri" id="btnAdd">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5.5v13M5.5 12h13"/></svg>
+              添加账号
+            </button>
+          </div>
+          <div class="tblwrap">
+            <table class="tbl">
+              <thead><tr><th>账号</th><th>状态</th><th class="r">积分</th><th>最近活动</th><th></th></tr></thead>
+              <tbody id="acctRows"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="view hide" data-view="keys">
+        <div class="vhead">
+          <h1>密钥管理</h1>
+          <div class="d">为不同客户端创建独立密钥</div>
+          <span class="sp"></span>
+          <button class="btn sm" id="btnKeysReload">刷新</button>
+        </div>
+        <div class="key-summary">
+          <div><span class="key-count" id="keyEnabledCount">—</span><span class="sub"> 把密钥正在启用</span></div>
+          <p class="sub">停用或删除会立即阻止后续请求，已开始的请求不受影响。</p>
+        </div>
+        <div id="keyError" class="note err hide" role="alert"></div>
+        <div class="panel">
+          <div class="ph">
+            <div class="search"><input id="keySearch" placeholder="搜索名称或备注" autocomplete="off" spellcheck="false" aria-label="搜索密钥"></div>
+            <span class="sp"></span>
+            <button class="btn sm pri" id="btnCreateKey">＋ 创建密钥</button>
+          </div>
+          <div class="tblwrap">
+            <table class="tbl key-table">
+              <thead><tr><th>名称与备注</th><th>密钥</th><th>模型绑定</th><th>状态</th><th>创建时间</th><th class="r">操作</th></tr></thead>
+              <tbody id="keyRows"><tr><td colspan="6"><div class="empty">正在加载密钥…</div></td></tr></tbody>
+            </table>
+          </div>
+        </div>
+        <p class="sub key-footnote">完整密钥仅在创建时显示一次。忘记密钥时，请创建新的密钥并停用旧密钥。</p>
+      </section>
+
+      <section class="view hide" data-view="tasks">
+        <div class="vhead">
+          <h1>排程</h1>
+          <div class="d">定时任务开关与手动触发</div>
+          <span class="sp"></span>
+          <button class="btn sm" id="btnTaskReload">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M20.5 3.8V9h-5.2"/></svg>
+            刷新
+          </button>
+        </div>
+        <div class="panel"><div class="tiles" id="taskList"></div></div>
+      </section>
+
+      <section class="view hide" data-view="system">
+        <div class="vhead">
+          <h1>系统</h1>
+          <div class="d">服务状态、登录账号与运行日志</div>
+        </div>
+        <div class="pairs wide">
+          <div>
+            <section class="panel">
+              <div class="ph"><h2>服务</h2></div>
+              <div class="pb" id="sysCards"></div>
+            </section>
+            <section class="panel" style="margin-top:14px">
+              <div class="ph"><h2>登录账号</h2><span class="sp"></span><span class="sub" id="whoami">—</span></div>
+              <div class="pb">
+                <div class="cred-form">
+                  <label class="fld">
+                    <span class="k">当前密码</span>
+                    <input id="pwCur" type="password" autocomplete="current-password" placeholder="用于确认身份">
+                  </label>
+                  <label class="fld">
+                    <span class="k">新用户名</span>
+                    <input id="pwUser" autocomplete="username" spellcheck="false">
+                  </label>
+                  <label class="fld">
+                    <span class="k">新密码</span>
+                    <input id="pwNew" type="password" autocomplete="new-password" placeholder="至少 8 位">
+                  </label>
+                  <label class="fld">
+                    <span class="k">重复新密码</span>
+                    <input id="pwCfm" type="password" autocomplete="new-password">
+                  </label>
+                </div>
+                <div class="frow">
+                  <button class="btn pri" id="btnPwSave">保存账号信息</button>
+                </div>
+                <div class="sub" id="pwHint" style="margin-top:10px;line-height:1.6">保存后所有设备都需要重新登录</div>
+              </div>
+            </section>
+          </div>
+          <section class="panel">
+            <div class="ph">
+              <h2>容器日志</h2>
+              <span class="sp"></span>
+              <div class="seg" id="logLines">
+                <button data-n="60">60</button>
+                <button data-n="120" aria-pressed="true">120</button>
+                <button data-n="300">300</button>
+                <button data-n="600">600</button>
+              </div>
+              <button class="btn sm ico" id="btnLogs" title="拉取日志" aria-label="拉取日志">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M20.5 3.8V9h-5.2"/></svg>
+              </button>
+            </div>
+            <pre class="term" id="logBox">—</pre>
+          </section>
+        </div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<div class="scrim" id="scrimD"></div>
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="drTitle">
+  <div class="dh">
+    <h3 id="drTitle">添加账号</h3>
+    <button class="vbtn" id="drClose" aria-label="关闭">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg>
+    </button>
+  </div>
+  <div class="dbody" id="drBody"></div>
+  <div class="dfoot" id="drFoot"></div>
+</aside>
+
+<div class="scrim" id="scrimM"></div>
+<div class="modal" id="modal" role="dialog" aria-modal="true" aria-labelledby="mdTitle">
+  <div class="mh">
+    <div class="mic w" id="mdIcon">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9.5v4M12 17h.01"/><path d="M10.3 4.4 2.9 17.2A1.9 1.9 0 0 0 4.6 20h14.8a1.9 1.9 0 0 0 1.7-2.8L13.7 4.4a1.9 1.9 0 0 0-3.4 0Z"/></svg>
+    </div>
+    <h3 id="mdTitle">确认操作</h3>
+  </div>
+  <div class="mbody"><div class="mtext" id="mdText"></div></div>
+  <div class="mfoot">
+    <button class="btn" id="mdNo">取消</button>
+    <button class="btn pri" id="mdYes">确认</button>
+  </div>
+</div>
+
+<div class="scrim" id="scrimL"></div>
+<div class="modal wide" id="logModal" role="dialog" aria-modal="true" aria-labelledby="lgTitle">
+  <div class="mh">
+    <h3 id="lgTitle">任务日志</h3>
+    <button class="btn sm ico" id="lgRefresh" title="刷新" aria-label="刷新日志">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M20.5 3.8V9h-5.2"/></svg>
+    </button>
+    <button class="btn sm ico ghost" id="lgClose" title="关闭" aria-label="关闭">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg>
+    </button>
+  </div>
+  <pre class="term" id="lgBody">—</pre>
+</div>
+
+<div class="toasts" id="toasts"></div>
+<dialog class="key-dialog" id="keyDialog" aria-labelledby="keyDialogTitle">
+  <form id="keyForm" autocomplete="off">
+    <div class="key-dialog-head"><h3 id="keyDialogTitle">创建密钥</h3><button type="button" class="vbtn" id="keyDialogClose" aria-label="关闭密钥窗口">×</button></div>
+    <div class="key-dialog-body">
+      <div id="keyFields">
+        <label class="fld"><span class="k">名称</span><input id="keyName" name="name" maxlength="64" required placeholder="例如：工作电脑 codex" autocomplete="off"></label>
+        <label class="fld"><span class="k">备注 <span class="sub">（可选）</span></span><input id="keyNote" name="note" maxlength="256" placeholder="记录用途，方便日后管理" autocomplete="off"></label>
+        <label class="fld"><span class="k">绑定模型 <span class="sub">（留空表示不限制）</span></span><input id="keyModels" name="models" placeholder="例如 cn:deepseek-v4.1-flash，多个用逗号分隔" autocomplete="off" spellcheck="false"></label>
+        <div class="key-model-pick">
+          <select id="keyModelPick" aria-label="从可用模型中选择"><option value="">从模型列表添加…</option></select>
+          <button type="button" class="btn sm" id="btnClearModels">清空绑定</button>
+        </div>
+      </div>
+      <div id="keyCreated" class="hide">
+        <div class="note ok">密钥已创建，可以用于连接网关。</div>
+        <p class="key-secret-hint">请现在复制并保存。关闭窗口后，完整密钥无法再次查看。</p>
+        <label class="fld"><span class="k">完整密钥</span><textarea id="keySecret" class="key-secret" rows="3" readonly spellcheck="false" aria-label="新创建的完整密钥"></textarea></label>
+        <button type="button" class="btn pri" id="btnCopyKey">复制密钥</button>
+      </div>
+      <p id="keyFormError" class="key-form-error hide" role="alert"></p>
+    </div>
+    <div class="key-dialog-foot"><button type="button" class="btn" id="keyDialogCancel">取消</button><button type="submit" class="btn pri" id="keyDialogSave">创建密钥</button></div>
+  </form>
+</dialog>
+<script src="vendor/qrcode.js"></script>
+<script>
+"use strict";
+"use strict";
+// ═══ 更新日志 ═══
+// 2026-09-16：接入密钥管理导航与本页刷新，侧栏不再下发或复制完整配置密钥。
+
+var $  = function(s, r){ return (r || document).querySelector(s); };
+var $$ = function(s, r){ return Array.prototype.slice.call((r || document).querySelectorAll(s)); };
+function esc(t){ return String(t == null ? '' : t).replace(/[&<>"']/g, function(c){
+  return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
+function pad(n){ return n < 10 ? '0' + n : '' + n; }
+function num(n){ return (n == null || isNaN(n)) ? '—' : Number(n).toLocaleString('en-US'); }
+function shortUid(u){ return (u && u.length > 18) ? u.slice(0, 8) + '…' + u.slice(-6) : (u || '—'); }
+function fmtTime(iso){
+  if (!iso) return '—';
+  var s = String(iso);
+  if (s.indexOf('0001-01-01') === 0) return '—';
+  var d = new Date(s);
+  if (isNaN(d.getTime())) return '—';
+  return pad(d.getMonth()+1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+function relTime(iso){
+  if (!iso) return '从未';
+  var s = String(iso);
+  if (s.indexOf('0001-01-01') === 0) return '从未';
+  var d = new Date(s);
+  if (isNaN(d.getTime())) return '从未';
+  var diff = Math.floor((Date.now() - d.getTime()) / 1000);
+  if (diff < 0) return '即将';
+  if (diff < 60) return '刚刚';
+  if (diff < 3600) return Math.floor(diff / 60) + ' 分钟前';
+  if (diff < 86400) return Math.floor(diff / 3600) + ' 小时前';
+  if (diff < 2592000) return Math.floor(diff / 86400) + ' 天前';
+  return fmtTime(iso);
+}
+function daysLeft(sec){
+  if (!sec) return null;
+  return Math.round((sec * 1000 - Date.now()) / 86400000);
+}
+function svg(inner, size){
+  return '<svg width="' + (size||16) + '" height="' + (size||16) + '" viewBox="0 0 24 24" fill="none" ' +
+    'stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + inner + '</svg>';
+}
+var IC = {
+  users: '<path d="M15 20.5v-1.6a3.4 3.4 0 0 0-3.4-3.4H6.4A3.4 3.4 0 0 0 3 18.9v1.6"/><circle cx="9" cy="7.6" r="3.6"/><path d="M21 20.5v-1.6a3.4 3.4 0 0 0-2.6-3.3"/>',
+  check: '<circle cx="12" cy="12" r="8.6"/><path d="m8.4 12.2 2.5 2.5 4.7-5.2"/>',
+  clock: '<circle cx="12" cy="12" r="8.6"/><path d="M12 7.4V12l3 1.8"/>',
+  warn:  '<path d="M12 9.5v4M12 17h.01"/><path d="M10.3 4.4 2.9 17.2A1.9 1.9 0 0 0 4.6 20h14.8a1.9 1.9 0 0 0 1.7-2.8L13.7 4.4a1.9 1.9 0 0 0-3.4 0Z"/>',
+  box:   '<path d="M20.5 7.5 12 3 3.5 7.5v9L12 21l8.5-4.5v-9Z"/><path d="m3.5 7.5 8.5 4.5 8.5-4.5"/>',
+  coins: '<circle cx="12" cy="12" r="8.6"/><path d="M12 7.4v9.2M9.4 10h5.2M9.4 14h5.2"/>',
+  eye:   '<path d="M2.2 12S5.8 5.4 12 5.4 21.8 12 21.8 12 18.2 18.6 12 18.6 2.2 12 2.2 12Z"/><circle cx="12" cy="12" r="2.7"/>',
+  play:  '<path d="M8 5.4v13.2L19 12 8 5.4Z"/>',
+  trash: '<path d="M4 7h16M9.6 7V4.8h4.8V7M6.6 7l.9 13.2h9l.9-13.2"/>',
+  pulse: '<path d="M3 12h3.6l2.4-6 3.9 12 2.6-6H21"/>',
+  moon:  '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/>',
+  sun:   '<circle cx="12" cy="12" r="4"/><path d="M12 2.6v2.2M12 19.2v2.2M2.6 12h2.2M19.2 12h2.2M5.3 5.3l1.6 1.6M17.1 17.1l1.6 1.6M18.7 5.3l-1.6 1.6M6.9 17.1l-1.6 1.6"/>'
+};
+
+/* ── 状态 ─────────────────────────────────────────── */
+var S = { data:null, tasks:null, filter:'all', q:'', logLines:120 };
+var DT = { realm:'cn', url:'', timer:null, tries:0 };
+var modalCb = null;
+var logKey = null, logName = '';
+
+/* ── 主题 ─────────────────────────────────────────── */
+function setTheme(t){
+  document.documentElement.setAttribute('data-theme', t);
+  $('#icTheme').innerHTML = (t === 'dark') ? IC.moon : IC.sun;
+  $('#themeLabel').textContent = (t === 'dark') ? '暗色' : '亮色';
+  try { localStorage.setItem('wb2a-theme', t); } catch(e){}
+}
+$('#btnTheme').addEventListener('click', function(){
+  setTheme(document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
+});
+(function(){
+  var t = 'dark';
+  try { var v = localStorage.getItem('wb2a-theme'); if (v) t = v; } catch(e){}
+  setTheme(t);
+})();
+
+/* ── 通讯 ─────────────────────────────────────────── */
+async function api(path, body){
+  var opt = { headers:{ 'Content-Type':'application/json' }, cache:'no-store' };
+  if (path.indexOf('api/keys') === 0) opt.headers['X-Admin-Request'] = '1';
+  if (body !== undefined){ opt.method = 'POST'; opt.body = JSON.stringify(body || {}); }
+  var r = await fetch(path, opt);
+  if (r.status === 401){ location.replace('login'); throw new Error('登录已失效'); }
+  var data = null;
+  try{ data = await r.json(); }catch(e){ data = null; }
+  if (!r.ok){
+    var msg = (data && (data.message || (data.error && data.error.message))) ||
+      ('HTTP ' + r.status);
+    var err = new Error(msg);
+    err.status = r.status;
+    throw err;
+  }
+  return data;
+}
+function toast(msg, kind){
+  var d = document.createElement('div');
+  d.className = 'toast ' + (kind || '');
+  var icon = kind === 'ok' ? IC.check : (kind === 'err' ? IC.warn : IC.clock);
+  d.innerHTML = svg(icon, 15) + '<div>' + esc(msg) + '</div>';
+  $('#toasts').appendChild(d);
+  setTimeout(function(){ d.style.transition = 'opacity .25s'; d.style.opacity = '0';
+    setTimeout(function(){ d.remove(); }, 260); }, 4200);
+}
+
+/* ── 视图 ─────────────────────────────────────────── */
+var PAGE = {
+  overview:{ t:'概览', d:'账号池与运行状态' },
+  accounts:{ t:'账号', d:'凭证、积分与启停' },
+  keys:    { t:'密钥管理', d:'创建与管理客户端的访问密钥' },
+  tasks:   { t:'排程', d:'定时任务开关与手动触发' },
+  system:  { t:'系统', d:'服务状态、登录账号与运行日志' }
+};
+var sysLoaded = false;
+function go(v){
+  if (!PAGE[v]) v = 'overview';
+  $$('.view[data-view]').forEach(function(p){
+    p.classList.toggle('hide', p.getAttribute('data-view') !== v);
+  });
+  $$('#tabs button, #tabs2 button').forEach(function(b){
+    b.classList.toggle('on', b.getAttribute('data-view') === v);
+  });
+  $('#pgTitle').textContent = PAGE[v].t;
+  $('#pgDesc').textContent = PAGE[v].d;
+  document.title = PAGE[v].t + ' · workbuddy2api';
+  try { localStorage.setItem('wb2a-view', v); } catch(e){}
+  history.replaceState(null, '', '#' + v);
+  closeNav();
+  if (v === 'keys' && typeof loadKeys === 'function') loadKeys();
+  if (v === 'system' && !sysLoaded){ sysLoaded = true; loadLogs(); }
+}
+document.addEventListener('click', function(e){
+  var b = e.target.closest('button[data-view]');
+  if (b) go(b.getAttribute('data-view'));
+});
+$('#btnHome').addEventListener('click', function(){ go('overview'); });
+$('#btnGoTasks').addEventListener('click', function(){ go('tasks'); });
+
+/* ── 窄屏导航 ─────────────────────────────────────── */
+function openNav(){ $('#side').classList.add('open'); $('#scrimNav').classList.add('on'); }
+function closeNav(){ $('#side').classList.remove('open'); $('#scrimNav').classList.remove('on'); }
+$('#btnMenu').addEventListener('click', openNav);
+$('#scrimNav').addEventListener('click', closeNav);
+
+/* ── 忙碌 ─────────────────────────────────────────── */
+var busyDepth = 0;
+function busy(on){
+  busyDepth = Math.max(0, busyDepth + (on ? 1 : -1));
+  var b = busyDepth > 0;
+  ['#btnRefresh','#btnRestart','#btnAdd','#btnTaskReload','#btnLogs'].forEach(function(s){
+    var el = $(s); if (el) el.disabled = b;
+  });
+}
+
+/* ── 加载 ─────────────────────────────────────────── */
+async function loadAll(forceCredit){
+  busy(true);
+  try{
+    var res = await Promise.all([
+      api('api/state' + (forceCredit ? '?refresh_credit=1' : '')),
+      api('api/tasks').catch(function(){ return null; })
+    ]);
+    S.data = res[0];
+    S.tasks = res[1];
+    render();
+    svc(true);
+  }catch(err){
+    svc(false, String(err && err.message || err));
+    toast('加载失败：' + (err && err.message || err), 'err');
+  }finally{ busy(false); }
+}
+function svc(up){
+  var b = $('#svcBadge'), t = $('#svcText');
+  var running = S.data && S.data.containerRunning;
+  if (!up){ b.className = 'chip e'; t.textContent = '面板不可达'; return; }
+  if (running){ b.className = 'chip ok'; t.textContent = '网关运行中'; }
+  else { b.className = 'chip e'; t.textContent = '容器未运行'; }
+}
+function taskList(){
+  return (S.tasks && S.tasks.available && Array.isArray(S.tasks.tasks)) ? S.tasks.tasks : [];
+}
+function badge(st){ return '<span class="bdg ' + st.cls + '"><i></i>' + st.text + '</span>'; }
+function mrow(k, v, cls){
+  return '<div class="mrow"><span class="k">' + esc(k) + '</span>' +
+    '<span class="v ' + (cls || '') + '">' + esc(v) + '</span></div>';
+}
+function emptyBox(icon, title, sub){
+  return '<div class="empty">' + svg(icon, 30) + '<div class="empty-t">' + esc(title) + '</div>' +
+    (sub ? '<div class="empty-s">' + esc(sub) + '</div>' : '') + '</div>';
+}
+
+/* ── 渲染 ─────────────────────────────────────────── */
+function render(){
+  var d = S.data; if (!d) return;
+  if (d.service) $('#brandVer').textContent = d.service + ' · v1';
+  var a = d.accounts || [], tasks = taskList();
+  $('#tabAcct').textContent = a.length;
+  $('#tabTask').textContent = tasks.length ? tasks.length : '—';
+  renderNotes();
+  renderStrip();
+  renderMetrics();
+  renderPool();
+  renderCredit();
+  renderOvTasks();
+  renderAccounts();
+  renderTasks();
+  renderSystem();
+}
+
+function metric(k, value, unit, sub, cls, pct, icon){
+  return '<div class="metric">' +
+    '<div class="k">' + esc(k) + '</div>' +
+    '<div class="v">' + svg(icon, 15) + '<b>' + value + '</b>' +
+    (unit ? '<small>' + esc(unit) + '</small>' : '') + '</div>' +
+    (typeof pct === 'number'
+      ? '<div class="bar"><i class="' + (cls || '') + '" style="width:' +
+        Math.max(0, Math.min(100, pct)) + '%"></i></div>'
+      : '') +
+    (sub ? '<div class="s ' + (cls || '') + '">' + esc(sub) + '</div>' : '') +
+    '</div>';
+}
+
+function renderMetrics(){
+  var d = S.data, a = d.accounts || [], p = d.pool || {};
+  var on = a.filter(function(x){ return !x.disabled; }).length;
+  var total = Number(p.total) || 0, healthy = Number(p.healthy) || 0;
+  var cooling = Number(p.cooling) || 0, dis = Number(p.disabled) || 0;
+  var runs = taskList().filter(function(t){ return t.running; }).length;
+  var have = a.filter(function(x){ return x.credits && typeof x.credits.remain === 'number'; });
+  var remain = have.reduce(function(s, x){ return s + x.credits.remain; }, 0);
+  var size = have.reduce(function(s, x){
+    return s + (typeof x.credits.size === 'number' ? x.credits.size : x.credits.remain); }, 0);
+  var pct = size ? Math.round(remain / size * 100) : 0;
+  var hpct = total ? Math.round(healthy / total * 100) : 0;
+
+  $('#metrics').innerHTML = [
+    metric('账号', a.length, on + ' 启用', (a.length - on) + ' 个停用',
+      (a.length - on) ? 'w' : 'ok', null, IC.users),
+    metric('账号池', healthy + ' / ' + total, '健康',
+      cooling ? (cooling + ' 个冷却中') : (dis ? (dis + ' 个停用') : '全部可用'),
+      cooling ? 'w' : (dis ? 'e' : 'ok'), hpct, IC.pulse),
+    metric('可用积分', num(remain), '剩余',
+      have.length + ' / ' + a.length + ' 个账号取到',
+      pct < 20 ? 'e' : (pct < 50 ? 'w' : 'ok'), pct, IC.coins),
+    metric('排程', taskList().length ? String(taskList().length) : '—', '个任务',
+      runs ? (runs + ' 个执行中') : '全部空闲', runs ? 'w' : '', null, IC.clock)
+  ].join('');
+}
+
+function renderNotes(){
+  var d = S.data, out = [];
+  var off = (d.accounts || []).filter(function(a){ return a.disabled; });
+  if (d.pendingRestart){
+    out.push(note('w', '账号变更待生效',
+      '有 ' + off.length + ' 个账号已停用但仍在池中，重启网关后生效。',
+      { label:'立即重启', act:'restart' }));
+  }
+  if (!d.containerRunning){
+    out.push(note('e', '网关容器未运行', '服务当前不可用，账号操作与积分查询都会失败。', null));
+  }
+  if (d.creditError){
+    out.push(note('w', '积分数据不可用', String(d.creditError), null));
+  }
+  if (S.tasks && S.tasks.available === false){
+    out.push(note('a', '排程未接入', '当前网关进程没有加载排程器。', null));
+  }
+  $('#notes').innerHTML = out.join('');
+}
+function note(kind, title, body, btn){
+  var cls = kind === 'e' ? 'e' : (kind === 'w' ? 'w' : 'a');
+  var icon = kind === 'a' ? IC.clock : IC.warn;
+  return '<div class="note ' + cls + '">' + svg(icon, 16) +
+    '<div class="g"><b>' + esc(title) + '</b> ' + esc(body) + '</div>' +
+    (btn ? '<button class="btn sm" data-note-act="' + esc(btn.act) + '">' + esc(btn.label) + '</button>' : '') +
+    '</div>';
+}
+$('#notes').addEventListener('click', function(e){
+  var b = e.target.closest('[data-note-act]');
+  if (b && b.getAttribute('data-note-act') === 'restart') actRestart();
+});
+
+function setCell(sel, text, copy){
+  var el = $(sel), code = el.querySelector('code'), btn = el.querySelector('.mini');
+  code.textContent = text;
+  code.title = text;
+  if (copy){ btn.disabled = false; btn.setAttribute('data-copy', copy); }
+  else { btn.disabled = true; btn.removeAttribute('data-copy'); }
+}
+function renderStrip(){
+  var base = location.origin + '/v1';
+  var health = location.origin + '/healthz';
+  setCell('#cellBase', base, base);
+  setCell('#cellKey', '在密钥页管理', '');
+  $('#cellKey .mini').disabled = false;
+  setCell('#cellHealth', health, health);
+}
+
+function renderPool(){
+  var p = S.data.pool || {};
+  var total = p.total || 0, healthy = p.healthy || 0, cooling = p.cooling || 0, dis = p.disabled || 0;
+  var off = Math.max(0, total - healthy - cooling - dis);
+  function w(n){ return total ? (n / total * 100) : 0; }
+  var html = '<div class="big"><span class="v">' + healthy + '</span><span class="u">/ ' + total + ' 健康</span></div>' +
+    '<div class="comp">' +
+      '<i class="a" style="width:' + w(healthy) + '%"></i>' +
+      '<i class="b" style="width:' + w(cooling) + '%"></i>' +
+      '<i class="c" style="width:' + w(dis + off) + '%"></i>' +
+    '</div>' +
+    mrow('池内总数', String(total)) +
+    mrow('冷却中', String(cooling), cooling ? 'w' : '') +
+    mrow('已停用', String(dis), dis ? 'w' : '') +
+    mrow('并发占满', String(p.inFlightFull || 0)) +
+    mrow('粘性会话', String(p.stickySessions || 0));
+  var rt = p.realmTotals || {};
+  Object.keys(rt).forEach(function(k){
+    var v = rt[k], label = (k === 'cn' ? '国内' : (k === 'global' ? '国际' : k));
+    if (v && typeof v === 'object'){
+      var tot = Number(v.total) || 0, ok = Number(v.healthy) || 0;
+      html += mrow(label + '可用', ok + ' / ' + tot, tot && ok === tot ? 'ok' : (ok ? '' : 'e'));
+    } else {
+      html += mrow(label + '可用', String(v));
+    }
+  });
+  $('#poolPanel').innerHTML = html;
+}
+
+function renderCredit(){
+  var d = S.data, a = d.accounts || [];
+  var have = a.filter(function(x){ return x.credits && typeof x.credits.remain === 'number'; });
+  var remain = have.reduce(function(s, x){ return s + x.credits.remain; }, 0);
+  var size = have.reduce(function(s, x){
+    return s + (typeof x.credits.size === 'number' ? x.credits.size : x.credits.remain); }, 0);
+  var used = Math.max(0, size - remain);
+  var pct = size ? Math.round(remain / size * 100) : 0;
+  var html = '<div class="big"><span class="v">' + num(remain) + '</span><span class="u">剩余</span></div>' +
+    '<div class="comp">' +
+      '<i class="a" style="width:' + pct + '%"></i>' +
+      '<i class="c" style="width:' + Math.max(0, 100 - pct) + '%"></i>' +
+    '</div>' +
+    mrow('已用', num(used)) +
+    mrow('总额度', num(size)) +
+    mrow('取到积分', have.length + ' / ' + a.length);
+  $('#creditPanel').innerHTML = html;
+}
+
+function taskState(t){
+  if (!t) return { cls:'n', text:'未知' };
+  if (!t.enabled) return { cls:'n', text:'已停用' };
+  if (t.running) return { cls:'a', text:'执行中' };
+  return { cls:'ok', text:'已启用' };
+}
+function sortTasks(list){
+  return list.slice().sort(function(a, b){
+    var ha = (a.hours && a.hours[0]) || 99, hb = (b.hours && b.hours[0]) || 99;
+    return ha - hb;
+  });
+}
+function renderOvTasks(){
+  var list = taskList();
+  if (!list.length){
+    $('#ovTasks').innerHTML = emptyBox(IC.clock, '暂无排程任务', '网关进程没有加载排程器');
+    return;
+  }
+  $('#ovTasks').innerHTML = sortTasks(list).map(function(t){
+    var st = taskState(t);
+    var time = (t.hours && t.hours.length) ? (pad(t.hours[0]) + ':00') : '—';
+    return '<div class="tl-row">' +
+      '<div class="tl-time">' + time + '</div>' +
+      '<div class="tl-main"><div class="tl-nm">' + esc(t.name) + '</div>' +
+      '<div class="tl-meta">下次 ' + esc(fmtTime(t.next_run)) + ' · 上次 ' + esc(relTime(t.last_run)) + '</div></div>' +
+      '<div class="tl-acts">' + badge(st) +
+      '<button class="btn sm" data-run="' + esc(t.key) + '">' + svg(IC.play, 11) + '跑一次</button>' +
+      '<button class="btn sm ico ghost" data-log="' + esc(t.key) + '" data-name="' + esc(t.name) + '" title="日志">' +
+      svg(IC.eye, 13) + '</button></div></div>';
+  }).join('');
+}
+
+function acctState(a){
+  if (a.disabled) return { cls:'n', text:'已停用' };
+  var p = a.pool || {};
+  if (!p.inPool) return { cls:'w', text:'不在池中' };
+  if (p.cooling) return { cls:'w', text:'冷却中' };
+  if (!p.healthy) return { cls:'e', text:'异常' };
+  return { cls:'ok', text:'正常' };
+}
+function renderAccounts(){
+  var all = S.data.accounts || [];
+  var list = all.slice();
+  var q = S.q.trim().toLowerCase();
+  if (S.filter === 'on') list = list.filter(function(a){ return !a.disabled; });
+  if (S.filter === 'off') list = list.filter(function(a){ return a.disabled; });
+  if (q) list = list.filter(function(a){
+    return (a.nickname || '').toLowerCase().indexOf(q) >= 0 ||
+           (a.uid || '').toLowerCase().indexOf(q) >= 0;
+  });
+  if (!list.length){
+    $('#acctRows').innerHTML = '<tr><td colspan="5" data-l="">' +
+      emptyBox(IC.users, '没有匹配的账号', all.length ? '换个关键词或筛选条件' : '用右上角添加账号') +
+      '</td></tr>';
+    return;
+  }
+  $('#acctRows').innerHTML = list.map(function(a){
+    var st = acctState(a), c = a.credits || {}, p = a.pool || {};
+    var left = daysLeft(a.expiresAt);
+    var creditCell = (typeof c.remain === 'number')
+      ? '<div class="cred"><span class="v">' + num(c.remain) + '</span>' +
+        '<span class="m">已用 ' + num(c.used) + ' / ' + num(c.size) + '</span>' +
+        (typeof c.size === 'number' && c.size > 0
+          ? '<span class="bar"><i style="width:' + Math.min(100, Math.round(c.remain / c.size * 100)) + '%"></i></span>'
+          : '') + '</div>'
+      : '<span style="color:var(--text3)">—</span>';
+    var lastTxt = p.lastSuccess ? relTime(p.lastSuccess) : '无记录';
+    var lastSub = (p.lastErr && String(p.lastErr).indexOf('0001') !== 0) ? ('错误 ' + relTime(p.lastErr))
+      : (p.breakerFails ? ('连错 ' + p.breakerFails + ' 次') : (p.inFlight ? ('并发 ' + p.inFlight) : ''));
+    return '<tr>' +
+      '<td data-l="账号"><div class="who">' + esc(a.nickname || '') + '</div>' +
+      '<div class="sub mono">' + esc(shortUid(a.uid)) + ' · ' + esc(String(a.realm || '').toUpperCase()) + '</div></td>' +
+      '<td data-l="状态"><span class="cell-in">' + badge(st) +
+      (left != null ? '<span class="sub">' + (left > 0 ? ('剩 ' + left + ' 天') : '已过期') + '</span>' : '') +
+      '</span></td>' +
+      '<td class="r" data-l="积分"><span class="cred">' + creditCell + '</span></td>' +
+      '<td data-l="最近活动"><span class="cell-in">' + esc(lastTxt) +
+      (lastSub ? '<span class="sub">' + esc(lastSub) + '</span>' : '') + '</span></td>' +
+      '<td class="acts">' +
+      '<button class="btn sm" data-toggle="' + esc(a.uid) + '" data-disabled="' + (a.disabled ? '1' : '0') + '">' +
+      (a.disabled ? '启用' : '停用') + '</button>' +
+      '<button class="btn sm ico ghost dgr" data-del="' + esc(a.uid) + '" data-name="' + esc(a.nickname || '') +
+      '" title="删除">' + svg(IC.trash, 13) + '</button></td></tr>';
+  }).join('');
+}
+$('#acctSearch').addEventListener('input', function(e){ S.q = e.target.value; renderAccounts(); });
+$('#acctFilter').addEventListener('click', function(e){
+  var b = e.target.closest('button[data-f]'); if (!b) return;
+  S.filter = b.getAttribute('data-f');
+  $$('#acctFilter button').forEach(function(x){
+    x.setAttribute('aria-pressed', String(x === b));
+  });
+  renderAccounts();
+});
+$('#acctRows').addEventListener('click', function(e){
+  var t = e.target.closest('[data-toggle]');
+  if (t) return actToggle(t.getAttribute('data-toggle'), t.getAttribute('data-disabled') === '0');
+  var d = e.target.closest('[data-del]');
+  if (d) return actDelete(d.getAttribute('data-del'), d.getAttribute('data-name'));
+});
+
+function renderTasks(){
+  var list = taskList();
+  if (!list.length){
+    $('#taskList').innerHTML = emptyBox(IC.clock, '暂无排程任务',
+      (S.tasks && S.tasks.error) || '网关进程没有加载排程器');
+    return;
+  }
+  $('#taskList').innerHTML = sortTasks(list).map(function(t){
+    var st = taskState(t);
+    var hours = (t.hours || []).map(function(h){
+      return '<span class="hour">' + pad(h) + ':00</span>'; }).join('');
+    return '<div class="tile">' +
+      '<div class="tile-t">' + badge(st) + '<span class="sp"></span>' +
+      '<button class="sw" role="switch" data-task="' + esc(t.key) + '" aria-checked="' +
+      (t.enabled ? 'true' : 'false') + '"' + (t.running ? ' disabled' : '') +
+      ' aria-label="' + esc(t.name) + ' 开关"></button></div>' +
+      '<div><div class="tl-nm">' + esc(t.name) + '</div>' +
+      '<div class="detail">' + esc(t.detail || '') + '</div></div>' +
+      '<div class="hours">' + hours + '</div>' +
+      '<div class="tile-f">' +
+      '<button class="btn sm" data-run="' + esc(t.key) + '">' + svg(IC.play, 11) + '跑一次</button>' +
+      '<button class="btn sm ico ghost" data-log="' + esc(t.key) + '" data-name="' + esc(t.name) +
+      '" title="日志">' + svg(IC.eye, 13) + '</button>' +
+      '<span class="sp"></span><span class="meta">' + esc(fmtTime(t.next_run)) + '</span>' +
+      '</div></div>';
+  }).join('');
+}
+
+function renderSystem(){
+  var d = S.data, accounts = d.accounts || [];
+  var cool = accounts.filter(function(a){ return a.pool && a.pool.cooling; }).length;
+  var bad = accounts.filter(function(a){ return a.pool && a.pool.inPool && !a.pool.healthy; }).length;
+  $('#sysCards').innerHTML =
+    mrow('容器状态', d.containerRunning ? '运行中' : '已停止', d.containerRunning ? 'ok' : 'e') +
+    mrow('容器名', 'workbuddy2api') +
+    mrow('冷却账号', String(cool), cool ? 'w' : '') +
+    mrow('异常账号', String(bad), bad ? 'e' : 'ok') +
+    mrow('账号总数', String(accounts.length)) +
+    mrow('排程任务', taskList().length ? String(taskList().length) : '—');
+}
+
+/* ── 交互委托 ─────────────────────────────────────── */
+document.addEventListener('click', function(e){
+  var r = e.target.closest('[data-run]');
+  if (r){ actTaskRun(r.getAttribute('data-run')); return; }
+  var g = e.target.closest('[data-log]');
+  if (g){ openTaskLog(g.getAttribute('data-log'), g.getAttribute('data-name')); return; }
+  var s = e.target.closest('[data-task]');
+  if (s){ actTaskToggle(s.getAttribute('data-task'), s.getAttribute('aria-checked') !== 'true'); return; }
+  var c = e.target.closest('[data-copy]');
+  if (c) copyText(c.getAttribute('data-copy'));
+});
+
+function copyText(t){
+  if (navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(t).then(function(){ toast('已复制', 'ok'); },
+      function(){ toast('复制失败', 'err'); });
+  } else {
+    var ta = document.createElement('textarea');
+    ta.value = t; document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); toast('已复制', 'ok'); }
+    catch(err){ toast('复制失败', 'err'); }
+    ta.remove();
+  }
+}
+
+/* ── 确认弹窗 ─────────────────────────────────────── */
+function ask(title, text, okLabel, danger, cb){
+  $('#mdTitle').textContent = title;
+  $('#mdText').textContent = text;
+  $('#mdIcon').className = 'mic ' + (danger ? 'e' : 'w');
+  var yes = $('#mdYes');
+  yes.textContent = okLabel;
+  modalCb = cb;
+  $('#scrimM').classList.add('on');
+  $('#modal').classList.add('on');
+  setTimeout(function(){ yes.focus(); }, 60);
+}
+function closeModal(){
+  $('#scrimM').classList.remove('on');
+  $('#modal').classList.remove('on');
+  modalCb = null;
+}
+$('#mdNo').addEventListener('click', closeModal);
+$('#scrimM').addEventListener('click', closeModal);
+$('#mdYes').addEventListener('click', function(){
+  var cb = modalCb; closeModal(); if (cb) cb();
+});
+document.addEventListener('keydown', function(e){
+  if (e.key !== 'Escape') return;
+  if ($('#modal').classList.contains('on')) closeModal();
+  else if ($('#logModal').classList.contains('on')) closeLogModal();
+  else if ($('#drawer').classList.contains('on')) closeDrawer();
+});
+
+/* ── 操作 ─────────────────────────────────────────── */
+async function actToggle(uid, nextDisabled){
+  busy(true);
+  try{
+    var r = await api('api/account/toggle', { uid:uid, disabled:nextDisabled });
+    toast(r.message, r.ok ? 'ok' : 'err');
+    if (r.ok) await loadAll();
+  }catch(err){ toast('操作失败：' + (err && err.message || err), 'err'); }
+  finally{ busy(false); }
+}
+function actDelete(uid, name){
+  ask('删除账号', '将把「' + (name || shortUid(uid)) + '」移入 auths-trash 并重启网关，可手动从回收目录恢复。',
+    '删除', true, async function(){
+      busy(true);
+      try{
+        var r = await api('api/account/delete', { uid:uid });
+        toast(r.message, r.ok ? 'ok' : 'err');
+        if (r.ok) await loadAll();
+      }catch(err){ toast('删除失败：' + (err && err.message || err), 'err'); }
+      finally{ busy(false); }
+    });
+}
+function actRestart(){
+  ask('重启网关', '重启期间服务中断约十秒，账号与配置改动会在此后生效。', '重启', false, async function(){
+    busy(true);
+    try{
+      var r = await api('api/service/restart', {});
+      toast(r.message, r.ok ? 'ok' : 'err');
+      await loadAll(true);
+    }catch(err){ toast('重启失败：' + (err && err.message || err), 'err'); }
+    finally{ busy(false); }
+  });
+}
+async function actTaskRun(key){
+  busy(true);
+  try{
+    var r = await api('api/task/run', { key:key });
+    toast(r.message, r.ok ? 'ok' : 'err');
+    if (r.ok) setTimeout(function(){ loadAll(); }, 1200);
+  }catch(err){ toast('触发失败：' + (err && err.message || err), 'err'); }
+  finally{ busy(false); }
+}
+function actTaskToggle(key, nextEnabled){
+  var t = taskList().filter(function(x){ return x.key === key; })[0] || {};
+  ask((nextEnabled ? '启用' : '停用') + '任务',
+    '「' + (t.name || key) + '」' + (nextEnabled ? '将恢复按点执行' : '将不再自动执行') + '，保存后重启网关生效。',
+    nextEnabled ? '启用' : '停用', !nextEnabled, async function(){
+      busy(true);
+      try{
+        var r = await api('api/task/toggle', { key:key, enabled:nextEnabled });
+        toast(r.message, r.ok ? 'ok' : 'err');
+        if (r.ok) await loadAll();
+      }catch(err){ toast('操作失败：' + (err && err.message || err), 'err'); }
+      finally{ busy(false); }
+    });
+}
+
+/* ── 任务日志 ─────────────────────────────────────── */
+function openLogModal(title){
+  $('#lgTitle').textContent = title;
+  $('#scrimL').classList.add('on');
+  $('#logModal').classList.add('on');
+}
+function closeLogModal(){
+  $('#scrimL').classList.remove('on');
+  $('#logModal').classList.remove('on');
+  logKey = null;
+}
+$('#lgClose').addEventListener('click', closeLogModal);
+$('#scrimL').addEventListener('click', closeLogModal);
+$('#lgRefresh').addEventListener('click', function(){ if (logKey) loadTaskLog(); });
+async function openTaskLog(key, name){
+  logKey = key; logName = name || key;
+  openLogModal('任务日志 · ' + logName);
+  $('#lgBody').textContent = '加载中…';
+  await loadTaskLog();
+}
+async function loadTaskLog(){
+  try{
+    var r = await api('api/task/log?key=' + encodeURIComponent(logKey));
+    var lines = r.lines || [];
+    $('#lgBody').textContent = lines.length ? lines.join('\n') : (r.message || '这次运行还没有输出。');
+  }catch(err){
+    $('#lgBody').textContent = '拉取失败：' + (err && err.message || err);
+  }
+}
+
+/* ── 容器日志 ─────────────────────────────────────── */
+$('#logLines').addEventListener('click', function(e){
+  var b = e.target.closest('button[data-n]'); if (!b) return;
+  S.logLines = parseInt(b.getAttribute('data-n'), 10) || 120;
+  $$('#logLines button').forEach(function(x){
+    x.setAttribute('aria-pressed', String(x === b));
+  });
+  loadLogs();
+});
+async function loadLogs(){
+  busy(true);
+  $('#logBox').textContent = '拉取中…';
+  try{
+    var r = await api('api/logs?lines=' + S.logLines);
+    var txt = r.logs || '';
+    $('#logBox').textContent = txt || '（无日志输出）';
+    $('#logBox').scrollTop = $('#logBox').scrollHeight;
+  }catch(err){ $('#logBox').textContent = '拉取失败：' + (err && err.message || err); }
+  finally{ busy(false); }
+}
+
+/* ── 添加账号 ─────────────────────────────────────── */
+function openDrawer(){
+  $('#scrimD').classList.add('on');
+  $('#drawer').classList.add('on');
+  renderPick();
+}
+function closeDrawer(){
+  stopPoll();
+  $('#scrimD').classList.remove('on');
+  $('#drawer').classList.remove('on');
+  DT.url = '';
+}
+$('#drClose').addEventListener('click', closeDrawer);
+$('#scrimD').addEventListener('click', closeDrawer);
+$('#btnAdd').addEventListener('click', openDrawer);
+
+function renderPick(){
+  DT.url = '';
+  $('#drTitle').textContent = '添加账号';
+  $('#drBody').innerHTML =
+    '<div class="mtext">扫码完成授权后，凭证会写入 auths 并重启网关。</div>' +
+    '<div style="margin-top:16px"><div class="sub" style="margin-bottom:7px">区域</div>' +
+    '<div class="seg grow" id="segRealm">' +
+    '<button data-r="cn" aria-pressed="' + (DT.realm === 'cn' ? 'true' : 'false') + '">国内版 CN</button>' +
+    '<button data-r="global" aria-pressed="' + (DT.realm === 'global' ? 'true' : 'false') + '">国际版 Global</button>' +
+    '</div></div>';
+  $('#drFoot').innerHTML = '<button class="btn pri" id="drGo">生成授权链接</button>';
+  $('#segRealm').addEventListener('click', function(e){
+    var b = e.target.closest('button[data-r]'); if (!b) return;
+    DT.realm = b.getAttribute('data-r');
+    $$('#segRealm button').forEach(function(x){
+      x.setAttribute('aria-pressed', String(x === b));
+    });
+  });
+  $('#drGo').addEventListener('click', startLogin);
+}
+
+async function startLogin(){
+  var go = $('#drGo'); go.disabled = true; go.textContent = '正在获取…';
+  try{
+    var r = await api('api/login/start', { realm:DT.realm });
+    if (!r.ok){ toast(r.message, 'err'); go.disabled = false; go.textContent = '重新生成'; return; }
+    DT.url = r.url;
+    renderWait();
+    startPoll();
+  }catch(err){
+    toast('获取链接失败：' + (err && err.message || err), 'err');
+    go.disabled = false; go.textContent = '重新生成';
+  }
+}
+
+function renderWait(){
+  $('#drTitle').textContent = '扫码登录';
+  $('#drBody').innerHTML =
+    '<div class="qr-box"><canvas id="qr"></canvas></div>' +
+    '<div class="url-box" id="urlText">' + esc(DT.url) + '</div>' +
+    '<div class="wait"><span class="spin"></span><span id="waitMsg">等待扫码…</span></div>';
+  $('#drFoot').innerHTML = '<button class="btn" id="drCancel">重新选择区域</button>' +
+    '<button class="btn" id="drCopy">复制链接</button>';
+  $('#drCancel').addEventListener('click', renderPick);
+  $('#drCopy').addEventListener('click', function(){ copyText(DT.url); });
+  drawQR(DT.url);
+}
+
+function drawQR(text){
+  var cv = $('#qr'); if (!cv) return;
+  try{
+    var q = qrcode(0, 'M');
+    q.addData(text); q.make();
+    var n = q.getModuleCount(), pad2 = 2;
+    var cell = Math.max(2, Math.floor(176 / (n + pad2 * 2)));
+    var side = cell * (n + pad2 * 2);
+    var dpr = window.devicePixelRatio || 1;
+    cv.width = side * dpr; cv.height = side * dpr;
+    cv.style.width = side + 'px'; cv.style.height = side + 'px';
+    var ctx = cv.getContext('2d');
+    ctx.scale(dpr, dpr);
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, side, side);
+    ctx.fillStyle = '#111214';
+    for (var r = 0; r < n; r++)
+      for (var c = 0; c < n; c++)
+        if (q.isDark(r, c)) ctx.fillRect((c + pad2) * cell, (r + pad2) * cell, cell, cell);
+  }catch(err){
+    cv.parentNode.innerHTML = '<div class="sub" style="padding:56px 0">二维码生成失败，请用下方链接打开</div>';
+  }
+}
+function setWait(msg){ var w = $('#waitMsg'); if (w) w.textContent = msg; }
+function stopPoll(){ if (DT.timer){ clearInterval(DT.timer); DT.timer = null; } }
+function startPoll(){
+  stopPoll(); DT.tries = 0;
+  DT.timer = setInterval(async function(){
+    if (DT.tries++ > 100){ stopPoll(); setWait('等待超时，请重新生成链接。'); return; }
+    try{
+      var r = await api('api/login/poll', { realm:DT.realm });
+      if (r.ok){ stopPoll(); renderDone(r); return; }
+      if (r.pending && DT.tries % 3 === 0) setWait('等待扫码…');
+    }catch(err){ /* 单次失败继续等 */ }
+  }, 3000);
+}
+function renderDone(r){
+  var a = r.account || {};
+  $('#drTitle').textContent = '添加成功';
+  $('#drBody').innerHTML =
+    '<div class="note ok">' + svg(IC.check, 16) +
+    '<div class="g"><b>' + esc(a.nickname || '账号') + '</b> 已写入并加载</div></div>' +
+    '<div style="margin-top:14px">' +
+    mrow('UID', a.uid || '—') +
+    mrow('区域', String(a.realm || '').toUpperCase()) +
+    mrow('有效期', a.expiresInDays ? (a.expiresInDays + ' 天') : '—') +
+    '</div>';
+  $('#drFoot').innerHTML = '<button class="btn" id="drMore">再加一个</button>' +
+    '<button class="btn pri" id="drDone">完成</button>';
+  $('#drDone').addEventListener('click', async function(){ closeDrawer(); await loadAll(true); });
+  $('#drMore').addEventListener('click', renderPick);
+  loadAll(true);
+}
+
+/* ── 顶栏动作 ─────────────────────────────────────── */
+$('#btnRefresh').addEventListener('click', function(){ loadAll(true); if (location.hash === '#keys') loadKeys(); });
+$('#btnRestart').addEventListener('click', actRestart);
+$('#btnTaskReload').addEventListener('click', async function(){
+  await loadAll(); toast('已刷新', 'ok');
+});
+$('#btnLogs').addEventListener('click', loadLogs);
+$('#btnLogout').addEventListener('click', function(){
+  ask('退出登录', '将结束本机的登录会话，需要重新输入用户名和密码。', '退出', false, async function(){
+    try{ await api('api/auth/logout', {}); }catch(e){}
+    location.replace('login');
+  });
+});
+
+/* ── 登录账号 ─────────────────────────────────────── */
+async function loadIdentity(){
+  try{
+    var r = await api('api/session');
+    $('#whoami').textContent = r.username || '';
+    $('#pwUser').value = r.username || '';
+    $('#pwHint').textContent = r.inherited
+      ? '沿用 nginx 时期的密码，保存一次即切换成本面板自管'
+      : '保存后所有设备都需要重新登录';
+  }catch(err){ /* 401 已由 api() 跳转登录页 */ }
+}
+$('#btnPwSave').addEventListener('click', async function(){
+  var cur = $('#pwCur').value, user = $('#pwUser').value.trim();
+  var pw = $('#pwNew').value, cfm = $('#pwCfm').value;
+  if (!cur){ toast('请输入当前密码', 'err'); $('#pwCur').focus(); return; }
+  if (!user){ toast('请输入新用户名', 'err'); $('#pwUser').focus(); return; }
+  if (pw.length < 8){ toast('新密码至少 8 位', 'err'); $('#pwNew').focus(); return; }
+  if (pw !== cfm){ toast('两次输入的新密码不一致', 'err'); $('#pwCfm').focus(); return; }
+  var btn = $('#btnPwSave');
+  btn.disabled = true;
+  try{
+    var r = await api('api/auth/password',
+      { current:cur, username:user, password:pw, confirm:cfm });
+    toast(r.message || '已保存', 'ok');
+    $('#pwCur').value = ''; $('#pwNew').value = ''; $('#pwCfm').value = '';
+    $('#whoami').textContent = r.username || user;
+  }catch(err){
+    toast('保存失败：' + (err && err.message || err), 'err');
+  }finally{ btn.disabled = false; }
+});
+
+/* ── 启动 ─────────────────────────────────────────── */
+function init(){
+  var v = 'overview';
+  try { var s = localStorage.getItem('wb2a-view'); if (s && PAGE[s]) v = s; } catch(e){}
+  var hashView = location.hash.slice(1); if (PAGE[hashView]) v = hashView;
+  go(v);
+  loadAll();
+  loadIdentity();
+  setInterval(function(){
+    if (!document.hidden && !DT.timer) loadAll();
+  }, 30000);
+}
+
+"use strict";
+// ═══ 更新日志 ═══
+// 2026-09-16：实现密钥创建、编辑、启停、删除与一次性显示，沿用控制台交互与主题。
+// 2026-09-16：确认关闭时同步清空完整密钥，避免等待异步 close 事件才清除。
+// 2026-09-17：密钥支持模型绑定：表单可填写或从模型列表挑选，列表展示绑定范围。
+
+var KS = {keys:null, loading:false, error:'', query:'', models:null};
+var KD = {id:null, secret:'', busy:false, copied:false, closeConfirmed:false};
+
+function keyModels(value){
+  return String(value || '').split(',').map(function(item){return item.trim();}).filter(function(item,index,all){
+    return item && all.indexOf(item) === index;
+  });
+}
+
+async function loadKeyModels(){
+  if (KS.models || KS.modelsLoading) return KS.models || [];
+  KS.modelsLoading = true;
+  try{
+    var result = await api('api/models');
+    KS.models = (result && Array.isArray(result.models)) ? result.models : [];
+  }catch(error){ KS.models = []; }
+  finally{
+    KS.modelsLoading = false;
+    var pick = $('#keyModelPick');
+    pick.innerHTML = '<option value="">从模型列表添加…</option>' + KS.models.map(function(id){
+      return '<option value="' + esc(id) + '">' + esc(id) + '</option>';
+    }).join('');
+  }
+  return KS.models;
+}
+
+function fillModelInput(models){
+  $('#keyModels').value = models.join(', ');
+}
+
+async function loadKeys(){
+  if (KS.loading) return;
+  KS.loading = true;
+  $('#btnKeysReload').disabled = true;
+  try{
+    var result = await api('api/keys');
+    if (!result || !Array.isArray(result.keys)) throw new Error('服务返回的密钥列表不完整');
+    KS.keys = result.keys; KS.error = '';
+  }catch(error){ KS.error = error.message || '加载失败，请稍后重试'; }
+  finally{ KS.loading = false; $('#btnKeysReload').disabled = false; renderKeys(); }
+}
+
+function renderKeys(){
+  var keys = KS.keys || [];
+  $('#keyError').textContent = KS.error;
+  $('#keyError').classList.toggle('hide', !KS.error);
+  $('#tabKeys').textContent = KS.keys ? keys.length : '—';
+  $('#keyEnabledCount').textContent = KS.keys ? keys.filter(function(k){return k.enabled;}).length : '—';
+  var query = KS.query.toLowerCase();
+  var filtered = keys.filter(function(k){return (k.name + ' ' + (k.note || '')).toLowerCase().indexOf(query) >= 0;});
+  if (!filtered.length){
+    var message = !KS.keys ? (KS.error ? '暂时无法加载密钥' : '正在加载密钥…') : (query ? '没有匹配的密钥' : '还没有密钥');
+    $('#keyRows').innerHTML = '<tr><td colspan="6">' + emptyBox(IC.box, message, !query && KS.keys ? '创建一把密钥，用于连接你的客户端。' : '') + '</td></tr>';
+    return;
+  }
+  $('#keyRows').innerHTML = filtered.map(function(key){
+    var models = keyModels((key.models || []).join(','));
+    return '<tr><td data-l="名称"><div class="key-name">' + esc(key.name) + (key.legacy ? '<span class="key-legacy">原有</span>' : '') + '</div>' +
+      '<div class="sub key-note">' + esc(key.note || '未填写备注') + '</div></td>' +
+      '<td data-l="密钥"><code class="key-mask">' + esc(key.masked_key) + '</code></td>' +
+      '<td data-l="模型绑定">' + (models.length
+        ? '<div class="key-model-tags">' + models.map(function(name){return '<span class="key-model-tag">' + esc(name) + '</span>';}).join('') + '</div>'
+        : '<span class="sub">不限制</span>') + '</td>' +
+      '<td data-l="状态"><span class="bdg ' + (key.enabled ? 'ok' : 'off') + '"><i></i>' + (key.enabled ? '启用' : '停用') + '</span></td>' +
+      '<td data-l="创建时间" class="mono key-date">' + esc(fmtTime(key.created_at)) + '</td>' +
+      '<td data-l="操作"><div class="key-actions"><button class="btn sm" data-key-action="edit" data-id="' + esc(key.id) + '">编辑</button>' +
+      '<button class="btn sm" data-key-action="toggle" data-id="' + esc(key.id) + '">' + (key.enabled ? '停用' : '启用') + '</button>' +
+      '<button class="btn sm danger" data-key-action="delete" data-id="' + esc(key.id) + '">删除</button></div></td></tr>';
+  }).join('');
+}
+
+function keyFormError(message){
+  $('#keyFormError').textContent = message;
+  $('#keyFormError').classList.toggle('hide', !message);
+}
+
+function openKeyEditor(key){
+  KD = {id:key ? key.id : null, secret:'', busy:false, copied:false, closeConfirmed:false};
+  $('#keyDialogTitle').textContent = key ? '编辑密钥' : '创建密钥';
+  $('#keyName').value = key ? key.name : '';
+  $('#keyNote').value = key ? (key.note || '') : '';
+  fillModelInput(key ? keyModels((key.models || []).join(',')) : []);
+  $('#keyModelPick').value = '';
+  $('#keySecret').value = '';
+  $('#keyFields').classList.remove('hide'); $('#keyCreated').classList.add('hide');
+  $('#keyDialogSave').classList.remove('hide'); $('#keyDialogSave').textContent = key ? '保存修改' : '创建密钥';
+  $('#keyDialogSave').disabled = false; $('#keyDialogCancel').textContent = '取消';
+  $('#btnCopyKey').textContent = '复制密钥';
+  keyFormError('');
+  $('#keyDialog').showModal(); $('#keyName').focus();
+  loadKeyModels();
+}
+
+function closeKeyEditor(){
+  if (KD.busy) return;
+  if (KD.secret && !KD.copied && !KD.closeConfirmed){
+    KD.closeConfirmed = true;
+    keyFormError('请确认已保存密钥。继续关闭后，无法再次查看完整密钥。');
+    $('#keyDialogCancel').textContent = '已保存，关闭';
+    return;
+  }
+  KD.secret = ''; $('#keySecret').value = '';
+  $('#keyDialog').close();
+}
+
+$('#keyDialog').addEventListener('close', function(){ KD.secret = ''; $('#keySecret').value = ''; $('#keyName').value = ''; $('#keyNote').value = ''; $('#keyModels').value = ''; });
+$('#keyDialog').addEventListener('cancel', function(event){ event.preventDefault(); closeKeyEditor(); });
+$('#keyDialogClose').addEventListener('click', closeKeyEditor);
+$('#keyDialogCancel').addEventListener('click', closeKeyEditor);
+$('#btnCreateKey').addEventListener('click', function(){openKeyEditor(null);});
+$('#btnKeysReload').addEventListener('click', loadKeys);
+$('#keySearch').addEventListener('input', function(){KS.query=this.value;renderKeys();});
+$('#keyModelPick').addEventListener('change', function(){
+  var value = this.value; this.value = ''; if (!value) return;
+  var models = keyModels($('#keyModels').value);
+  if (models.indexOf(value) < 0) models.push(value);
+  fillModelInput(models);
+});
+$('#btnClearModels').addEventListener('click', function(){ fillModelInput([]); });
+
+$('#keyForm').addEventListener('submit', async function(event){
+  event.preventDefault(); if (KD.busy || KD.secret) return;
+  var body = {name:$('#keyName').value.trim(), note:$('#keyNote').value.trim(), models:keyModels($('#keyModels').value)};
+  if (!body.name){keyFormError('请填写密钥名称');$('#keyName').focus();return;}
+  if (body.models.length > 64){keyFormError('模型绑定最多 64 项');$('#keyModels').focus();return;}
+  if (body.models.some(function(item){return item.length > 64;})){keyFormError('单个模型名不能超过 64 个字符');$('#keyModels').focus();return;}
+  if (KD.id) body.id = KD.id;
+  KD.busy = true; $('#keyDialogSave').disabled = true; keyFormError('');
+  try{
+    var result = await api(KD.id ? 'api/keys/update' : 'api/keys', body);
+    if (KD.id){ KD.busy = false; closeKeyEditor(); toast('密钥信息已保存','ok'); }
+    else{
+      if (!result.key) throw new Error('未收到完整密钥，请刷新列表后重试');
+      KD.secret = result.key;
+      $('#keySecret').value = KD.secret;
+      $('#keyFields').classList.add('hide'); $('#keyCreated').classList.remove('hide');
+      $('#keyDialogSave').classList.add('hide'); $('#keyDialogCancel').textContent = '完成';
+      $('#keyDialogTitle').textContent = '保存你的密钥'; $('#btnCopyKey').focus();
+    }
+    await loadKeys();
+  }catch(error){keyFormError(error.message || '保存失败，请稍后重试');}
+  finally{KD.busy = false;$('#keyDialogSave').disabled = false;}
+});
+
+$('#btnCopyKey').addEventListener('click', async function(){
+  if (!KD.secret) return;
+  try{
+    if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(KD.secret);
+    else {var field=$('#keySecret');field.focus();field.select();if (!document.execCommand('copy')) throw new Error('copy unavailable');}
+    KD.copied = true; keyFormError(''); $('#btnCopyKey').textContent = '已复制'; toast('密钥已复制','ok');
+  }catch(error){keyFormError('无法自动复制，请选中上方密钥手动复制并保存。');$('#keySecret').focus();$('#keySecret').select();}
+});
+
+$('#keyRows').addEventListener('click', function(event){
+  var button = event.target.closest('button[data-key-action]'); if (!button) return;
+  var key = (KS.keys || []).find(function(k){return k.id === button.getAttribute('data-id');}); if (!key) return;
+  var action = button.getAttribute('data-key-action');
+  if (action === 'edit'){openKeyEditor(key);return;}
+  var removing = action === 'delete';
+  var label = removing ? '删除' : (key.enabled ? '停用' : '启用');
+  var message = removing ? '删除后无法恢复。使用这把密钥的客户端将无法继续发起请求。' : (key.enabled ? '使用这把密钥的客户端将无法发起新请求，之后可以重新启用。' : '启用后，这把密钥可以重新用于调用网关。');
+  if (key.enabled && (removing || action === 'toggle') && KS.keys.filter(function(k){return k.enabled;}).length === 1) message += ' 这是最后一把启用的密钥；你仍可从管理面板创建新密钥。';
+  ask(label + '「' + key.name + '」',message,label,removing || key.enabled,async function(){
+    button.disabled = true;
+    try{
+      await api(removing ? 'api/keys/delete' : 'api/keys/update',removing ? {id:key.id} : {id:key.id,enabled:!key.enabled});
+      toast('密钥已' + label,'ok'); await loadKeys();
+    }catch(error){toast(error.message || '操作失败','err');}
+    finally{button.disabled = false;}
+  });
+});
+
+init();
+
+</script>
+</body>
+</html>

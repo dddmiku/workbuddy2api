@@ -1,0 +1,334 @@
+<aside class="side" id="side">
+  <div class="side-top">
+    <button class="mark" id="btnHome" title="回到概览">WB</button>
+    <div class="wm">
+      <b>workbuddy2api</b>
+      <span id="brandVer">网关控制台</span>
+    </div>
+  </div>
+
+  <nav class="nav">
+    <div class="nav-lb">总览</div>
+    <div id="tabs">
+      <button data-view="overview" class="on">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7.5" height="7.5" rx="1"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1"/></svg>
+        概览
+      </button>
+      <button data-view="accounts">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="9.5" cy="8" r="3.4"/><path d="M3.2 19.5a6.3 6.3 0 0 1 12.6 0"/><path d="M17 6.2a3.4 3.4 0 0 1 0 6.6"/><path d="M18.6 19.5a6.3 6.3 0 0 0-2.2-4.4"/></svg>
+        账号
+        <i id="tabAcct">0</i>
+      </button>
+      <button data-view="keys">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="9" r="4.5"/><path d="m11.3 12.3 8 8 2-2-2-2 1.5-1.5-2-2-1.5 1.5-2.7-2.7"/></svg>
+        密钥管理
+        <i id="tabKeys">—</i>
+      </button>
+    </div>
+    <div class="nav-lb">运维</div>
+    <div id="tabs2">
+      <button data-view="tasks">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.6"/><path d="M12 7.4V12l3.2 2"/></svg>
+        排程
+        <i id="tabTask">—</i>
+      </button>
+      <button data-view="system">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/></svg>
+        系统
+      </button>
+    </div>
+  </nav>
+
+  <div class="side-conn">
+    <div class="cell" id="cellBase">
+      <span class="k">URL</span>
+      <code title="">—</code>
+      <button class="mini" disabled title="复制" aria-label="复制 Base URL">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>
+      </button>
+    </div>
+    <div class="cell" id="cellKey">
+      <span class="k">KEY</span>
+      <code title="">—</code>
+      <button class="mini" data-view="keys" title="管理密钥" aria-label="打开密钥管理">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>
+      </button>
+    </div>
+    <div class="cell" id="cellHealth">
+      <span class="k">HLT</span>
+      <code title="">—</code>
+      <button class="mini" disabled title="复制" aria-label="复制健康检查地址">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <div class="side-foot">
+    <button id="btnTheme" title="切换主题">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" id="icTheme"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+      <span id="themeLabel">暗色</span>
+    </button>
+  </div>
+</aside>
+
+<div class="scrim-m" id="scrimNav"></div>
+
+<div class="main">
+  <header class="top">
+    <button class="vbtn menu" id="btnMenu" title="菜单" aria-label="菜单">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3.5 6.5h17M3.5 12h17M3.5 17.5h17"/></svg>
+    </button>
+    <div>
+      <div class="ptitle" id="pgTitle">概览</div>
+      <div class="pdesc" id="pgDesc">账号池与运行状态</div>
+    </div>
+    <span class="sp"></span>
+    <div class="chips">
+      <span class="chip" id="svcBadge"><i></i><span id="svcText">连接中</span></span>
+    </div>
+    <button class="vbtn" id="btnRefresh" title="刷新数据" aria-label="刷新数据">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M20.5 3.8V9h-5.2"/></svg>
+    </button>
+    <button class="vbtn danger" id="btnRestart" title="重启网关" aria-label="重启网关">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.6v8"/><path d="M7.5 6.7a7 7 0 1 0 9 0"/></svg>
+    </button>
+    <button class="vbtn" id="btnLogout" title="退出登录" aria-label="退出登录">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 20.5H5.5A1.5 1.5 0 0 1 4 19V5a1.5 1.5 0 0 1 1.5-1.5h4"/><path d="m16 16.5 4.5-4.5L16 7.5"/><path d="M20.5 12H9"/></svg>
+    </button>
+  </header>
+
+  <div class="body">
+    <div class="inner">
+      <div class="notes" id="notes"></div>
+      <section class="view" data-view="overview">
+        <div class="metrics" id="metrics"></div>
+        <div class="rule"></div>
+        <div class="vhead" style="margin-top:20px">
+          <h1>账号池与积分</h1>
+          <div class="d">运行时状态</div>
+        </div>
+        <div class="pairs">
+          <section class="panel">
+            <div class="ph"><h2>账号池</h2><span class="sp"></span><span class="sub">按区域</span></div>
+            <div class="pb" id="poolPanel"></div>
+          </section>
+          <section class="panel">
+            <div class="ph"><h2>积分</h2><span class="sp"></span><span class="sub">全部账号合计</span></div>
+            <div class="pb" id="creditPanel"></div>
+          </section>
+        </div>
+        <div class="vhead" style="margin-top:22px">
+          <h1>今日排程</h1>
+          <div class="d">按时间顺序</div>
+          <span class="sp"></span>
+          <button class="btn sm ghost" id="btnGoTasks">全部任务</button>
+        </div>
+        <div class="panel"><div class="pb flush" id="ovTasks"></div></div>
+      </section>
+
+      <section class="view hide" data-view="accounts">
+        <div class="vhead">
+          <h1>账号</h1>
+          <div class="d">凭证、积分与启停</div>
+        </div>
+        <div class="panel">
+          <div class="ph">
+            <div class="search">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="6.4"/><path d="m15.8 15.8 4.4 4.4"/></svg>
+              <input id="acctSearch" placeholder="搜索昵称或 UID" autocomplete="off" spellcheck="false">
+            </div>
+            <div class="seg" id="acctFilter">
+              <button data-f="all" aria-pressed="true">全部</button>
+              <button data-f="on">启用</button>
+              <button data-f="off">停用</button>
+            </div>
+            <span class="sp"></span>
+            <button class="btn sm pri" id="btnAdd">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5.5v13M5.5 12h13"/></svg>
+              添加账号
+            </button>
+          </div>
+          <div class="tblwrap">
+            <table class="tbl">
+              <thead><tr><th>账号</th><th>状态</th><th class="r">积分</th><th>最近活动</th><th></th></tr></thead>
+              <tbody id="acctRows"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="view hide" data-view="keys">
+        <div class="vhead">
+          <h1>密钥管理</h1>
+          <div class="d">为不同客户端创建独立密钥</div>
+          <span class="sp"></span>
+          <button class="btn sm" id="btnKeysReload">刷新</button>
+        </div>
+        <div class="key-summary">
+          <div><span class="key-count" id="keyEnabledCount">—</span><span class="sub"> 把密钥正在启用</span></div>
+          <p class="sub">停用或删除会立即阻止后续请求，已开始的请求不受影响。</p>
+        </div>
+        <div id="keyError" class="note err hide" role="alert"></div>
+        <div class="panel">
+          <div class="ph">
+            <div class="search"><input id="keySearch" placeholder="搜索名称或备注" autocomplete="off" spellcheck="false" aria-label="搜索密钥"></div>
+            <span class="sp"></span>
+            <button class="btn sm pri" id="btnCreateKey">＋ 创建密钥</button>
+          </div>
+          <div class="tblwrap">
+            <table class="tbl key-table">
+              <thead><tr><th>名称与备注</th><th>密钥</th><th>模型绑定</th><th>状态</th><th>创建时间</th><th class="r">操作</th></tr></thead>
+              <tbody id="keyRows"><tr><td colspan="6"><div class="empty">正在加载密钥…</div></td></tr></tbody>
+            </table>
+          </div>
+        </div>
+        <p class="sub key-footnote">完整密钥仅在创建时显示一次。忘记密钥时，请创建新的密钥并停用旧密钥。</p>
+      </section>
+
+      <section class="view hide" data-view="tasks">
+        <div class="vhead">
+          <h1>排程</h1>
+          <div class="d">定时任务开关与手动触发</div>
+          <span class="sp"></span>
+          <button class="btn sm" id="btnTaskReload">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M20.5 3.8V9h-5.2"/></svg>
+            刷新
+          </button>
+        </div>
+        <div class="panel"><div class="tiles" id="taskList"></div></div>
+      </section>
+
+      <section class="view hide" data-view="system">
+        <div class="vhead">
+          <h1>系统</h1>
+          <div class="d">服务状态、登录账号与运行日志</div>
+        </div>
+        <div class="pairs wide">
+          <div>
+            <section class="panel">
+              <div class="ph"><h2>服务</h2></div>
+              <div class="pb" id="sysCards"></div>
+            </section>
+            <section class="panel" style="margin-top:14px">
+              <div class="ph"><h2>登录账号</h2><span class="sp"></span><span class="sub" id="whoami">—</span></div>
+              <div class="pb">
+                <div class="cred-form">
+                  <label class="fld">
+                    <span class="k">当前密码</span>
+                    <input id="pwCur" type="password" autocomplete="current-password" placeholder="用于确认身份">
+                  </label>
+                  <label class="fld">
+                    <span class="k">新用户名</span>
+                    <input id="pwUser" autocomplete="username" spellcheck="false">
+                  </label>
+                  <label class="fld">
+                    <span class="k">新密码</span>
+                    <input id="pwNew" type="password" autocomplete="new-password" placeholder="至少 8 位">
+                  </label>
+                  <label class="fld">
+                    <span class="k">重复新密码</span>
+                    <input id="pwCfm" type="password" autocomplete="new-password">
+                  </label>
+                </div>
+                <div class="frow">
+                  <button class="btn pri" id="btnPwSave">保存账号信息</button>
+                </div>
+                <div class="sub" id="pwHint" style="margin-top:10px;line-height:1.6">保存后所有设备都需要重新登录</div>
+              </div>
+            </section>
+          </div>
+          <section class="panel">
+            <div class="ph">
+              <h2>容器日志</h2>
+              <span class="sp"></span>
+              <div class="seg" id="logLines">
+                <button data-n="60">60</button>
+                <button data-n="120" aria-pressed="true">120</button>
+                <button data-n="300">300</button>
+                <button data-n="600">600</button>
+              </div>
+              <button class="btn sm ico" id="btnLogs" title="拉取日志" aria-label="拉取日志">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M20.5 3.8V9h-5.2"/></svg>
+              </button>
+            </div>
+            <pre class="term" id="logBox">—</pre>
+          </section>
+        </div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<div class="scrim" id="scrimD"></div>
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="drTitle">
+  <div class="dh">
+    <h3 id="drTitle">添加账号</h3>
+    <button class="vbtn" id="drClose" aria-label="关闭">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg>
+    </button>
+  </div>
+  <div class="dbody" id="drBody"></div>
+  <div class="dfoot" id="drFoot"></div>
+</aside>
+
+<div class="scrim" id="scrimM"></div>
+<div class="modal" id="modal" role="dialog" aria-modal="true" aria-labelledby="mdTitle">
+  <div class="mh">
+    <div class="mic w" id="mdIcon">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9.5v4M12 17h.01"/><path d="M10.3 4.4 2.9 17.2A1.9 1.9 0 0 0 4.6 20h14.8a1.9 1.9 0 0 0 1.7-2.8L13.7 4.4a1.9 1.9 0 0 0-3.4 0Z"/></svg>
+    </div>
+    <h3 id="mdTitle">确认操作</h3>
+  </div>
+  <div class="mbody"><div class="mtext" id="mdText"></div></div>
+  <div class="mfoot">
+    <button class="btn" id="mdNo">取消</button>
+    <button class="btn pri" id="mdYes">确认</button>
+  </div>
+</div>
+
+<div class="scrim" id="scrimL"></div>
+<div class="modal wide" id="logModal" role="dialog" aria-modal="true" aria-labelledby="lgTitle">
+  <div class="mh">
+    <h3 id="lgTitle">任务日志</h3>
+    <button class="btn sm ico" id="lgRefresh" title="刷新" aria-label="刷新日志">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M20.5 3.8V9h-5.2"/></svg>
+    </button>
+    <button class="btn sm ico ghost" id="lgClose" title="关闭" aria-label="关闭">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg>
+    </button>
+  </div>
+  <pre class="term" id="lgBody">—</pre>
+</div>
+
+<div class="toasts" id="toasts"></div>
+<dialog class="key-dialog" id="keyDialog" aria-labelledby="keyDialogTitle">
+  <form id="keyForm" autocomplete="off">
+    <div class="key-dialog-head"><h3 id="keyDialogTitle">创建密钥</h3><button type="button" class="vbtn" id="keyDialogClose" aria-label="关闭密钥窗口">×</button></div>
+    <div class="key-dialog-body">
+      <div id="keyFields">
+        <label class="fld"><span class="k">名称</span><input id="keyName" name="name" maxlength="64" required placeholder="例如：工作电脑 codex" autocomplete="off"></label>
+        <label class="fld"><span class="k">备注 <span class="sub">（可选）</span></span><input id="keyNote" name="note" maxlength="256" placeholder="记录用途，方便日后管理" autocomplete="off"></label>
+        <label class="fld"><span class="k">绑定模型 <span class="sub">（留空表示不限制）</span></span><input id="keyModels" name="models" placeholder="例如 cn:deepseek-v4.1-flash，多个用逗号分隔" autocomplete="off" spellcheck="false"></label>
+        <div class="key-model-pick">
+          <select id="keyModelPick" aria-label="从可用模型中选择"><option value="">从模型列表添加…</option></select>
+          <button type="button" class="btn sm" id="btnClearModels">清空绑定</button>
+        </div>
+      </div>
+      <div id="keyCreated" class="hide">
+        <div class="note ok">密钥已创建，可以用于连接网关。</div>
+        <p class="key-secret-hint">请现在复制并保存。关闭窗口后，完整密钥无法再次查看。</p>
+        <label class="fld"><span class="k">完整密钥</span><textarea id="keySecret" class="key-secret" rows="3" readonly spellcheck="false" aria-label="新创建的完整密钥"></textarea></label>
+        <button type="button" class="btn pri" id="btnCopyKey">复制密钥</button>
+      </div>
+      <p id="keyFormError" class="key-form-error hide" role="alert"></p>
+    </div>
+    <div class="key-dialog-foot"><button type="button" class="btn" id="keyDialogCancel">取消</button><button type="submit" class="btn pri" id="keyDialogSave">创建密钥</button></div>
+  </form>
+</dialog>
+<script src="vendor/qrcode.js"></script>
+<script>
+"use strict";
+/*__APP_JS__*/
+</script>
+</body>
+</html>

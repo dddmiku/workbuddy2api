@@ -1,5 +1,6 @@
 // ═══ 更新日志 ═══
 // 2026-09-16：在选号前校验请求基础结构并拒绝不支持的 Responses 状态能力，避免坏参数被静默丢弃或触发换号。
+// 2026-09-17：接受 Responses 的命名空间工具分组，并把命名空间名字写回函数调用历史。
 package server
 
 import (
@@ -120,49 +121,99 @@ func requestValidationTools(value any, path string, responses bool) error {
 		if err != nil {
 			return err
 		}
-		if err := requestValidationString(tool["type"], toolPath+".type", true); err != nil {
+		if err := requestValidationToolSpec(tool, toolPath, responses, true); err != nil {
 			return err
-		}
-		switch tool["type"] {
-		case "function":
-			function := tool
-			functionPath := toolPath
-			if rawFunction, nested := tool["function"]; nested {
-				function, err = requestValidationObject(rawFunction, toolPath+".function")
-				functionPath += ".function"
-				if err != nil {
-					return err
-				}
-			} else if !responses {
-				return fmt.Errorf("%s.function must be an object", toolPath)
-			}
-			if err := requestValidationFunction(function, functionPath); err != nil {
-				return err
-			}
-		case "custom":
-			if !responses {
-				return fmt.Errorf("%s.type custom is supported through the Responses endpoint", toolPath)
-			}
-			if err := requestValidationString(tool["name"], toolPath+".name", true); err != nil {
-				return err
-			}
-			if err := requestValidationOptionalStrings(tool, toolPath, "description"); err != nil {
-				return err
-			}
-			if rawFormat := tool["format"]; rawFormat != nil {
-				format, err := requestValidationObject(rawFormat, toolPath+".format")
-				if err != nil {
-					return err
-				}
-				if err := requestValidationOptionalStrings(format, toolPath+".format", "type", "syntax", "definition"); err != nil {
-					return err
-				}
-			}
-		default:
-			return fmt.Errorf("%s.type %q is not supported; use function or custom tools", toolPath, tool["type"])
 		}
 	}
 	return nil
+}
+
+// requestValidationToolSpec 校验单条工具定义。allowNamespace 为真时接受 Responses 的
+// 命名空间分组（type=namespace，内含 function/custom 子工具，子层不再允许继续嵌套）。
+// 网关无法实现的内置工具按声明接受、由 responsesTools 丢弃：官方 Codex 0.155 默认
+// 就会带上 web_search，整条请求拒绝会让客户端完全不可用。
+var unimplementedBuiltinTools = map[string]bool{
+	"web_search":         true,
+	"web_search_preview": true,
+}
+
+func requestValidationToolSpec(tool map[string]any, toolPath string, responses, allowNamespace bool) error {
+	if err := requestValidationString(tool["type"], toolPath+".type", true); err != nil {
+		return err
+	}
+	if kind, _ := tool["type"].(string); unimplementedBuiltinTools[kind] {
+		if !responses {
+			return fmt.Errorf("%s.type %q is not supported; use function or custom tools", toolPath, kind)
+		}
+		if !allowNamespace {
+			return fmt.Errorf("%s.type %q is not supported inside a namespace; use function or custom tools", toolPath, kind)
+		}
+		// 声明本身可以出现，只是不会转发到上游；额外字段不校验，避免绑定未来格式。
+		return nil
+	}
+	switch tool["type"] {
+	case "function":
+		function := tool
+		functionPath := toolPath
+		if rawFunction, nested := tool["function"]; nested {
+			object, err := requestValidationObject(rawFunction, toolPath+".function")
+			if err != nil {
+				return err
+			}
+			function, functionPath = object, toolPath+".function"
+		} else if !responses {
+			return fmt.Errorf("%s.function must be an object", toolPath)
+		}
+		return requestValidationFunction(function, functionPath)
+	case "custom":
+		if !responses {
+			return fmt.Errorf("%s.type custom is supported through the Responses endpoint", toolPath)
+		}
+		if err := requestValidationString(tool["name"], toolPath+".name", true); err != nil {
+			return err
+		}
+		if err := requestValidationOptionalStrings(tool, toolPath, "description"); err != nil {
+			return err
+		}
+		if rawFormat := tool["format"]; rawFormat != nil {
+			format, err := requestValidationObject(rawFormat, toolPath+".format")
+			if err != nil {
+				return err
+			}
+			return requestValidationOptionalStrings(format, toolPath+".format", "type", "syntax", "definition")
+		}
+		return nil
+	case "namespace":
+		if !responses {
+			return fmt.Errorf("%s.type namespace is supported through the Responses endpoint", toolPath)
+		}
+		if !allowNamespace {
+			return fmt.Errorf("%s.type namespace cannot be nested; use function or custom tools inside a namespace", toolPath)
+		}
+		if err := requestValidationString(tool["name"], toolPath+".name", true); err != nil {
+			return err
+		}
+		if err := requestValidationOptionalStrings(tool, toolPath, "description"); err != nil {
+			return err
+		}
+		children, ok := tool["tools"].([]any)
+		if !ok || len(children) == 0 {
+			return fmt.Errorf("%s.tools must be a non-empty array of function or custom tools", toolPath)
+		}
+		for i, raw := range children {
+			childPath := fmt.Sprintf("%s.tools[%d]", toolPath, i)
+			child, err := requestValidationObject(raw, childPath)
+			if err != nil {
+				return err
+			}
+			if err := requestValidationToolSpec(child, childPath, responses, false); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("%s.type %q is not supported; use function, custom, or namespace tools", toolPath, tool["type"])
+	}
 }
 
 func requestValidationContent(value any, path string, responses bool) error {
@@ -273,6 +324,10 @@ func requestValidationToolChoice(value any, path string, responses bool) error {
 		}
 		// This is the shape that responsesToolChoice actually maps. A nested
 		// chat-style choice would otherwise silently fall back to auto.
+		// 命名空间内的工具额外带 namespace，映射时拼回出站扁平名。
+		if err := requestValidationOptionalStrings(choice, path, "namespace"); err != nil {
+			return err
+		}
 		return requestValidationString(choice["name"], path+".name", true)
 	}
 	switch kind {
@@ -405,6 +460,10 @@ func requestValidationResponsesInput(value any) error {
 				return err
 			}
 			if err := requestValidationOptionalStrings(item, path, "arguments", "input"); err != nil {
+				return err
+			}
+			// 命名空间工具的调用项带 namespace；缺失表示顶层工具。
+			if err := requestValidationOptionalStrings(item, path, "namespace"); err != nil {
 				return err
 			}
 		case "function_call_output", "custom_tool_call_output":

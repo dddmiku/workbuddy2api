@@ -1,5 +1,6 @@
 // ═══ 更新日志 ═══
 // 2026-09-17：合并模型级避让与完整响应校验，仅在确认成功后解除模型负缓存。
+// 2026-09-17：密钥可绑定模型白名单，超出范围的请求在选号前拒绝。
 // 2026-09-16：保留调用者指令，停止全局自动降级；校验输入并按真实流结果记录成功。
 // Package server 暴露 OpenAI 兼容 HTTP 接口，内部驱动 pool 挑号 + upstream 转发。
 package server
@@ -123,11 +124,12 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		if h.cfg.APIKeys != nil {
 			authz := r.Header.Get("Authorization")
-			if !strings.HasPrefix(authz, "Bearer ") || !h.cfg.APIKeys.Authenticate(strings.TrimPrefix(authz, "Bearer ")) {
+			info, ok := h.cfg.APIKeys.Resolve(strings.TrimPrefix(authz, "Bearer "))
+			if !strings.HasPrefix(authz, "Bearer ") || !ok {
 				writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 				return
 			}
-			next(w, r)
+			next(w, r.WithContext(context.WithValue(r.Context(), apiKeyContextKey{}, info)))
 			return
 		}
 		if h.cfg.APIKey != "" {
@@ -146,6 +148,37 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 type internalAdminContextKey struct{}
+
+// apiKeyContextKey 携带本次请求使用的密钥信息（模型白名单等）。
+type apiKeyContextKey struct{}
+
+// requestKeyInfo 返回鉴权命中的密钥信息；单密钥模式或内部管理请求返回零值。
+func requestKeyInfo(r *http.Request) (apikeys.Info, bool) {
+	info, ok := r.Context().Value(apiKeyContextKey{}).(apikeys.Info)
+	return info, ok
+}
+
+// modelAllowedByKey 判断请求模型是否在密钥白名单内。
+//
+// 匹配按「realm + 裸名」比较：白名单项可写裸名（两个域通用）或带前缀的全名。
+// 白名单为空表示不限制，保持旧密钥行为。
+func modelAllowedByKey(info apikeys.Info, requestModel string) bool {
+	if len(info.Models) == 0 {
+		return true
+	}
+	realm, bare := resolveModel(requestModel)
+	for _, allowed := range info.Models {
+		allowedRealm, allowedBare := resolveModel(allowed)
+		if allowedBare != bare {
+			continue
+		}
+		if allowedRealm != realm && strings.Contains(allowed, ":") {
+			continue
+		}
+		return true
+	}
+	return false
+}
 
 // InternalHandler 只挂载到权限为 0600 的 Unix socket，使面板管理不依赖任一调用密钥。
 func (h *Handler) InternalHandler() http.Handler {
@@ -231,10 +264,22 @@ const (
 )
 
 // models 返回模型列表：纯动态（缓存 1h），失败/无号返回空列表（无静态兜底）。
+// 绑定模型的密钥只会看到自己可用的模型，客户端据此选择也不会撞 403。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
+	list := h.modelList()
+	if info, ok := requestKeyInfo(r); ok && len(info.Models) > 0 {
+		filtered := make([]map[string]any, 0, len(list))
+		for _, entry := range list {
+			id, _ := entry["id"].(string)
+			if id != "" && modelAllowedByKey(info, id) {
+				filtered = append(filtered, entry)
+			}
+		}
+		list = filtered
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data":   h.modelList(),
+		"data":   list,
 	})
 }
 
@@ -515,6 +560,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
 	defer st.done()
+
+	// 密钥模型绑定：只放行白名单内的模型，拒绝发生在选号之前——不占用账号、不轮转、不冷却。
+	if info, ok := requestKeyInfo(r); ok && !modelAllowedByKey(info, peek.Model) {
+		writeOpenAIError(w, http.StatusForbidden, "model_not_allowed",
+			fmt.Sprintf("this API key is restricted to its bound models and cannot use %q", peek.Model))
+		st.status = http.StatusForbidden
+		return
+	}
 
 	tried := map[string]bool{}
 	var lastErr error

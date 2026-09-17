@@ -2,7 +2,7 @@
 
 将已授权的 WorkBuddy / CodeBuddy 账号接入 OpenAI 兼容接口的自托管网关，支持账号池、流式响应、工具调用和 API key 管理。
 
-本仓库基于 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 二次开发，保留上游 MIT 许可证。Web 管理台独立维护于 [workbuddy2api-panel](https://github.com/dddmiku/workbuddy2api-panel)。
+本仓库基于 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 二次开发，保留上游 MIT 许可证。网关与 Web 管理台（`panel/`）在同一个仓库、同一个 Compose 项目里发布，部署一次即可。
 
 ## 功能
 
@@ -11,6 +11,8 @@
 - 保留业务文本、代码、编号和工具参数；正确区分完成、截断和上游错误。
 - 支持多账号调度、会话粘性、限流冷却、并发额度与凭据刷新。
 - 支持持久化多 API key，创建、启停和删除即时生效。
+- API key 可绑定模型白名单，越界模型在选号前被拒。
+- 内置网页管理台：账号、API key、排程任务、容器日志，随网关一起启动。
 - 提供账号状态、任务查询、任务日志和定时任务控制接口。
 
 ## 环境要求
@@ -63,9 +65,19 @@ sudo docker compose run --rm --entrypoint /bin/bash wb2api /app/login.sh --realm
 ```bash
 sudo docker compose up -d
 curl -sS http://127.0.0.1:7863/healthz
+curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:7864/login   # 管理台登录页，应返回 200
 ```
 
-默认只绑定宿主机 `127.0.0.1:7863`。远程访问应通过自己的 HTTPS 反向代理。
+默认只绑定宿主机回环地址：网关 `127.0.0.1:7863`、管理台 `127.0.0.1:7864`。远程访问应通过自己的 HTTPS 反向代理。
+
+`docker compose up -d` 会同时启动 `wb2api` 与 `wb2api-admin` 两个容器。管理台首次启动后按需初始化管理员账号（没有可继承的旧口令时，随机初始密码写入 `panel-data/initial-password.txt`）：
+
+```bash
+sudo docker compose exec wb2api-admin python3 -c 'import sys; sys.path.insert(0,"/app"); import app; app.load_credentials()'
+cat panel-data/initial-password.txt
+```
+
+管理台的反向代理、端口与独立部署方式见 [管理台部署](docs/panel.md)。
 
 以后添加或调整账号文件后，执行 `sudo docker compose restart wb2api` 重新加载。账号目录不支持热加载。
 
@@ -94,7 +106,7 @@ curl -sS http://127.0.0.1:7863/v1/responses \
 
 ## API key 管理
 
-Web 页面由 [独立管理台](https://github.com/dddmiku/workbuddy2api-panel) 提供，本仓库的 Compose 仅启动网关。
+Web 页面由本仓库 `panel/` 提供的管理台承载，随 Compose 一起启动，访问 `http://127.0.0.1:7864/admin/#keys`（经反向代理时前缀由自己决定）。
 
 在 `config.json` 中启用持久化密钥库：
 
@@ -105,13 +117,13 @@ Web 页面由 [独立管理台](https://github.com/dddmiku/workbuddy2api-panel) 
 }
 ```
 
-把上述字段合并到已有配置后重启网关，再按管理台说明安装面板。
+把上述字段合并到已有配置后重启网关。管理台只通过本机 Unix socket 管理密钥，不经过普通调用密钥。
 
 - 首次创建密钥库时，现有 `api_key` 自动迁移，原有客户端可以继续使用。
 - 密钥库建立后以库内状态为准；修改 `api_key` 不会重置或绕过密钥库。
 - 列表只展示掩码；新密钥的完整值仅在创建时显示。
 - 禁用或删除立即生效；空密钥库拒绝所有普通 HTTP 鉴权。
-- 管理接口仅经本机 Unix socket 提供，不使用普通调用密钥进行管理。
+- 每个密钥可以绑定模型白名单（例如只允许 `cn:deepseek-v4.1-flash`）。绑定后越界模型返回 `403 model_not_allowed`，`GET /v1/models` 也只列出可用模型；留空表示不限制。
 
 配置和目录权限详见 [配置说明](docs/configuration.md)。
 
@@ -146,6 +158,7 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o wb2api ./cmd/server
 ```text
 cmd/                  网关及登录、积分、任务命令
 internal/             请求转换、上游访问、账号池与密钥管理
+panel/                随仓库发布的 Web 管理台（Python 标准库 + 单文件前端）
 scripts/              辅助任务脚本
 docs/                 配置和客户端文档
 examples/             可复用的客户端说明

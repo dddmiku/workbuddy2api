@@ -10,6 +10,7 @@
 | 图片输入 | 支持相关内容块转换，受出站图片预算影响 |
 | function 工具 | 支持调用与结果往返 |
 | custom 工具 | 桥接为函数参数，输出还原为 custom 调用 |
+| namespace 工具分组 | 展开为出站函数（`命名空间__工具名`），回程还原 `name` + `namespace` |
 | `reasoning.effort` / `summary` | 转发；具体档位按模型能力处理 |
 | `parallel_tool_calls` | 保留；显式禁止并行时检查返回结果 |
 | `prompt_cache_key` | 保留，不等于服务端保存会话内容 |
@@ -47,6 +48,16 @@ JSON Schema 校验针对最终文本输出，允许先完成工具调用。外�
 | `rate_limit_exceeded` | 账号或模型限流，需要等待恢复 |
 
 渠道拒绝与内容拒绝是不同原因，不能通过错误码 `11128` 单独判断。网关不会因这类请求错误替换用户正文或修改其他会话的系统指令。
+
+## 命名空间工具
+
+新版 Codex 会把 MCP 与内部工具按 `tools[].type="namespace"` 分组上报。网关把分组内的 function/custom 工具展开成上游可用的扁平函数名（`mcp__node_repl__js` 这种三段式），并在返回工具调用时还原成客户端要的形状：
+
+```json
+{"type":"function_call","name":"js","namespace":"mcp__node_repl","call_id":"call_1","arguments":"{\"code\":\"1+1\"}"}
+```
+
+历史里的 `function_call` / `custom_tool_call` 也会按同样规则折回扁平名，模型看到的调用名前后一致。分组内允许 function 与 custom，不允许继续嵌套命名空间；`/v1/chat/completions` 不接受命名空间工具。
 
 ## 验证范围
 

@@ -56,3 +56,7 @@ SPEC.md
 **/*-wire-*.request.json
 /trial_bin
 /activity_bin
+
+# Admin panel runtime data and bytecode
+/panel-data/
+/panel/__pycache__/

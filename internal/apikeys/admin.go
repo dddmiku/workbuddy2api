@@ -1,5 +1,6 @@
 // ═══ 更新日志 ═══
 // 2026-09-16：增加仅通过本机 Unix socket 访问的密钥管理接口，避免把管理能力暴露给普通调用密钥。
+// 2026-09-17：管理接口支持模型绑定字段，与密钥库校验保持一致。
 package apikeys
 
 import (
@@ -21,13 +22,14 @@ func (s *Store) AdminHandler() http.Handler {
 	})
 	mux.HandleFunc("POST /keys", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			Name string `json:"name"`
-			Note string `json:"note"`
+			Name   string   `json:"name"`
+			Note   string   `json:"note"`
+			Models []string `json:"models"`
 		}
 		if !readBody(w, r, &body) {
 			return
 		}
-		entry, key, err := s.Create(body.Name, body.Note)
+		entry, key, err := s.Create(body.Name, body.Note, body.Models)
 		if err != nil {
 			replyError(w, err)
 			return
@@ -36,18 +38,19 @@ func (s *Store) AdminHandler() http.Handler {
 	})
 	mux.HandleFunc("PATCH /keys/{id}", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			Name    *string `json:"name"`
-			Note    *string `json:"note"`
-			Enabled *bool   `json:"enabled"`
+			Name    *string   `json:"name"`
+			Note    *string   `json:"note"`
+			Enabled *bool     `json:"enabled"`
+			Models  *[]string `json:"models"`
 		}
 		if !readBody(w, r, &body) {
 			return
 		}
-		if body.Name == nil && body.Note == nil && body.Enabled == nil {
+		if body.Name == nil && body.Note == nil && body.Enabled == nil && body.Models == nil {
 			reply(w, 400, map[string]any{"ok": false, "message": "没有要修改的字段"})
 			return
 		}
-		entry, err := s.Update(r.PathValue("id"), body.Name, body.Note, body.Enabled)
+		entry, err := s.Update(r.PathValue("id"), body.Name, body.Note, body.Enabled, body.Models)
 		if err != nil {
 			replyError(w, err)
 			return
@@ -91,6 +94,9 @@ func replyError(w http.ResponseWriter, err error) {
 		code = 404
 		message = err.Error()
 	case errors.Is(err, ErrInvalid):
+		code = 400
+		message = err.Error()
+	case errors.Is(err, ErrInvalidModels):
 		code = 400
 		message = err.Error()
 	case errors.Is(err, ErrLimit):
