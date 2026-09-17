@@ -17,7 +17,7 @@
 
 ## 环境要求
 
-推荐在 Linux 上使用 Docker Engine 与 Docker Compose v2。源码运行需要 Go 1.23 或更新版本；登录脚本另需 Bash、Python 3。
+推荐在 Linux 上使用 Docker Engine 与 Docker Compose v2。直接拉取已发布镜像不需要 Go 工具链；从源码构建需要 Go 1.23 或更新版本。登录脚本另需 Bash、Python 3。
 
 需要至少一个本人有权使用的上游账号。模型、额度和客户端是否可用由上游决定，本项目不保证所有客户端都能直接接入。
 
@@ -47,6 +47,19 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
 sudo install -d -o 10001 -g 10001 -m 700 auths data
 sudo chown 10001:10001 config.json
 sudo chmod 600 config.json
+```
+
+镜像已经发布在 ghcr.io，支持 `linux/amd64` 与 `linux/arm64`。不想在本机构建时，跳过下面的 `docker compose build`，改为拉取镜像：
+
+```bash
+sudo docker compose -f docker-compose.published.yml pull
+```
+
+需要固定版本时，把 `docker-compose.published.yml` 里的 `:latest` 换成[发布页](https://github.com/dddmiku/workbuddy2api/releases)上的版本号，例如 `:v1.1.0`。断网或 NAS 环境可以改用 Release 附件里的 `wb2api-amd64.tar.gz`（网关）和 `wb2api-admin-amd64.tar.gz`（管理台）离线导入。走镜像部署时，本文后续所有 `docker compose <子命令>` 都加上 `-f docker-compose.published.yml`。
+
+在本机构建则执行：
+
+```bash
 sudo docker compose build
 ```
 
@@ -67,6 +80,8 @@ sudo docker compose up -d
 curl -sS http://127.0.0.1:7863/healthz
 curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:7864/login   # 管理台登录页，应返回 200
 ```
+
+用已发布镜像时把上面三条里的 `docker compose` 换成 `docker compose -f docker-compose.published.yml`，端口、卷和健康检查与源码部署相同。
 
 默认只绑定宿主机回环地址：网关 `127.0.0.1:7863`、管理台 `127.0.0.1:7864`。远程访问应通过自己的 HTTPS 反向代理。
 
