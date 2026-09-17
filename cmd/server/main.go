@@ -392,7 +392,13 @@ func main() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), wait)
 		defer cancel()
 		shutdownAdmin(shutdownCtx)
+		// 用量账本必须在在途请求跑完之后再收：它记的是请求完成那一刻的 token，
+		// 提前 Close 会让交接时正在流式输出的那条请求直接不计入统计。
+		// （上面的 store.Close 是账号池镜像，不是用量账本；Store 的 Close 可重复调用。）
 		_ = srv.Shutdown(shutdownCtx)
+		if usageStore != nil {
+			_ = usageStore.Close()
+		}
 		if reason != "signal" {
 			// 约定退出码：容器 PID 1 看到它就不再拉起新实例（套接字已在别人手里），
 			// 但保持容器存活。
