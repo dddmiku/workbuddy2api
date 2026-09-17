@@ -45,6 +45,11 @@ const sseOK = "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\"
 	"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n" +
 	"data: [DONE]\n\n"
 
+// sseCacheHit 上游在思考模式下重发整段上下文时的典型末帧：输入 5000 token 里 4096 命中缓存。
+const sseCacheHit = "data: {\"id\":\"chatcmpl-cache\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"deepseek-v4.1-flash\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"}}]}\n\n" +
+	"data: {\"id\":\"chatcmpl-cache\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"deepseek-v4.1-flash\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5000,\"completion_tokens\":120,\"total_tokens\":5120,\"prompt_cache_hit_tokens\":4096}}\n\n" +
+	"data: [DONE]\n\n"
+
 // newFakeUpstream 返回一个 ChatStream 走 fake 的 upstream.Client。
 // fake 依据 Authorization 头决定行为。
 func newFakeUpstream(t *testing.T, behavior func(auth string) (status int, body string, isStream bool)) *upstream.Client {

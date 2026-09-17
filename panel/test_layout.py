@@ -35,10 +35,11 @@ class TableAlignmentTests(unittest.TestCase):
 
     def test_numeric_headers_use_right_class(self):
         body = read_source("body.html")
-        for header in ("TTFB", "tok", "tok/s", "total"):
+        # 日志页的 token 列：输入 / 缓存命中 / 输出（tok 改名为输出，语义不变）。
+        for header in ("TTFB", "输入", "缓存命中", "输出", "tok/s", "total"):
             with self.subTest(header=header):
                 self.assertIn('<th class="r">%s</th>' % header, body)
-        for header in ("请求", "输入 tokens", "输出 tokens", "合计 tokens"):
+        for header in ("请求", "输入 tokens", "缓存命中", "输出 tokens", "合计 tokens"):
             with self.subTest(header=header):
                 self.assertIn('<th class="r">%s</th>' % header, body)
 

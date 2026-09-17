@@ -62,10 +62,12 @@ COOKIE_NAME = "wb2a_admin"
 CONTAINER = os.environ.get("WB2API_CONTAINER", "workbuddy2api")
 
 # 网关请求行（logging.go 的表格日志）：
-# | #012 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | TTFB=3414ms | tok=110 | 34.3tok/s | total=3.4s |
+# | #012 | 22:04:21 | global:deep | stream | 200 | key=团队 A | uid=1e04e34d | TTFB=3414ms | in=306401 | hit=298112 | tok=110 | 34.3tok/s | total=3.4s |
+# in=/hit= 是 2026-09-18 新增列（输入 tokens 与其中缓存命中数）；旧行没有这两列，正则按可选取。
 REQUEST_ROW = re.compile(
     r"^\|\s*#(?P<seq>\d+)\s*\|\s*(?P<time>[^|]*?)\s*\|\s*(?P<model>[^|]*?)\s*\|\s*(?P<mode>[^|]*?)\s*\|\s*"
     r"(?P<status>\d+)\s*\|\s*(?:key=(?P<key>[^|]*?)\s*\|\s*)?uid=(?P<uid>[^|]*?)\s*\|\s*TTFB=(?P<ttfb>[^|]*?)\s*\|\s*"
+    r"(?:in=(?P<in>[^|]*?)\s*\|\s*hit=(?P<hit>[^|]*?)\s*\|\s*)?"
     r"tok=(?P<tok>[^|]*?)\s*\|\s*(?P<rate>[^|]*?)\s*\|\s*total=(?P<total>[^|]*?)\s*\|\s*$"
 )
 
@@ -81,6 +83,8 @@ def parse_request_log(text):
             continue
         item = match.groupdict()
         item["key"] = (item["key"] or "").strip() or "-"
+        for field in ("in", "hit"):
+            item[field] = (item.get(field) or "").strip() or "-"
         rows.append(item)
     return rows, other[-60:]
 GATEWAY = os.environ.get("WB2API_GATEWAY_URL", "http://127.0.0.1:7863")

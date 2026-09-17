@@ -4,6 +4,8 @@
 // 2026-09-17：锁定跨进程可见性：另一个进程落盘的记录要立刻出现在本进程快照里，
 //
 //	且不会因为"把它算成自己的增量"而重复计数。
+//
+// 2026-09-18：锁定缓存命中输入维度能穿过「盘上 + 本方增量」合并与重开恢复（曾因子段枚举漏写而丢）。
 package usage
 
 import (
@@ -24,10 +26,10 @@ func TestRecordAccumulatesPerKeyAndPerModel(t *testing.T) {
 	defer store.Close()
 
 	at := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
-	store.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:deepseek-v4.1-flash", 100, 40, 0.5, true, at)
-	store.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:glm-5.2", 10, 5, 0, false, at.Add(time.Minute))
-	store.Record("key_b", "团队 B", "wb2a_ef…gh", "cn:deepseek-v4.1-flash", 7, 3, 0, false, at)
-	store.Record("", "", "", "cn:deepseek-v4.1-flash", 1, 1, 0, false, at)
+	store.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:deepseek-v4.1-flash", 100, 40, 0, 0.5, true, at)
+	store.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:glm-5.2", 10, 5, 0, 0, false, at.Add(time.Minute))
+	store.Record("key_b", "团队 B", "wb2a_ef…gh", "cn:deepseek-v4.1-flash", 7, 3, 0, 0, false, at)
+	store.Record("", "", "", "cn:deepseek-v4.1-flash", 1, 1, 0, 0, false, at)
 
 	snapshot := store.Snapshot()
 	if snapshot.Totals.Requests != 4 {
@@ -68,7 +70,7 @@ func TestFlushAndReload(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	at := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
-	store.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:deepseek-v4.1-flash", 100, 40, 0, false, at)
+	store.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:deepseek-v4.1-flash", 100, 40, 0, 0, false, at)
 	if err := store.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -99,6 +101,43 @@ func TestFlushAndReload(t *testing.T) {
 	}
 }
 
+// TestCachedTokensSurviveMergeAndReload 缓存命中维度必须和其它维度一样，穿过快照合并、
+// 落盘与重开恢复。快照合并按字段枚举，漏写新字段会让页面上永远显示 0。
+func TestCachedTokensSurviveMergeAndReload(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "usage.json")
+	store, err := Open(path, time.Hour)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	at := time.Date(2026, 9, 18, 3, 0, 0, 0, time.UTC)
+	// 5000 输入里 4096 命中缓存：这正是思考模式每轮重发整段上下文的典型形状。
+	store.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:deepseek-v4.1-flash", 5000, 120, 4096, 0, false, at)
+
+	snapshot := store.Snapshot()
+	if snapshot.Totals.CachedTokens != 4096 {
+		t.Fatalf("snapshot cached = %d want 4096（合并路径丢了缓存字段）", snapshot.Totals.CachedTokens)
+	}
+	if len(snapshot.Keys) != 1 || snapshot.Keys[0].Totals.CachedTokens != 4096 ||
+		len(snapshot.Keys[0].Models) != 1 || snapshot.Keys[0].Models[0].Totals.CachedTokens != 4096 {
+		t.Fatalf("per-key/per-model cached lost: %+v", snapshot.Keys)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	reopened, err := Open(path, time.Hour)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	restored := reopened.Snapshot()
+	if restored.Totals.CachedTokens != 4096 || restored.Totals.PromptTokens != 5000 {
+		t.Fatalf("reloaded cached = %d prompt = %d want 4096 / 5000",
+			restored.Totals.CachedTokens, restored.Totals.PromptTokens)
+	}
+}
+
 func TestRecordAfterCloseIsIgnored(t *testing.T) {
 	dir := t.TempDir()
 	store, err := Open(filepath.Join(dir, "usage.json"), time.Hour)
@@ -108,7 +147,7 @@ func TestRecordAfterCloseIsIgnored(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	store.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:deepseek-v4.1-flash", 10, 10, 0, false, time.Now())
+	store.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:deepseek-v4.1-flash", 10, 10, 0, 0, false, time.Now())
 	if got := store.Snapshot().Totals.Requests; got != 0 {
 		t.Fatalf("requests after close = %d want 0", got)
 	}
@@ -121,7 +160,7 @@ func TestResetClearsCounters(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	defer store.Close()
-	store.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:deepseek-v4.1-flash", 5, 5, 0, false, time.Now())
+	store.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:deepseek-v4.1-flash", 5, 5, 0, 0, false, time.Now())
 	if err := store.Reset(time.Now()); err != nil {
 		t.Fatalf("reset: %v", err)
 	}
@@ -148,12 +187,12 @@ func TestConcurrentStoresMergeInsteadOfOverwrite(t *testing.T) {
 	defer newProcess.Close()
 
 	at := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
-	oldProcess.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:deepseek-v4.1-flash", 100, 40, 1.5, true, at)
+	oldProcess.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:deepseek-v4.1-flash", 100, 40, 0, 1.5, true, at)
 	if err := oldProcess.Flush(); err != nil {
 		t.Fatalf("old flush: %v", err)
 	}
 	// 新进程在旧进程落盘之后才写：磁盘上已经有 key_a 的 140 token。
-	newProcess.Record("key_b", "团队 B", "wb2a_ef…gh", "global:deepseek-v4.1-flash", 7, 3, 0, false, at.Add(time.Minute))
+	newProcess.Record("key_b", "团队 B", "wb2a_ef…gh", "global:deepseek-v4.1-flash", 7, 3, 0, 0, false, at.Add(time.Minute))
 	if err := newProcess.Flush(); err != nil {
 		t.Fatalf("new flush: %v", err)
 	}
@@ -214,7 +253,7 @@ func TestSnapshotSeesOtherProcessRecords(t *testing.T) {
 		t.Fatalf("open other: %v", err)
 	}
 	at := time.Date(2026, 9, 17, 16, 25, 0, 0, time.UTC)
-	other.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:deepseek-v4.1-flash", 308, 7948, 0, false, at)
+	other.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:deepseek-v4.1-flash", 308, 7948, 0, 0, false, at)
 	if err := other.Flush(); err != nil {
 		t.Fatalf("other flush: %v", err)
 	}
@@ -231,7 +270,7 @@ func TestSnapshotSeesOtherProcessRecords(t *testing.T) {
 	}
 
 	// 本进程再记一笔并落盘：盘上应是两笔之和，且不会把对方那笔重复计入。
-	idle.Record("key_b", "团队 B", "wb2a_ef…gh", "cn:deepseek-v4.1-flash", 10, 20, 0, false, at.Add(time.Minute))
+	idle.Record("key_b", "团队 B", "wb2a_ef…gh", "cn:deepseek-v4.1-flash", 10, 20, 0, 0, false, at.Add(time.Minute))
 	if err := idle.Flush(); err != nil {
 		t.Fatalf("idle flush: %v", err)
 	}
@@ -269,7 +308,7 @@ func TestMergeFromDiskSurvivesBrokenLedger(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	defer store.Close()
-	store.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:deepseek-v4.1-flash", 5, 5, 0, false, time.Now())
+	store.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:deepseek-v4.1-flash", 5, 5, 0, 0, false, time.Now())
 	// 另一个进程写了一半就被杀掉：盘上是半截 JSON。
 	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
 		t.Fatalf("seed broken ledger: %v", err)

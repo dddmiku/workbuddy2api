@@ -1,5 +1,6 @@
 // ═══ 更新日志 ═══
 // 2026-09-17：锁定按调用密钥记账、请求行带 key= 列，以及 /usage 只走本机管理通道。
+// 2026-09-18：新增缓存命中输入（prompt_cache_hit_tokens）记账与 in=/hit= 日志列的端到端断言。
 package server
 
 import (
@@ -80,7 +81,7 @@ func TestUsageCountsPerKeyFromUpstreamUsage(t *testing.T) {
 
 func TestUsageEndpointIsInternalOnly(t *testing.T) {
 	handler, key, ledger := usageLedgerHandler(t)
-	ledger.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:deepseek-v4.1-flash", 10, 5, 0, false, time.Now())
+	ledger.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:deepseek-v4.1-flash", 10, 5, 4, 0, false, time.Now())
 
 	// 公开端口：即使带合法调用密钥也不放行全量用量。
 	recorder := httptest.NewRecorder()
@@ -98,9 +99,42 @@ func TestUsageEndpointIsInternalOnly(t *testing.T) {
 		t.Fatalf("internal /usage status=%d body=%s", internal.Code, internal.Body)
 	}
 	body := internal.Body.String()
-	for _, want := range []string{`"ok":true`, `"keys"`, `key_a`, `cn:deepseek-v4.1-flash`, `"totals"`} {
+	for _, want := range []string{`"ok":true`, `"keys"`, `key_a`, `cn:deepseek-v4.1-flash`, `"totals"`, `"cached_tokens":4`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("/usage payload missing %q:\n%s", want, body)
+		}
+	}
+}
+
+// TestUsageRecordsCachedPromptTokens 上游在思考模式下每轮重发整段上下文，
+// 输入里绝大部分命中提示缓存；账本必须单独记下这个维度，否则页面上只剩一个巨大的输入数。
+func TestUsageRecordsCachedPromptTokens(t *testing.T) {
+	withChatLog(t)
+	handler, key, ledger := usageLedgerHandler(t)
+	// 覆盖 upstream 侧的假 SSE：带 prompt_cache_hit_tokens 的末帧 usage。
+	handler.cfg.Upstream = newFakeUpstream(t, func(string) (int, string, bool) {
+		return http.StatusOK, sseCacheHit, true
+	})
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"cn:deepseek-v4.1-flash","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	request.Header.Set("Authorization", "Bearer "+key)
+	out := captureStdout(t, func() { handler.ServeHTTP(recorder, request) })
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("chat status=%d body=%s", recorder.Code, recorder.Body)
+	}
+	snapshot := ledger.Snapshot()
+	totals := snapshot.Totals
+	if totals.Requests != 1 || totals.PromptTokens != 5000 || totals.CompletionTokens != 120 ||
+		totals.CachedTokens != 4096 {
+		t.Fatalf("totals = %+v want 1 request / 5000 prompt / 4096 cached / 120 completion", totals)
+	}
+	if len(snapshot.Keys) != 1 || snapshot.Keys[0].Totals.CachedTokens != 4096 {
+		t.Fatalf("per-key cached tokens missing: %+v", snapshot.Keys)
+	}
+	for _, want := range []string{"in=5000", "hit=4096", "tok=120"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("请求行缺少 %q:\n%s", want, out)
 		}
 	}
 }

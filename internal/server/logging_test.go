@@ -198,10 +198,12 @@ func TestUIDPrefix(t *testing.T) {
 func TestLogChatRowFormat(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", "00e26541abcdef", http.StatusOK, 1234, "团队 A")
+		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", "00e26541abcdef", http.StatusOK,
+			306401, 298112, 1234, "团队 A")
 	})
 	for _, want := range []string{
-		"| #", "deepseek-v4", "| stream |", "| 200 |", "key=团队 A", "uid=00e26541", "TTFB=412ms", "tok=1234", "tok/s |", "total=",
+		"| #", "deepseek-v4", "| stream |", "| 200 |", "key=团队 A", "uid=00e26541", "TTFB=412ms",
+		"in=306401", "hit=298112", "tok=1234", "tok/s |", "total=",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("row missing %q:\n%s", want, out)
@@ -215,9 +217,9 @@ func TestLogChatRowFormat(t *testing.T) {
 func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", http.StatusServiceUnavailable, -1, "-")
+		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", http.StatusServiceUnavailable, -1, -1, -1, "-")
 	})
-	for _, want := range []string{"key=-", "TTFB=-", "tok=-", "-tok/s", "| 503 |"} {
+	for _, want := range []string{"key=-", "TTFB=-", "in=-", "hit=-", "tok=-", "-tok/s", "| 503 |"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("row missing %q:\n%s", want, out)
 		}
@@ -227,8 +229,8 @@ func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 func TestLogChatRowSeqIncrements(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, "-")
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, "-")
+		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, 1, 1, "-")
+		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, 1, 1, "-")
 	})
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) != 2 {

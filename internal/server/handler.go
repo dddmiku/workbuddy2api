@@ -248,7 +248,7 @@ func (h *Handler) recordUsage(st *chatStat, model string) {
 	if h.cfg.Usage == nil || st == nil {
 		return
 	}
-	h.cfg.Usage.Record(st.keyID, st.keyName, st.keyMask, model, st.prompt, st.toks,
+	h.cfg.Usage.Record(st.keyID, st.keyName, st.keyMask, model, st.prompt, st.toks, st.cached,
 		st.credit, st.hasCred, time.Now())
 }
 
@@ -997,6 +997,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
 			st.prompt = stats.PromptTokens()
+			st.cached = stats.CachedTokens()
 			if streamErr != nil {
 				rc.Close()
 				if r.Context().Err() != nil {
@@ -1051,6 +1052,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
 		st.prompt = promptTokens(resp)
+		st.cached = cachedTokens(resp)
 		// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
 		if credit, total, ok := usageCreditTotal(resp); ok {
 			h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)

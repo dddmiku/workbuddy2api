@@ -2,6 +2,8 @@
 // ═══ 更新日志 ═══
 // 2026-09-17：新增用量统计页：总量卡片 + 按密钥明细 + 单密钥模型拆分，
 //             数据经本机管理通道读取网关记账（/usage）。
+// 2026-09-18：输入卡片补「其中缓存命中」说明并新增缓存命中卡片：思考模式每轮重发整段
+//             上下文，输入里大头是缓存命中；不单列会让人误以为"明明用得多却只记了这么点"。
 
 var US = {data: null, loading: false, error: '', open: {}};
 
@@ -29,12 +31,19 @@ function usageTime(value){
 
 function renderUsageTiles(totals){
   var t = totals || {};
+  var cached = Number(t.cached_tokens) || 0;
+  var prompt = Number(t.prompt_tokens) || 0;
+  var promptNote = exactTokens(t.prompt_tokens) + ' tokens';
+  if (cached > 0 && prompt > 0){
+    promptNote += '（缓存命中 ' + Math.round(cached / prompt * 100) + '%）';
+  }
   var tiles = [
     {k: '请求数', v: exactTokens(t.requests), s: '成功完成的调用'},
     {k: '合计 tokens', v: compactTokens(t.total_tokens), s: exactTokens(t.total_tokens) + ' tokens'},
-    {k: '输入 tokens', v: compactTokens(t.prompt_tokens), s: exactTokens(t.prompt_tokens) + ' tokens'},
-    {k: '输出 tokens', v: compactTokens(t.completion_tokens), s: exactTokens(t.completion_tokens) + ' tokens'}
+    {k: '输入 tokens', v: compactTokens(t.prompt_tokens), s: promptNote},
+    {k: '输出 tokens', v: compactTokens(t.completion_tokens), s: exactTokens(t.completion_tokens) + ' tokens（含思考）'}
   ];
+  if (cached > 0) tiles.push({k: '缓存命中输入', v: compactTokens(cached), s: exactTokens(cached) + ' tokens'});
   if (t.credit) tiles.push({k: '上游计费', v: String(t.credit), s: 'usage.credit 累计'});
   $('#usageTiles').innerHTML = tiles.map(function(tile){
     return '<div class="usage-tile"><div class="k">' + esc(tile.k) + '</div>' +
@@ -46,7 +55,7 @@ function renderUsageTiles(totals){
 function renderUsageRows(keys, totals){
   var rows = keys || [];
   if (!rows.length){
-    $('#usageRows').innerHTML = '<tr><td colspan="7"><div class="empty">还没有用量记录，客户端发一次请求后这里就有数据。</div></td></tr>';
+    $('#usageRows').innerHTML = '<tr><td colspan="8"><div class="empty">还没有用量记录，客户端发一次请求后这里就有数据。</div></td></tr>';
     return;
   }
   var max = 0;
@@ -63,16 +72,17 @@ function renderUsageRows(keys, totals){
     return '<tr>' +
       '<td><div class="usage-key"><b>' + name + '</b>' + mask +
         '<div class="usage-bar"><i style="width:' + share + '%"></i></div></div></td>' +
-      '<td class="num">' + esc(exactTokens(t.requests)) + '</td>' +
-      '<td class="num">' + esc(exactTokens(t.prompt_tokens)) + '</td>' +
-      '<td class="num">' + esc(exactTokens(t.completion_tokens)) + '</td>' +
+        '<td class="num">' + esc(exactTokens(t.requests)) + '</td>' +
+        '<td class="num">' + esc(exactTokens(t.prompt_tokens)) + '</td>' +
+        '<td class="num">' + esc(exactTokens(t.cached_tokens)) + '</td>' +
+        '<td class="num">' + esc(exactTokens(t.completion_tokens)) + '</td>' +
       '<td class="num">' + esc(exactTokens(t.total_tokens)) + '</td>' +
       '<td>' + esc(usageTime(item.last_used_at)) + '</td>' +
       '<td class="r">' + (models
         ? '<button class="btn sm" data-usage-toggle="' + esc(item.key_id) + '">' + (open ? '收起' : '按模型') + '</button>'
         : '<span class="sub">—</span>') + '</td>' +
       '</tr>' + (open && models
-        ? '<tr><td colspan="7"><ul class="usage-models">' + models + '</ul></td></tr>'
+        ? '<tr><td colspan="8"><ul class="usage-models">' + models + '</ul></td></tr>'
         : '');
   }).join('');
 }

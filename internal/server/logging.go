@@ -1,6 +1,10 @@
 // ═══ 更新日志 ═══
 // 2026-09-16：统计读取器保留底层错误，避免带末尾数据的断流被误报为正常 EOF。
 // 2026-09-17：请求行加 key= 列（调用方密钥身份），并带上 prompt/completion 明细供用量账本记账。
+// 2026-09-18：请求行加 in=（输入 tokens）与 hit=（其中缓存命中）两列，账本同步记录缓存维度：
+//
+//	思考模式下每轮都要重发整段上下文，只看 tok= 会让人觉得"用量明明很大却记了这么点"。
+//
 // logging.go 请求级表格日志：每个 /v1/chat/completions 请求结束后打印一行到 stdout。
 package server
 
@@ -37,6 +41,7 @@ type chatStat struct {
 	keyName  string
 	keyMask  string
 	prompt   int
+	cached   int // 输入里命中提示缓存的 token 数（<0 表示未知）
 	hasUsage bool
 	credit   float64
 	hasCred  bool
@@ -64,7 +69,8 @@ func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
 	if stream {
 		mode = "stream"
 	}
-	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1}
+	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1,
+		prompt: -1, cached: -1}
 }
 
 // done 幂等落一行表格日志。
@@ -73,7 +79,8 @@ func (s *chatStat) done() {
 		return
 	}
 	s.logged = true
-	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks, s.keyLabel())
+	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status,
+		s.prompt, s.cached, s.toks, s.keyLabel())
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -89,6 +96,7 @@ type chatStatsReader struct {
 	tokens    int
 	credit    float64 // 末帧 usage.credit（本次真实扣费，供成本账本）
 	prompt    int     // 末帧 usage.prompt_tokens（与 completion 合计折算单价）
+	cached    int     // usage.prompt_cache_hit_tokens / prompt_tokens_details.cached_tokens
 	pend      []byte  // 已读未返回的行缓存
 	readErr   error
 	dataParts []string
@@ -107,6 +115,16 @@ func (s *chatStatsReader) Tokens() (int, bool) { return s.tokens, s.hasUsage }
 
 // PromptTokens 返回末帧 usage.prompt_tokens（缺失为 0，与 completion 一起供用量账本累计）。
 func (s *chatStatsReader) PromptTokens() int { return s.prompt }
+
+// CachedTokens 返回末帧 usage 里「输入缓存命中」的 token 数。
+// 上游用 prompt_cache_hit_tokens 报这个值，OpenAI 形状的响应放在 prompt_tokens_details.cached_tokens；
+// 两者都没有时返回 -1（未知 ≠ 0，账本据此区分「没命中」与「没观测」）。
+func (s *chatStatsReader) CachedTokens() int {
+	if s.cached < 0 {
+		return -1
+	}
+	return s.cached
+}
 
 // Credit 返回末帧 usage.credit（本次真实扣费）。ok=true 要求 usage 存在**且** credit
 // 字段显式出现——字段缺失时 ok=false（缺失≠0：不能把"缺观测"当"0 成本"写入账本，
@@ -141,6 +159,10 @@ func (s *chatStatsReader) parseSSELine(line string) {
 			CompletionTokens int      `json:"completion_tokens"`
 			PromptTokens     int      `json:"prompt_tokens"`
 			Credit           *float64 `json:"credit"` // 指针区分「缺失」与「显式 0」
+			CacheHitTokens   *int     `json:"prompt_cache_hit_tokens"`
+			PromptDetails    *struct {
+				CachedTokens *int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
@@ -149,6 +171,11 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	s.hasUsage = true
 	s.tokens = chunk.Usage.CompletionTokens
 	s.prompt = chunk.Usage.PromptTokens
+	if chunk.Usage.CacheHitTokens != nil {
+		s.cached = *chunk.Usage.CacheHitTokens
+	} else if chunk.Usage.PromptDetails != nil && chunk.Usage.PromptDetails.CachedTokens != nil {
+		s.cached = *chunk.Usage.PromptDetails.CachedTokens
+	}
 	if chunk.Usage.Credit != nil {
 		s.hasCredit = true
 		s.credit = *chunk.Usage.Credit
@@ -219,6 +246,24 @@ func promptTokens(resp map[string]any) int {
 	return int(v)
 }
 
+// cachedTokens 从聚合响应提取输入缓存命中数：优先上游的 prompt_cache_hit_tokens，
+// 其次 OpenAI 形状的 prompt_tokens_details.cached_tokens；都缺失返回 -1（缺失≠0）。
+func cachedTokens(resp map[string]any) int {
+	u, ok := resp["usage"].(map[string]any)
+	if !ok {
+		return -1
+	}
+	if v, ok := u["prompt_cache_hit_tokens"].(float64); ok {
+		return int(v)
+	}
+	if details, ok := u["prompt_tokens_details"].(map[string]any); ok {
+		if v, ok := details["cached_tokens"].(float64); ok {
+			return int(v)
+		}
+	}
+	return -1
+}
+
 // usageCreditTotal 从聚合响应提取本次真实扣费与总 token 数（供成本账本）。
 // ok=false 表示 usage 缺失或字段类型不符——此时不记录观测，避免污染账本。
 func usageCreditTotal(resp map[string]any) (credit float64, total int, ok bool) {
@@ -247,8 +292,10 @@ func uidPrefix(uid string) string {
 }
 
 // logChatRow 打印一行请求级表格日志（直接输出 stdout，无 log 时间戳前缀）。
-// toks<0 表示 usage 缺失，显示 "-"。
-func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, toks int, key string) {
+//
+// 三个 token 列都是「上游 usage 原值」：in= 输入、hit= 输入里命中缓存的、
+// tok= 输出（含思考 token）。负值表示上游没给 usage，显示 "-"（缺失≠0）。
+func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, prompt, cached, toks int, key string) {
 	if !chatLogEnabled {
 		return
 	}
@@ -270,7 +317,15 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, toks
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
 	}
-	fmt.Fprintf(os.Stdout, "| #%03d | %s | %s | %s | %d | key=%s | uid=%s | TTFB=%s | tok=%s | %stok/s | total=%.1fs |\n",
+	promptField := "-"
+	if prompt >= 0 {
+		promptField = fmt.Sprintf("%d", prompt)
+	}
+	cachedField := "-"
+	if cached >= 0 {
+		cachedField = fmt.Sprintf("%d", cached)
+	}
+	fmt.Fprintf(os.Stdout, "| #%03d | %s | %s | %s | %d | key=%s | uid=%s | TTFB=%s | in=%s | hit=%s | tok=%s | %stok/s | total=%.1fs |\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
@@ -279,6 +334,8 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, toks
 		key,
 		uidPrefix(uid),
 		ttfbMS,
+		promptField,
+		cachedField,
 		tokField,
 		tokpsField,
 		total.Seconds(),

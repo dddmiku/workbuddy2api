@@ -10,6 +10,9 @@
 // 2026-09-17：改为「基线 + 本方增量」并在文件锁内读改写。取最大值只在两侧看到同一批
 //
 //	记录时才对；两个进程各自服务不同请求时取大会丢掉一方记的请求，改增量后可累加。
+//
+// 2026-09-18：新增缓存命中输入维度（CachedTokens）。思考模式下每轮重发整段上下文，
+// 输入里绝大部分是缓存命中；不单列出来，看总数会误以为「用了很多却只记了这么点」。
 package usage
 
 import (
@@ -37,21 +40,26 @@ const defaultFlushInterval = 5 * time.Second
 type Totals struct {
 	Requests         int64   `json:"requests"`
 	PromptTokens     int64   `json:"prompt_tokens"`
+	CachedTokens     int64   `json:"cached_tokens"`
 	CompletionTokens int64   `json:"completion_tokens"`
 	TotalTokens      int64   `json:"total_tokens"`
 	Credit           float64 `json:"credit"`
 }
 
-// add 把一次请求计入累计量。
-func (t *Totals) add(prompt, completion int, credit float64, hasCredit bool) {
+// add 把一次请求计入累计量。prompt/completion/cached 为负表示上游没有该项观测（缺失≠0）。
+func (t *Totals) add(prompt, completion, cached int, credit float64, hasCredit bool) {
 	if prompt < 0 {
 		prompt = 0
 	}
 	if completion < 0 {
 		completion = 0
 	}
+	if cached < 0 {
+		cached = 0
+	}
 	t.Requests++
 	t.PromptTokens += int64(prompt)
+	t.CachedTokens += int64(cached)
 	t.CompletionTokens += int64(completion)
 	t.TotalTokens += int64(prompt + completion)
 	if hasCredit {
@@ -181,7 +189,7 @@ func (s *Store) load() error {
 
 // Record 记一次成功请求的用量。keyID 为空时归到 "legacy"（单密钥模式/内置密钥）。
 // model 为空时只计入密钥与总量维度。
-func (s *Store) Record(keyID, name, maskedKey, model string, prompt, completion int, credit float64, hasCredit bool, at time.Time) {
+func (s *Store) Record(keyID, name, maskedKey, model string, prompt, completion, cached int, credit float64, hasCredit bool, at time.Time) {
 	if s == nil {
 		return
 	}
@@ -217,8 +225,8 @@ func (s *Store) Record(keyID, name, maskedKey, model string, prompt, completion 
 		record.FirstUsedAt = at
 	}
 	record.LastUsedAt = at
-	record.Totals.add(prompt, completion, credit, hasCredit)
-	s.doc.Totals.add(prompt, completion, credit, hasCredit)
+	record.Totals.add(prompt, completion, cached, credit, hasCredit)
+	s.doc.Totals.add(prompt, completion, cached, credit, hasCredit)
 	s.doc.UpdatedAt = at
 	if strings.TrimSpace(model) != "" {
 		if record.Models == nil {
@@ -229,7 +237,7 @@ func (s *Store) Record(keyID, name, maskedKey, model string, prompt, completion 
 			counter = &Totals{}
 			record.Models[model] = counter
 		}
-		counter.add(prompt, completion, credit, hasCredit)
+		counter.add(prompt, completion, cached, credit, hasCredit)
 	}
 	s.dirty = true
 }
@@ -546,6 +554,7 @@ func deltaTotals(now, prev Totals) Totals {
 	return Totals{
 		Requests:         positive(now.Requests - prev.Requests),
 		PromptTokens:     positive(now.PromptTokens - prev.PromptTokens),
+		CachedTokens:     positive(now.CachedTokens - prev.CachedTokens),
 		CompletionTokens: positive(now.CompletionTokens - prev.CompletionTokens),
 		TotalTokens:      positive(now.TotalTokens - prev.TotalTokens),
 		Credit:           positiveFloat(now.Credit - prev.Credit),
@@ -557,6 +566,7 @@ func addTotals(base, delta Totals) Totals {
 	return Totals{
 		Requests:         base.Requests + delta.Requests,
 		PromptTokens:     base.PromptTokens + delta.PromptTokens,
+		CachedTokens:     base.CachedTokens + delta.CachedTokens,
 		CompletionTokens: base.CompletionTokens + delta.CompletionTokens,
 		TotalTokens:      base.TotalTokens + delta.TotalTokens,
 		Credit:           base.Credit + delta.Credit,
