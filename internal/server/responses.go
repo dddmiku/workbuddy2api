@@ -254,9 +254,18 @@ func responsesMessages(input json.RawMessage, instructions string, toolNames map
 	// 同一轮里连续的 function_call 必须并进同一条 assistant 消息的 tool_calls，
 	// 拆成多条 assistant 会被上游拒。
 	var pending []any
+	// pendingReasoning 攒住推理项文本，挂到紧随其后的 assistant 消息上。
+	// DeepSeek 思考模式要求把上一轮的 reasoning_content 原样带回，否则上游 11155
+	// （reasoning_content_missing）；丢历史推理内容这条老假设已被真实报错推翻。
+	pendingReasoning := ""
 	flush := func() {
 		if len(pending) > 0 {
-			msgs = append(msgs, map[string]any{"role": "assistant", "content": "", "tool_calls": pending})
+			message := map[string]any{"role": "assistant", "content": "", "tool_calls": pending}
+			if pendingReasoning != "" {
+				message["reasoning_content"] = pendingReasoning
+				pendingReasoning = ""
+			}
+			msgs = append(msgs, message)
 			pending = nil
 		}
 	}
@@ -316,7 +325,13 @@ func responsesMessages(input json.RawMessage, instructions string, toolNames map
 			})
 			continue
 		case "reasoning":
-			// 历史推理内容不回灌上游：上游不接受 reasoning item，且不影响后续回答正确性。
+			if text := responsesReasoningText(m); text != "" {
+				if pendingReasoning != "" {
+					pendingReasoning += "\n\n" + text
+				} else {
+					pendingReasoning = text
+				}
+			}
 			continue
 		}
 		role, _ := m["role"].(string)
@@ -328,10 +343,46 @@ func responsesMessages(input json.RawMessage, instructions string, toolNames map
 			continue
 		}
 		flush()
-		msgs = append(msgs, map[string]any{"role": role, "content": content})
+		message := map[string]any{"role": role, "content": content}
+		if role == "assistant" && pendingReasoning != "" {
+			message["reasoning_content"] = pendingReasoning
+			pendingReasoning = ""
+		}
+		msgs = append(msgs, message)
 	}
 	flush()
 	return msgs, nil
+}
+
+// responsesReasoningText 取 Responses 推理项里的可读推理文本。
+//
+// 客户端把上一轮的推理原样带回来，槽位是 summary[]（我们出站时写在 summary_text 里，
+// 见 reasoningItem）或 content[]（部分客户端/服务端形态）；两者都取，拼成一段。
+func responsesReasoningText(item map[string]any) string {
+	var parts []string
+	for _, key := range []string{"summary", "content"} {
+		if text, ok := item[key].(string); ok && strings.TrimSpace(text) != "" {
+			parts = append(parts, text)
+			continue
+		}
+		entries, _ := item[key].([]any)
+		for _, raw := range entries {
+			part, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if text, _ := part["text"].(string); strings.TrimSpace(text) != "" {
+				parts = append(parts, text)
+			}
+		}
+	}
+	if len(parts) == 0 {
+		// 少数客户端把原文直接放在 reasoning_content 字段上（非 Responses 标准字段）。
+		if text, _ := item["reasoning_content"].(string); strings.TrimSpace(text) != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n\n"))
 }
 
 // responsesContent 把 Responses 的 content（字符串或 part 数组）折成 chat 的 content。
