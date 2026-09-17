@@ -74,6 +74,32 @@ Cookie 路径固定为 `/admin/`，`proxy_pass` 结尾的斜杠不能省。站�
 | 查看容器日志 | 系统页 → 容器日志 |
 | 重启网关 | 系统页 → 重启服务 |
 
+## 面板内部接口
+
+前端只调用下列路径，经反向代理访问时统一带 `/admin` 前缀；除登录外都需要会话 Cookie。
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| GET | `/login` | 登录页 |
+| GET | `/`、`/index.html`、`/vendor/*` | 控制台资源，需登录 |
+| GET | `/api/session` | 当前登录身份 |
+| GET | `/api/state` | 账号状态；`refresh_credit=1` 触发积分刷新 |
+| GET | `/api/models` | 网关模型目录（不受调用密钥的模型绑定限制） |
+| GET | `/api/tasks`、`/api/task/log?key=` | 排程任务与单个任务日志 |
+| GET | `/api/logs?lines=` | 网关容器日志 |
+| GET | `/api/keys` | 密钥列表 |
+| POST | `/api/auth/login`、`/api/auth/logout`、`/api/auth/password` | 登录、退出、修改管理员账号 |
+| POST | `/api/login/start`、`/api/login/poll` | 上游账号授权 |
+| POST | `/api/account/toggle`、`/api/account/delete` | 账号开关、回收 |
+| POST | `/api/task/run`、`/api/task/toggle` | 任务运行、开关 |
+| POST | `/api/credit` | 刷新积分 |
+| POST | `/api/service/restart` | 重启网关容器 |
+| POST | `/api/keys`、`/api/keys/update`、`/api/keys/delete` | 密钥创建、修改（含 `models` 绑定）、删除 |
+
+密钥写接口需要登录 Cookie、`Content-Type: application/json` 与 `X-Admin-Request: 1`；携带 `Origin` 时必须与当前 Host 一致，请求体上限 8 KiB。
+
+页面检查用 GET；后端未实现 HEAD，`curl -I` 的结果不能用来判断页面是否可用。
+
 ## 排障
 
 | 现象 | 处理 |

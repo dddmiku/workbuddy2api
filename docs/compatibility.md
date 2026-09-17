@@ -43,6 +43,7 @@ JSON Schema 校验针对最终文本输出，允许先完成工具调用。外�
 | `request_body_too_large` | 入站请求超过配置上限 |
 | `upstream_invalid_request` | 上游拒绝请求参数；查看脱敏诊断 |
 | `upstream_channel_rejected` | 上游明确拒绝调用渠道 |
+| `upstream_waf_blocked` | 上游 WAF 按正文特征拦截（HTML/脚本或 SQL 样式文本），请求未到达模型 |
 | `content_blocked` | 上游内容策略拒绝 |
 | `context_length_exceeded` | 模型上下文超限 |
 | `rate_limit_exceeded` | 账号或模型限流，需要等待恢复 |
@@ -50,6 +51,8 @@ JSON Schema 校验针对最终文本输出，允许先完成工具调用。外�
 渠道拒绝与内容拒绝是不同原因，不能通过错误码 `11128` 单独判断。网关不会因这类请求错误替换用户正文或修改其他会话的系统指令。
 
 `upstream_channel_rejected` 的触发面已定位到系统说明，并收敛到一句：`Codex CLI is an open source project led by OpenAI.`。真实请求里移除全部工具声明仍然被拒，换成中性说明后立即通过；只删掉这一句、或把它改写成中性说法，整段 21026 字符的说明也能通过；单独的 `OpenAI` 一词（在说明里或在用户消息里）不触发。工具分组、模型名与用户消息不是触发点。网关保持正文原样，需要由客户端自带中性说明（见 [Codex 接入](codex.md)）；桌面版说明不含该句，CLI 默认说明含该句。
+
+`upstream_waf_blocked` 是上游 WAF 的判定结果，不是网关或账号故障。2026-09-17 实测（国际版 `www.workbuddy.ai`）：正文含 `<!DOCTYPE html>`、`<script>…</script>` 或 SQL 注入样式文本时返回 403 HTML 拦截页；同一账号发普通文本、纯 HTML 表格与长代码均通过。判定看正文、不看账号，因此网关把这类响应判为请求终态——不轮转账号，也不把拦截页 HTML 当作请求参数错误回显给调用方。
 
 ## 命名空间工具
 

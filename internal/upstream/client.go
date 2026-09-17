@@ -41,6 +41,7 @@ const (
 	ErrClient                         // 其他 4xx / 业务错误
 	ErrContextTooLong                 // 上下文超限（11115 prompt is too long）→ 请求终态，不轮转、透传原文
 	ErrChannelRejected                // 明确拒绝未批准的调用渠道：请求终态，不推断为内容违规
+	ErrUpstreamWAF                    // 上游 WAF 拦截页（403 HTML，按正文特征判定）：请求终态，不轮转、不回显 HTML
 )
 
 func (k ErrKind) String() string {
@@ -69,6 +70,8 @@ func (k ErrKind) String() string {
 		return "context_too_long"
 	case ErrChannelRejected:
 		return "channel_rejected"
+	case ErrUpstreamWAF:
+		return "upstream_waf"
 	default:
 		return "none"
 	}
@@ -175,6 +178,17 @@ var sessionDeadRule = errorRule{kind: ErrSessionDead, mode: matchExact, patterns
 // Classify 会先返回 ErrChannelRejected，不能据此给调用者安上内容违规原因。
 var contentBlockedRule = errorRule{kind: ErrContentBlocked, mode: matchLower, patterns: []string{
 	"blocked by security policy",
+}}
+
+// wafBlockRule 上游 WAF 拦截页特征：返回的是 HTML 页面而不是 JSON 信封。
+//
+// 2026-09-17 实测（国际版 www.workbuddy.ai，腾讯云 WAF）：请求正文含 `<!DOCTYPE html>`、
+// `<script>…</script>` 或 SQL 注入样式文本时返回 403 + 该页；纯 HTML 表格与长代码通过，
+// 说明判定看正文内容、不看账号。命中即请求终态（见 handler 对应分支）：
+// 换号同域同样被拦，且 HTML 页不能当作「请求参数被拒」回显给调用方。
+var wafBlockRule = errorRule{kind: ErrUpstreamWAF, mode: matchLower, patterns: []string{
+	"waf block page",
+	"waf-intl.qq.com",
 }}
 
 // contentBlockedClientMsg 内容拦截返回给调用方的固定文案。
@@ -463,6 +477,11 @@ func Classify(status int, body string) ErrKind {
 		return ErrChannelRejected
 	}
 	lower := strings.ToLower(body)
+	// 上游 WAF 拦截页先于内容/参数关键词判定：它既不是内容审核文案（不得归
+	// content_blocked），也不是请求参数错误（不得原样回显 HTML 给调用方）。
+	if wafBlockRule.hit(body, lower) {
+		return ErrUpstreamWAF
+	}
 	if hardRule.hit(body, lower) {
 		return ErrHardCredit
 	}

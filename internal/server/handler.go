@@ -751,6 +751,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = http.StatusBadRequest
 				return
 			}
+			// 上游 WAF 按请求正文特征拦截（XSS/SQL 规则），返回的是 HTML 拦截页而非 JSON。
+			// 判定看正文、不看账号：同域内换任何号都会撞同一条规则，因此请求终态——
+			// 不轮转、不罚账号，也不把 HTML 页当作「请求参数被拒」回显给调用方。
+			if kind == upstream.ErrUpstreamWAF {
+				fail(acct.UID)
+				writeOpenAIError(w, http.StatusBadRequest, "upstream_waf_blocked",
+					"upstream WAF blocked the request body before it reached the model "+
+						"(HTML doctype/script tags or SQL-looking text); remove that content and retry")
+				st.status = http.StatusBadRequest
+				return
+			}
 			// 上游内容拒绝属于当前请求；直接返回，不修改其他会话或替换正文重试。
 			if kind == upstream.ErrContentBlocked {
 				// 内容命中网关内容防火墙：立即回客户端，**不轮转**——换任何账号都会撞同一

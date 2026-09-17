@@ -1,0 +1,21 @@
+[Unit]
+Description=workbuddy2api account admin panel
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/workbuddy2api/panel
+Environment=WB2API_GATEWAY_DIR=/opt/workbuddy2api
+Environment=WB2API_ADMIN_DIR=/opt/workbuddy2api/panel-data
+Environment=WB2API_GATEWAY_URL=http://127.0.0.1:7863
+Environment=WB2API_CONTAINER=workbuddy2api
+ExecStart=/usr/bin/python3 /opt/workbuddy2api/panel/app.py
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wb2api-admin
+
+[Install]
+WantedBy=multi-user.target
