@@ -39,6 +39,8 @@ model = "cn:deepseek-v4.1-flash"
 model_provider = "workbuddy2api"
 model_reasoning_effort = "low"
 model_reasoning_summary = "concise"
+model_context_window = 1000000
+model_auto_compact_token_limit = 500000
 
 [model_providers.workbuddy2api]
 name = "workbuddy2api"
@@ -55,6 +57,19 @@ stream_idle_timeout_ms = 90000
 远程客户端把 `base_url` 换成自己的服务地址，模型名按 `/v1/models` 里实际可用的值填（国际版账号加 `global:` 前缀）。
 
 通过 `WORKBUDDY_API_KEY` 环境变量提供调用密钥，不把真实密钥提交到配置示例中。
+
+### 长会话必须把压缩阈值压在硬墙以内
+
+上游的用量由它自家分词器统计，报出来的 `input_tokens` 比真正参与 1,048,576 上限计算的那套分词器少约 37%。同一段时间的日志里，上报 663,178 与 668,228 的请求返回 200，紧随其后的请求被上游以 `prompt is too long: 1051642 tokens > 1048576 maximum` 拒绝。**换算成上报值，硬墙大约在 66.8 万。**
+
+Codex 默认按上下文窗口的比例决定何时压缩，比例落在这道墙之外，于是它不会提前压缩，而是一直发到上游返回 400 `context_length_exceeded`，用户看到的是一段"这个会话接不下去"的报错。把阈值显式压在墙以内即可：
+
+```toml
+model_context_window = 1000000
+model_auto_compact_token_limit = 500000
+```
+
+50 万上报值约合 79 万真实 token，给一整轮工具调用留出约 25 万真实 token 的余量。改完需要重启 Codex（或让 cc switch 重新写入 `config.toml`）才会生效，已经在跑的会话继续沿用启动时读到的旧阈值。
 
 ### 可选：用中性说明覆盖系统提示词
 
