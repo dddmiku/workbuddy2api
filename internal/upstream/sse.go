@@ -3,6 +3,7 @@
 // 2026-09-16：统一 SSE 事件解析与结束校验，保留上游错误并防止断流和残缺工具参数伪装成功。
 // 2026-09-16：将完整消息快照转成缺失增量并核对已有输出，区分工具参数暂缺、显式空串和类型错误。
 // 2026-09-17：合并 fork 的错误信封透传，保留完整诊断字段与数字字面量，同时维持 typed 失败终态。
+// 2026-09-18：拒绝错误形状的工具列表，并在流结束时校验工具终态确有调用，避免预告正文静默收尾。
 package upstream
 
 import (
@@ -318,6 +319,8 @@ func (c *streamChoice) observeOutput(output map[string]any, wholeMessage bool) (
 		if len(normalizedCalls) > 0 {
 			normalized["tool_calls"] = normalizedCalls
 		}
+	} else if value, exists := output["tool_calls"]; exists && value != nil {
+		return nil, &StreamError{Code: "upstream_parse", Message: "upstream tool_calls must be an array"}
 	}
 	if fn, ok := output["function_call"].(map[string]any); ok {
 		name, _ := fn["name"].(string)
@@ -420,6 +423,11 @@ func (s *streamState) end() error {
 		}
 		if err := choice.validateArguments(); err != nil {
 			return err
+		}
+		// A finish marker can precede late metadata. Enforce presence only at the
+		// response boundary, after all frames before DONE have been consumed.
+		if (choice.finishReason == "tool_calls" || choice.finishReason == "function_call") && len(choice.tools) == 0 && choice.function == nil {
+			return &StreamError{Code: "missing_tool_call", Message: "upstream ended with a tool finish reason but no tool call"}
 		}
 	}
 	if !hasResponse {

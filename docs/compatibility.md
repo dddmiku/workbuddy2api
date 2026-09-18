@@ -10,7 +10,7 @@
 | 图片输入 | 支持相关内容块转换，受出站图片预算影响 |
 | function 工具 | 支持调用与结果往返 |
 | custom 工具 | 桥接为函数参数，输出还原为 custom 调用 |
-| namespace 工具分组 | 展开为出站函数（`命名空间__工具名`），回程还原 `name` + `namespace` |
+| namespace 工具分组 | 展开为出站函数（`命名空间__工具名`），回程还原 `name` + `namespace`；保留子工具的扁平及嵌套 `function` 定义 |
 | `reasoning.effort` / `summary` | 转发；具体档位按模型能力处理 |
 | `parallel_tool_calls` | 保留；显式禁止并行时检查返回结果 |
 | `prompt_cache_key` | 保留，不等于服务端保存会话内容 |
@@ -35,6 +35,10 @@ JSON Schema 校验针对最终文本输出，允许先完成工具调用。外�
 - 输出上限或内容过滤截断：`response.incomplete`，携带 `incomplete_details`。
 - 上游流错误、意外结束或输出契约不满足：失败状态或相应 HTTP 错误。
 - 不完整的工具参数不会作为可执行的完整工具调用交付。
+- 工具结束原因（`tool_calls` / `function_call`）没有实际调用时，返回 `missing_tool_call` 失败，不能静默当作成功正文。
+- 非数组的 `tool_calls` 返回格式错误；`null` 和空数组配合正常文字结束仍可接受。
+
+`response.completed` 是响应的协议终态，不是整个用户任务的验收结论。工具调用与纯文字都可以有这个终态。模型用纯文字预告下一步却没有调用工具时，属于需要另行核对的提前收尾；网关的运行约定见 [Codex 接入](codex.md#预告文字与回合结束)。
 
 非流式请求由本地聚合上游 SSE。客户端取消、读取错误与格式错误保留其失败语义。
 
@@ -46,6 +50,7 @@ JSON Schema 校验针对最终文本输出，允许先完成工具调用。外�
 | `invalid_request` | 输入结构错误，或请求了尚未支持的能力 |
 | `request_body_too_large` | 入站请求超过配置上限 |
 | `upstream_invalid_request` | 上游拒绝请求参数；查看脱敏诊断 |
+| `missing_tool_call` | 上游声称以工具调用结束，但整个响应没有返回实际调用 |
 | `upstream_channel_rejected` | 上游明确拒绝调用渠道 |
 | `upstream_waf_blocked` | 上游 WAF 按正文特征拦截（HTML/脚本或 SQL 样式文本），请求未到达模型 |
 | `content_blocked` | 上游内容策略拒绝 |
@@ -123,7 +128,7 @@ Codex 在「先写一句话、再调工具」时，历史里是 `message` + `fun
 {"type":"function_call","name":"js","namespace":"mcp__node_repl","call_id":"call_1","arguments":"{\"code\":\"1+1\"}"}
 ```
 
-历史里的 `function_call` / `custom_tool_call` 也会按同样规则折回扁平名，模型看到的调用名前后一致。分组内允许 function 与 custom，不允许继续嵌套命名空间；`/v1/chat/completions` 不接受命名空间工具。
+历史里的 `function_call` / `custom_tool_call` 也会按同样规则折回扁平名，模型看到的调用名前后一致。分组内允许 function 与 custom，不允许继续嵌套命名空间；`/v1/chat/completions` 不接受命名空间工具。子函数既可以使用 Responses 的顶层 `name` / `parameters`，也可以使用 Chat 风格的 `function.name` / `function.parameters`；转换时复制定义，原请求中的名称和 schema 保持不变。
 
 ## 验证范围
 

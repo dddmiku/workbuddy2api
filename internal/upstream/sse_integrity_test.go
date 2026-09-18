@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-18：合法 legacy 工具终态正例补齐实际调用，缺调用场景由完整性反例覆盖。
 // 2026-09-16：覆盖真实审计发现的错误吞没、异常 EOF 和工具残参假成功，并保留合法终态兼容。
 // 2026-09-16：复核完整 message 快照去重/保真，以及新旧工具协议的参数缺失、null 与类型错误。
 package upstream
@@ -126,7 +127,7 @@ func TestIntegrityAcceptsLegitimateTerminals(t *testing.T) {
 		{"arguments intact", integrityTool(`{"id":11128}`) + integrityFinish("tool_calls"), "tool_calls"},
 		{"empty tool arguments", integrityTool("") + integrityFinish("tool_calls"), "tool_calls"},
 		{"valid scalar arguments", integrityTool("123") + integrityFinish("tool_calls"), "tool_calls"},
-		{"legacy function finish", integrityEvent(integrityContent) + integrityFinish("function_call"), "function_call"},
+		{"legacy function finish", integrityEvent(`{"choices":[{"index":0,"delta":{"function_call":{"name":"lookup","arguments":"{}"}}}]}`) + integrityFinish("function_call"), "function_call"},
 		{"ignore after DONE", integrityEvent(integrityContent) + integrityEvent("[DONE]") + integrityEvent(`{"error":{"message":"ignored"}}`), "stop"},
 	}
 	for _, tc := range cases {

@@ -17,6 +17,8 @@
 // 2026-09-17：新增 applyActNote：带工具的请求在 system 末尾追加运行约定，抑制上游模型
 //
 //	「一句话一个命令」的叙述式输出（原生 DeepSeek 不会这样，反代链路实测会）。
+//
+// 2026-09-18：保留 namespace 内嵌函数定义，拒绝无实际工具的工具终态和畸形工具列表，避免静默结束。
 package server
 
 import (
@@ -693,7 +695,7 @@ func responsesTools(tools []any, req *responsesRequest) []any {
 				if !ok {
 					continue
 				}
-				inner, _ := child["name"].(string)
+				inner := chatToolName(child)
 				if strings.TrimSpace(namespace) == "" || inner == "" {
 					continue
 				}
@@ -752,6 +754,14 @@ func responsesTools(tools []any, req *responsesRequest) []any {
 // responsesFunctionTool 把 Responses 的扁平 function 定义转成 chat 的嵌套定义。
 func responsesFunctionTool(tm map[string]any) map[string]any {
 	fn := map[string]any{}
+	if nested, ok := tm["function"].(map[string]any); ok {
+		// Copy before assigning a namespace alias; req.Tools is echoed back to
+		// the caller and must retain its original tool names and schema.
+		for key, value := range nested {
+			fn[key] = value
+		}
+		return map[string]any{"type": "function", "function": fn}
+	}
 	for _, k := range []string{"name", "description", "parameters", "strict"} {
 		if v, ok := tm[k]; ok && v != nil {
 			fn[k] = v
@@ -1268,14 +1278,26 @@ func (rw *responsesWriter) handleChunk(chunk map[string]any) {
 		if s, ok := delta["refusal"].(string); ok && s != "" {
 			rw.refusalDelta(s)
 		}
-		if tcs, ok := delta["tool_calls"].([]any); ok && len(tcs) > 0 {
-			if rw.legacyCallID != "" {
-				rw.failOutput("upstream_parse", "upstream mixed legacy and modern tool calls")
+		if value := delta["tool_calls"]; value != nil {
+			tcs, ok := value.([]any)
+			if !ok {
+				rw.failOutput("upstream_parse", "upstream tool_calls must be an array")
 				return
 			}
-			rw.toolCallDelta(tcs)
+			if len(tcs) > 0 {
+				if rw.legacyCallID != "" {
+					rw.failOutput("upstream_parse", "upstream mixed legacy and modern tool calls")
+					return
+				}
+				rw.toolCallDelta(tcs)
+			}
 		}
-		if fn, ok := delta["function_call"].(map[string]any); ok {
+		if value := delta["function_call"]; value != nil {
+			fn, ok := value.(map[string]any)
+			if !ok {
+				rw.failOutput("upstream_parse", "upstream function_call must be an object")
+				return
+			}
 			rw.legacyFunctionDelta(fn)
 		}
 	}
@@ -1572,6 +1594,9 @@ func (rw *responsesWriter) CompletionError() error {
 	if rw.streamErr == nil && !rw.sawDone && rw.finishReason == "" {
 		rw.failOutput("upstream_truncated", "upstream stream ended without a completion marker")
 	}
+	if rw.streamErr == nil && (rw.finishReason == "tool_calls" || rw.finishReason == "function_call") && len(rw.order) == 0 {
+		rw.failOutput("missing_tool_call", "upstream ended with a tool finish reason but no tool call")
+	}
 	if rw.streamErr == nil && rw.finishReason != "length" && rw.finishReason != "content_filter" {
 		if rw.req != nil && rw.req.ParallelToolCalls != nil && !*rw.req.ParallelToolCalls && len(rw.order) > 1 {
 			rw.failOutput("parallel_tool_calls_violation", "model returned parallel tool calls despite parallel_tool_calls=false")
@@ -1633,10 +1658,25 @@ func (rw *responsesWriter) validateJSONCompletion(chat, result map[string]any) e
 	}
 	choice, _ := choices[0].(map[string]any)
 	message, _ := choice["message"].(map[string]any)
+	if value := message["tool_calls"]; value != nil {
+		switch value.(type) {
+		case []any, []map[string]any:
+		default:
+			return fmt.Errorf("upstream tool_calls must be an array")
+		}
+	}
+	if value := message["function_call"]; value != nil {
+		if _, ok := value.(map[string]any); !ok {
+			return fmt.Errorf("upstream function_call must be an object")
+		}
+	}
 	if len(responseArray(message["tool_calls"])) > 0 && legacyResponseFunction(message) != nil {
 		return fmt.Errorf("upstream mixed legacy and modern tool calls")
 	}
 	calls := responseToolCalls(message)
+	if (choice["finish_reason"] == "tool_calls" || choice["finish_reason"] == "function_call") && len(calls) == 0 {
+		return fmt.Errorf("upstream ended with a tool finish reason but no tool call")
+	}
 	if rw.req.ParallelToolCalls != nil && !*rw.req.ParallelToolCalls && len(calls) > 1 {
 		return fmt.Errorf("model returned parallel tool calls despite parallel_tool_calls=false")
 	}

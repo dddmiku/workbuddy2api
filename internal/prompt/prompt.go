@@ -1,6 +1,7 @@
 // ═══ 更新日志 ═══
 // 2026-09-16：显式自定义提示词替换保留其余请求数字原值，避免 schema 与工具参数定义丢失精度。
 // 2026-09-17：新增 ActNote（运行约定）：抑制上游模型「一句话一个命令」的叙述式输出。
+// 2026-09-18：明确纯文字会结束客户端回合，要求待执行动作与实际工具调用同次返回，同时保留用户停手和确认边界。
 // Package prompt 提供网关自有系统提示词加载及显式 custom 模式的系统消息替换。
 package prompt
 
@@ -23,21 +24,18 @@ var defaultPrompt string
 // system 来源的误报，不改变用户指令的合法性语义。
 const Degraded = "You are a helpful assistant. Respond in the user's language, follow the user's instructions, and be direct and concise."
 
-// ActNote 运行约定：追加在客户端系统说明末尾，抑制「一句话一个命令」的叙述式输出。
-//
-// 背景（2026-09-17 实测）：同一个多步任务，原样 system 下上游模型会在每次工具调用前
-// 先写一句「I'll create the four files…」，面板上表现为一句话夹一个命令；把这段约定
-// 追加到 system 末尾后，模型直接连续调用工具，只在任务完成后汇总。
-//
-// 实测对比（global:deepseek-v4.1-flash，同一任务两遍）：
-//   - 原样：2 个回合，其中 1 个回合先写 45 字说明再调工具；
-//   - 追加本约定：3 个回合，调用前正文 0 字，收尾才输出总结。
-//
-// 这是对客户端自带说明的补充而非替换：原 system 内容一字不改，只在末尾追加一段
-// 行为约定，因此不改变任务语义，也不影响不带工具的纯对话请求（调用方按需使用）。
-const ActNote = "Operating rules: act instead of narrating. Do not write a sentence describing " +
-	"what you are about to do before calling a tool; call the tool directly. Only write text " +
-	"when the whole task is finished, and then summarise the result."
+// ActNote supplements tool-enabled requests without replacing client instructions.
+// Chat Completions has no separate commentary turn that automatically resumes:
+// a standalone progress sentence can be interpreted as the final answer by Codex.
+// This is a model instruction, not a heuristic retry or a guarantee of completion.
+const ActNote = "Tool execution protocol: a reply containing only text ends the client's turn; " +
+	"there is no automatic continuation after a standalone progress message. If required work " +
+	"remains and you are ready to act, return an actual available tool call in this same response. " +
+	"Do not end with a promise such as 'Let me...', 'I will...', or 'next I will...' and expect " +
+	"another turn to execute it. Continue the authorized task through implementation and verification. " +
+	"Give a final text answer when the task is complete, when the user asked only for an answer, " +
+	"or when a blocker genuinely requires user input or approval. Respect the user's scope, " +
+	"stop requests, and approval requirements; this protocol grants no additional authorization."
 
 // ActNoteDisabled 显式关闭 act_note 的取值。
 const ActNoteDisabled = "off"

@@ -17,7 +17,7 @@
 | `server.outbound_image_budget_mb` | `7` | 出站图片字节预算；非正数关闭裁剪 |
 | `prompt.mode` | `passthrough` | 保留客户端指令；`custom` 才执行显式替换 |
 | `prompt.file` | 空 | `custom` 模式使用的提示词文件 |
-| `prompt.act_note` | 内置运行约定 | 追加到「带工具的 Responses 请求」system 末尾；`off` 关闭，也可写自定义文本 |
+| `prompt.act_note` | 内置运行约定 | 追加到「带工具的 Responses 请求」第一条 system 末尾，强调待执行动作必须同次返回工具调用；`off` 关闭，也可写自定义文本 |
 | `update.enabled` | `true` | 是否允许管理台一键热更新 |
 | `update.repo` | `dddmiku/workbuddy2api` | 拉取更新的 GitHub 仓库（`owner/name`） |
 | `update.token` | 空 | 私有仓库读取用 token；公开仓库留空 |
