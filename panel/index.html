@@ -1033,6 +1033,9 @@ function busy(on){
 }
 
 /* ── 加载 ─────────────────────────────────────────── */
+// CREDIT_RETRY 首次加载时积分还在后台查（后端返回 creditPending）的补取定时器。
+var CREDIT_RETRY = null;
+
 async function loadAll(forceCredit){
   busy(true);
   try{
@@ -1044,10 +1047,23 @@ async function loadAll(forceCredit){
     S.tasks = res[1];
     render();
     svc(true);
+    scheduleCreditRetry(res[0]);
   }catch(err){
     svc(false, String(err && err.message || err));
     toast('加载失败：' + (err && err.message || err), 'err');
   }finally{ busy(false); }
+}
+
+// scheduleCreditRetry 后端说积分还在后台查时，过几秒自动补取一次；
+// 这样首屏立刻可用，积分数字稍后自己出现，不必让页面干等（冷查约 8 秒）。
+function scheduleCreditRetry(data){
+  if (CREDIT_RETRY){ clearTimeout(CREDIT_RETRY); CREDIT_RETRY = null; }
+  if (!data || !data.creditPending) return;
+  CREDIT_RETRY = setTimeout(function(){
+    CREDIT_RETRY = null;
+    // 不传 force：走后端缓存优先路径，拿到后台线程写好的结果就渲染。
+    loadAll();
+  }, 3000);
 }
 function svc(up){
   var b = $('#svcBadge'), t = $('#svcText');
@@ -1207,6 +1223,14 @@ function renderPool(){
 function renderCredit(){
   var d = S.data, a = d.accounts || [];
   var have = a.filter(function(x){ return x.credits && typeof x.credits.remain === 'number'; });
+  // 积分在后台查询中（首屏不等 8 秒的冷查）：给出明确提示，稍后自动刷新。
+  if (d.creditPending && !have.length){
+    $('#creditPanel').innerHTML =
+      '<div class="big"><span class="v">…</span><span class="u">查询中</span></div>' +
+      mrow('状态', '正在后台统计积分') +
+      mrow('取到积分', '0 / ' + a.length);
+    return;
+  }
   var remain = have.reduce(function(s, x){ return s + x.credits.remain; }, 0);
   var size = have.reduce(function(s, x){
     return s + (typeof x.credits.size === 'number' ? x.credits.size : x.credits.remain); }, 0);

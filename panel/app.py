@@ -104,8 +104,13 @@ REALMS = ("cn", "global")
 UID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 AUTH_FILE_RE = re.compile(r"^workbuddy-(?P<uid>.+?)\.json(?P<disabled>\.disabled)?$")
 
+# 积分摘要缓存。
+# 2026-09-19：`./credit` 要逐个账号查上游，一次冷跑约 8 秒；此前 /api/state 同步等它，
+# 于是"刷新网页很久才出数据"。现在页面请求一律不等它：有缓存就先给（哪怕是旧的），
+# 刷新在后台线程里做；只有用户显式点刷新才同步取一次。
 CREDIT_TTL = 60.0
 _credit_cache = {"ts": 0.0, "data": None}
+_credit_refreshing = False
 _lock = threading.Lock()
 
 
@@ -644,10 +649,49 @@ def restart_container():
 
 
 def get_credits(force=False):
+    """取积分摘要。
+
+    force=True（用户显式刷新）同步查一次；force=False 一律"先返回、后刷新"：
+    有缓存立刻返回（过期也先给旧值），同时起后台线程更新；没有缓存则返回
+    pending 占位并起后台线程，页面立刻渲染，前端稍后自动重取一次。
+
+    这样 /api/state 的响应时间不再受 `./credit` 影响（实测冷跑 8.3 秒）。
+    """
     with _lock:
         now = time.time()
-        if not force and _credit_cache["data"] and now - _credit_cache["ts"] < CREDIT_TTL:
-            return _credit_cache["data"]
+        cached = _credit_cache["data"]
+        fresh = cached and now - _credit_cache["ts"] < CREDIT_TTL
+        if not force and fresh:
+            return cached
+        if not force:
+            _start_credit_refresh_locked()
+            # 有旧值就给旧值（页面上数字不会跳空），否则给 pending 占位。
+            return cached if cached else {"pending": True, "accounts": []}
+    return _query_credits()
+
+
+def _start_credit_refresh_locked():
+    """调用方必须已持有 _lock；起一个后台线程更新缓存，同一时刻只允许一个。"""
+    global _credit_refreshing
+    if _credit_refreshing:
+        return
+    _credit_refreshing = True
+
+    def worker():
+        global _credit_refreshing
+        try:
+            _query_credits()
+        except Exception as ex:  # noqa: BLE001 - 后台线程异常不能让 _credit_refreshing 卡死
+            sys.stderr.write("[credit] background refresh failed: %s\n" % ex)
+        finally:
+            with _lock:
+                _credit_refreshing = False
+
+    threading.Thread(target=worker, name="credit-refresh", daemon=True).start()
+
+
+def _query_credits():
+    """真正执行一次积分查询并写缓存；失败时返回带 error 的字典（不抛异常）。"""
     if not container_running():
         return {"error": "容器未运行"}
     rc, out, err = docker(["exec", CONTAINER, "./credit"], timeout=90)
@@ -674,6 +718,9 @@ def build_state(force_credit=False):
     pool = gateway_get("/status") or {}
     pool_by_uid = {a.get("uid"): a for a in (pool.get("accounts") or [])}
     cred_by_uid, credit_raw = credits_by_uid(force=force_credit)
+    # 积分还在后台查（或首次加载尚未拿到）时告诉前端：稍后自己重取一次，
+    # 而不是让首屏一直等 `./credit`（冷跑 8 秒）。
+    credit_pending = bool(isinstance(credit_raw, dict) and credit_raw.get("pending"))
 
     accounts = []
     for e in list_auth_files():
@@ -718,6 +765,7 @@ def build_state(force_credit=False):
         },
         "creditTotals": (credit_raw or {}).get("total") if isinstance(credit_raw, dict) else None,
         "creditError": (credit_raw or {}).get("error") if isinstance(credit_raw, dict) else None,
+        "creditPending": credit_pending,
         "pendingRestart": bool(changed),
         "apiKey": "",
         "apiKeysManaged": bool(key_management.socket_path(CONFIG_PATH, BASE)),
