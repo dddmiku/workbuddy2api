@@ -68,7 +68,7 @@ stream_idle_timeout_ms = 90000
 { "server": { "input_token_scale": 1.4 } }
 ```
 
-换算只作用于回给客户端的 usage，账本与日志里的 `in=` 列仍是上游口径，不影响对账。开启后客户端按窗口比例设置的阈值（例如 `model_auto_compact_token_limit = 700000`）就能在撞墙前触发压缩；已经在跑的会话要重启 Codex（或让 cc switch 重新写入 `config.toml`）才会用上新阈值。
+换算只作用于 `/v1/responses` 回给客户端的 usage；`/v1/chat/completions`、账本与日志里的 `in=` 列仍是上游口径，不影响对账。开启后客户端按窗口比例设置的阈值（例如 `model_auto_compact_token_limit = 700000`）就能在撞墙前触发压缩；已经在跑的会话要重启 Codex（或让 cc switch 重新写入 `config.toml`）才会用上新阈值。
 
 没有实测出差额的部署保持默认 `1`（原样透传）。
 
