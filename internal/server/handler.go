@@ -239,6 +239,8 @@ func (h *Handler) usageStats(w http.ResponseWriter, r *http.Request) {
 		"updated_at": snapshot.UpdatedAt,
 		"totals":     snapshot.Totals,
 		"keys":       snapshot.Keys,
+		// days 是按天分桶（新到旧），面板的日期筛选读它；漏传会让筛选永远落在「全部」。
+		"days": snapshot.Days,
 	})
 }
 

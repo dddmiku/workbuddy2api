@@ -104,6 +104,10 @@ func TestUsageEndpointIsInternalOnly(t *testing.T) {
 			t.Fatalf("/usage payload missing %q:\n%s", want, body)
 		}
 	}
+	// 日期筛选依赖按天分桶：/usage 必须把 days 一并暴露，漏传会让筛选永远停在「全部」。
+	if !strings.Contains(body, `"days"`) {
+		t.Fatalf("/usage payload missing day buckets:\n%s", body)
+	}
 }
 
 // TestUsageRecordsCachedPromptTokens 上游在思考模式下每轮重发整段上下文，
