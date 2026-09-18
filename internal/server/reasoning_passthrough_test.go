@@ -212,3 +212,125 @@ func TestReasoningStatsFeedsDiagnostics(t *testing.T) {
 		t.Fatalf("reasoning stats = %+v want {Items:2 WithText:1}", req.reasoning)
 	}
 }
+
+// TestAdjacentAssistantMessagesAreMerged 国际版后端要求「一条 assistant 消息 = 一个回合」：
+// 模型先写一句正文、再调工具时，Responses 侧是 message + function_call 两个 item，
+// 翻译后会变成两条相邻 assistant，global 直接 400（11155）。转换层要并成一条。
+func TestAdjacentAssistantMessagesAreMerged(t *testing.T) {
+	request := `{"model":"global:deepseek-v4.1-flash","stream":false,"input":[
+	  {"role":"user","content":"读文件再总结"},
+	  {"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"先看一眼"}]},
+	  {"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"},
+	  {"type":"function_call_output","call_id":"call_1","output":"内容"},
+	  {"type":"reasoning","id":"rs_2","summary":[{"type":"summary_text","text":"再核对一遍"}]},
+	  {"role":"assistant","content":"我看一下目录"},
+	  {"type":"function_call","call_id":"call_2","name":"lookup","arguments":"{}"},
+	  {"type":"function_call_output","call_id":"call_2","output":"内容"}]}`
+	body, _, err := responsesToChat([]byte(request))
+	if err != nil {
+		t.Fatalf("转换失败: %v", err)
+	}
+	chat := decodeChat(t, body)
+	raw, _ := chat["messages"].([]any)
+	roles := make([]string, 0, len(raw))
+	for _, item := range raw {
+		message, _ := item.(map[string]any)
+		role, _ := message["role"].(string)
+		roles = append(roles, role)
+	}
+	for index := 1; index < len(roles); index++ {
+		if roles[index] == "assistant" && roles[index-1] == "assistant" {
+			t.Fatalf("仍有相邻 assistant 消息（global 会 11155）: %v\n%s", roles, body)
+		}
+	}
+	// 合并后的那一条要同时带正文与 tool_calls，并且正文顺序不乱。
+	var mergedText, mergedCalls, mergedReasoning string
+	calls := 0
+	for _, item := range raw {
+		message, _ := item.(map[string]any)
+		if role, _ := message["role"].(string); role != "assistant" {
+			continue
+		}
+		if text, _ := message["content"].(string); strings.Contains(text, "我看一下目录") {
+			mergedText = text
+			if list, ok := message["tool_calls"].([]any); ok {
+				calls = len(list)
+			}
+			mergedReasoning, _ = message["reasoning_content"].(string)
+			mergedCalls = "found"
+		}
+	}
+	if mergedCalls == "" || calls != 1 {
+		t.Fatalf("正文没有并进带 tool_calls 的那条 assistant: %s", body)
+	}
+	if mergedText != "我看一下目录" {
+		t.Fatalf("合并后正文 = %q want 我看一下目录", mergedText)
+	}
+	if mergedReasoning != "再核对一遍" {
+		t.Fatalf("合并后 reasoning_content = %q want 再核对一遍", mergedReasoning)
+	}
+}
+
+// TestAssistantTurnFollowedByUserIsNotMerged 正文 assistant 后面紧跟 user（回合边界清晰）
+// 时不该被合并——那边界正是上游接受的形状。
+func TestAssistantTurnFollowedByUserIsNotMerged(t *testing.T) {
+	request := `{"model":"global:deepseek-v4.1-flash","stream":false,"input":[
+	  {"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"想想"}]},
+	  {"role":"assistant","content":"第一次回答"},
+	  {"role":"user","content":"继续"}]}`
+	body, _, err := responsesToChat([]byte(request))
+	if err != nil {
+		t.Fatalf("转换失败: %v", err)
+	}
+	chat := decodeChat(t, body)
+	raw, _ := chat["messages"].([]any)
+	if len(raw) != 2 {
+		t.Fatalf("消息数 = %d want 2（assistant/user，未被合并）: %s", len(raw), body)
+	}
+	assistant, _ := raw[0].(map[string]any)
+	if text, _ := assistant["content"].(string); text != "第一次回答" {
+		t.Fatalf("正文被改动: %s", body)
+	}
+}
+
+// TestAdjacentAssistantMergeKeepsToolPairing 合并后 tool 消息必须仍能配对上被并入的
+// tool_call（上游按 id 配对，错位会变成另一种 400）。
+func TestAdjacentAssistantMergeKeepsToolPairing(t *testing.T) {
+	request := `{"model":"global:deepseek-v4.1-flash","stream":false,"input":[
+	  {"role":"user","content":"跑两条命令"},
+	  {"type":"function_call","call_id":"call_a","name":"lookup","arguments":"{}"},
+	  {"type":"function_call_output","call_id":"call_a","output":"甲"},
+	  {"role":"assistant","content":"先跑第二条"},
+	  {"type":"function_call","call_id":"call_b","name":"lookup","arguments":"{}"},
+	  {"type":"function_call_output","call_id":"call_b","output":"乙"}]}`
+	body, _, err := responsesToChat([]byte(request))
+	if err != nil {
+		t.Fatalf("转换失败: %v", err)
+	}
+	chat := decodeChat(t, body)
+	raw, _ := chat["messages"].([]any)
+	declared := map[string]bool{}
+	for _, item := range raw {
+		message, _ := item.(map[string]any)
+		if role, _ := message["role"].(string); role != "assistant" {
+			continue
+		}
+		calls, _ := message["tool_calls"].([]any)
+		for _, rawCall := range calls {
+			call, _ := rawCall.(map[string]any)
+			if id, _ := call["id"].(string); id != "" {
+				declared[id] = true
+			}
+		}
+	}
+	for _, item := range raw {
+		message, _ := item.(map[string]any)
+		if role, _ := message["role"].(string); role != "tool" {
+			continue
+		}
+		id, _ := message["tool_call_id"].(string)
+		if !declared[id] {
+			t.Fatalf("tool 结果 %q 找不到对应的 tool_call: %s", id, body)
+		}
+	}
+}

@@ -76,6 +76,36 @@ DeepSeek 系模型在思考模式下，上游要求把上一轮的推理原文�
 history_reasoning_items=N with_text=N`。据此可区分「客户端没带推理项」「带了但没明文」
 与「assistant 消息缺字段」三种成因。
 
+### 相邻 assistant 消息必须合并（国际版真实成因）
+
+上面第 1–3 条只解决了「字段缺失」，2026-09-18 的真实会话复现表明 11155 还有第二种成因：
+**国际版后端要求「一条 assistant 消息 = 一个回话回合」**。
+
+Codex 在「先写一句话、再调工具」时，历史里是 `message` + `function_call` 两个独立 item，
+翻译后会变成两条相邻的 assistant 消息。国际版后端遇到这种历史直接 400：
+
+```text
+{"code":11155,"msg":"the reasoning content from the previous turn must be passed back in thinking mode",
+ "extError":{"code":"reasoning_content_missing",...}}
+```
+
+实测矩阵（同一份最小历史，国际版 / 国内版对照）：
+
+| 历史尾部形状 | global | cn |
+|---|---|---|
+| 相邻 assistant：正文那条后面紧跟带 tool_calls 的那条 | **400 11155** | 200 |
+| 正文与 tool_calls 并成同一条 assistant | 200 | 200 |
+| 带正文的 assistant 后面紧跟 user / developer / system | 200 | 200 |
+| 纯工具往返（assistant(tool_calls) → tool → …） | 200 | 200 |
+
+因此转换层现在把**连续的 assistant 消息合并成一条**：正文按顺序拼接、tool_calls 依序合并、
+`reasoning_content` 取第一条非空值。真实会话复现验证：1361 项历史（1053 条 chat 消息、
+54 处相邻 assistant）合并前 400、合并后 200。国内版后端两种形状都接受，所以这条归一化
+对 CN 链路无行为变化。
+
+排查这类问题时先看上面那行形状日志：`assistant=` 条数明显多于回合数、或
+`last_reasoning_content=false` 而前面又有大量 assistant，就是这个成因。
+
 网关的处理分两步：
 
 1. 原样请求先发一次（正文保真优先）。

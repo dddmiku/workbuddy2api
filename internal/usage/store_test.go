@@ -6,6 +6,7 @@
 //	且不会因为"把它算成自己的增量"而重复计数。
 //
 // 2026-09-18：锁定缓存命中输入维度能穿过「盘上 + 本方增量」合并与重开恢复（曾因子段枚举漏写而丢）。
+// 2026-09-18：锁定按天分桶：总量与按密钥都要有当天数据，且穿过落盘/合并/重开。
 package usage
 
 import (
@@ -135,6 +136,103 @@ func TestCachedTokensSurviveMergeAndReload(t *testing.T) {
 	if restored.Totals.CachedTokens != 4096 || restored.Totals.PromptTokens != 5000 {
 		t.Fatalf("reloaded cached = %d prompt = %d want 4096 / 5000",
 			restored.Totals.CachedTokens, restored.Totals.PromptTokens)
+	}
+}
+
+// TestDayBucketsTrackLocalCalendarDay 天桶按服务端本地日历日切分：
+// 同一天的两笔要落到同一个桶，跨零点要分开，且按密钥维度也要能对上。
+func TestDayBucketsTrackLocalCalendarDay(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(filepath.Join(dir, "usage.json"), time.Hour)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer store.Close()
+
+	local := time.FixedZone("CST", 8*3600)
+	day1 := time.Date(2026, 9, 18, 1, 0, 0, 0, local)    // 本地 09-18 01:00
+	day1b := time.Date(2026, 9, 18, 23, 30, 0, 0, local) // 本地 09-18 23:30（同一日历日）
+	day2 := time.Date(2026, 9, 19, 0, 30, 0, 0, local)   // 本地 09-19 00:30（跨零点）
+	store.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:deepseek-v4.1-flash", 100, 10, 80, 0, false, day1)
+	store.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:deepseek-v4.1-flash", 200, 20, 160, 0, false, day1b)
+	store.Record("key_b", "团队 B", "wb2a_ef…gh", "cn:glm-5.2", 50, 5, 0, 0, false, day2)
+
+	snapshot := store.Snapshot()
+	byDay := map[string]Totals{}
+	for _, day := range snapshot.Days {
+		byDay[day.Day] = day.Totals
+	}
+	// 天桶用 time.Local 归日：测试里传入的是 CST 时刻，容器/CI 的 time.Local 未必是 CST，
+	// 因此这里按「同一本地日历日的两笔必须合并、跨日的必须分开」来断言，而不是写死日期串。
+	if len(snapshot.Days) != 2 {
+		t.Fatalf("天桶数 = %d want 2（本地同一天合并、跨日分开）: %+v", len(snapshot.Days), snapshot.Days)
+	}
+	total := Totals{}
+	for _, day := range snapshot.Days {
+		total = addTotals(total, day.Totals)
+		if day.Totals.Requests != 2 && day.Totals.Requests != 1 {
+			t.Fatalf("单日请求数异常: %+v", day.Totals)
+		}
+	}
+	if total.Requests != 3 || total.PromptTokens != 350 || total.CachedTokens != 240 {
+		t.Fatalf("天桶合计与总数不一致: %+v", total)
+	}
+	// 最新的一天排最前
+	if snapshot.Days[0].Day <= snapshot.Days[1].Day {
+		t.Fatalf("天桶应按日期倒序: %v", []string{snapshot.Days[0].Day, snapshot.Days[1].Day})
+	}
+	// 按密钥维度也要有当天数据
+	for _, key := range snapshot.Keys {
+		if len(key.Days) == 0 {
+			t.Fatalf("密钥 %s 缺天桶明细", key.KeyID)
+		}
+	}
+}
+
+// TestDayBucketsSurviveMergeAndReload 天桶必须穿过「盘上 + 本方增量」合并与重开恢复，
+// 且新维度漏进子段枚举时本用例会失败（缓存维度就踩过这个坑）。
+func TestDayBucketsSurviveMergeAndReload(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "usage.json")
+	store, err := Open(path, time.Hour)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	at := time.Now()
+	store.Record("key_a", "团队 A", "wb2a_ab…cd", "cn:deepseek-v4.1-flash", 500, 40, 320, 0, false, at)
+	snapshot := store.Snapshot()
+	if len(snapshot.Days) != 1 {
+		t.Fatalf("合并路径丢了天桶: %+v", snapshot.Days)
+	}
+	if snapshot.Days[0].Totals.PromptTokens != 500 || snapshot.Days[0].Totals.CachedTokens != 320 {
+		t.Fatalf("天桶数值不对: %+v", snapshot.Days[0].Totals)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	reopened, err := Open(path, time.Hour)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	restored := reopened.Snapshot()
+	if len(restored.Days) != 1 || restored.Days[0].Totals.PromptTokens != 500 {
+		t.Fatalf("重开后丢天桶: %+v", restored.Days)
+	}
+}
+
+// TestDayKeyUsesLocalCalendarDay 天键必须是本地日历日（容器 TZ 与用户一致），
+// 用 UTC 归日会把本地 00:00–08:00 的请求算到前一天。
+func TestDayKeyUsesLocalCalendarDay(t *testing.T) {
+	local := time.FixedZone("CST", 8*3600)
+	moment := time.Date(2026, 9, 18, 0, 30, 0, 0, local)
+	got := dayKeyOf(moment)
+	want := moment.In(time.Local).Format(dayKeyLayout)
+	if got != want {
+		t.Fatalf("dayKeyOf = %q want %q（本地日历日）", got, want)
+	}
+	if got == moment.UTC().Format(dayKeyLayout) && moment.In(time.Local).Day() != moment.UTC().Day() {
+		t.Fatalf("dayKeyOf 用了 UTC 归日: %q", got)
 	}
 }
 

@@ -396,7 +396,77 @@ func responsesMessages(input json.RawMessage, instructions string, toolNames map
 			}
 		}
 	}
-	return msgs, stats, nil
+	return mergeAdjacentAssistants(msgs), stats, nil
+}
+
+// mergeAdjacentAssistants 把连续的 assistant 消息并成一条（正文 + tool_calls）。
+//
+// 为什么必须并：Responses 历史里「模型先写一句话、再调工具」是两条独立 item
+// （message + function_call），翻译后就成了两条相邻的 assistant 消息。国际版
+// （global）后端按「一条 assistant 消息 = 一个回合」校验，遇到「带正文但不带
+// tool_calls 的 assistant 后面还跟着 assistant / tool」的历史直接 400：
+//
+//	{"code":11155,"msg":"the reasoning content from the previous turn must be
+//	 passed back in thinking mode","extError":{"code":"reasoning_content_missing"}}
+//
+// 2026-09-18 线上复现（真实 Codex 会话 1361 项历史）：报错时 1055 条 chat 消息里
+// 有 54 处「纯正文 assistant 紧跟 assistant」；同样的历史把相邻 assistant 合并后
+// 立刻 200。CN 后端两种形状都接受，因此该归一化对 CN 无副作用。
+//
+// 合并规则：正文按顺序拼接（仅字符串形态），tool_calls 依序合并，reasoning_content
+// 取第一条非空值（同一回合的推理本就只有一份）。
+func mergeAdjacentAssistants(msgs []any) []any {
+	if len(msgs) < 2 {
+		return msgs
+	}
+	out := make([]any, 0, len(msgs))
+	for _, item := range msgs {
+		message, ok := item.(map[string]any)
+		if !ok {
+			out = append(out, item)
+			continue
+		}
+		role, _ := message["role"].(string)
+		if role != "assistant" || len(out) == 0 {
+			out = append(out, item)
+			continue
+		}
+		previous, ok := out[len(out)-1].(map[string]any)
+		if !ok {
+			out = append(out, item)
+			continue
+		}
+		if previousRole, _ := previous["role"].(string); previousRole != "assistant" {
+			out = append(out, item)
+			continue
+		}
+		mergeAssistantInto(previous, message)
+	}
+	return out
+}
+
+// mergeAssistantInto 把 later 并入 earlier（earlier 保持原位，供其后的 tool 消息继续配对）。
+func mergeAssistantInto(earlier, later map[string]any) {
+	if text, ok := earlier["content"].(string); ok {
+		if extra, ok := later["content"].(string); ok && strings.TrimSpace(extra) != "" {
+			if strings.TrimSpace(text) == "" {
+				earlier["content"] = extra
+			} else {
+				earlier["content"] = text + "\n\n" + extra
+			}
+		}
+	}
+	if calls, ok := later["tool_calls"].([]any); ok && len(calls) > 0 {
+		existing, _ := earlier["tool_calls"].([]any)
+		earlier["tool_calls"] = append(existing, calls...)
+	}
+	// 同一回合的推理只有一份：先到的非空值优先（客户端常把正文那条标成有推理、
+	// 紧随的 function_call 条留空）。
+	if current, _ := earlier["reasoning_content"].(string); strings.TrimSpace(current) == "" {
+		if text, ok := later["reasoning_content"].(string); ok && strings.TrimSpace(text) != "" {
+			earlier["reasoning_content"] = text
+		}
+	}
 }
 
 // lastAssistantWithoutReasoning 返回最后一条还没带 reasoning_content 的 assistant 消息。

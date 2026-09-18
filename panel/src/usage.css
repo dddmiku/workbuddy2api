@@ -1,7 +1,20 @@
 /* ══ 用量统计 ═══════════════════════════════════════════════════════ */
+.usage-filter{display:inline-flex;flex-wrap:wrap;border:1px solid var(--line);border-radius:var(--r2);background:var(--sunken);padding:2px;gap:2px;margin-bottom:10px}
+.usage-filter button{display:inline-flex;align-items:center;gap:6px;padding:4px 12px;border-radius:2px;font-size:12px;color:var(--ink-2);white-space:nowrap}
+.usage-filter button:hover{color:var(--ink)}
+.usage-filter button[aria-pressed=true]{background:var(--surface);color:var(--ink);box-shadow:var(--shadow)}
+.usage-filter button i{font-style:normal;font-family:var(--mono);font-size:11px;color:var(--ink-3)}
+.usage-range{display:flex;flex-wrap:wrap;align-items:flex-end;gap:10px;margin:0 0 12px}
+.usage-range .fld{display:flex;flex-direction:column;gap:4px}
+.usage-range .fld .k{font-size:10px;letter-spacing:.06em;color:var(--ink-3);text-transform:uppercase}
+.usage-range input[type=date],.usage-range select{height:30px;border:1px solid var(--line-2);border-radius:var(--r);padding:0 8px;background:var(--sunken);color:var(--ink);font-size:12px;font-family:inherit}
+.usage-range select{min-width:186px}
+.usage-range input[type=date]:disabled,.usage-range select:disabled{opacity:.5}
 .usage-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));gap:10px;margin-bottom:14px}
 .usage-tile{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:12px 14px}
-.usage-tile .k{font-size:11px;color:var(--ink-2);letter-spacing:.02em}
+.usage-tile .k{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--ink-2);letter-spacing:.02em}
+.usage-tile .uz-ico{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:4px;background:var(--sunken);color:var(--ink-2);flex:none}
+.usage-tile .uz-ico svg{width:12px;height:12px}
 .usage-tile .v{font:600 20px/1.35 var(--mono);margin-top:2px}
 .usage-tile .s{font-size:11px;color:var(--ink-3)}
 .usage-table td.num,.usage-table th.r{text-align:right}

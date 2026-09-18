@@ -49,7 +49,8 @@ class TableAlignmentTests(unittest.TestCase):
         with open(os.path.join(HERE, "usage.js"), "r", encoding="utf-8") as fh:
             usage_js = fh.read()
         self.assertIn('<td class="mono num">', logs_js)
-        self.assertIn('<td class="num">', usage_js)
+        # 用量表数字列带 data-l（窄屏折叠成卡片时显示行内标签），class 仍然是 num。
+        self.assertIn('<td class="num"', usage_js)
 
     def test_built_index_contains_alignment_rules(self):
         # 生成的 index.html 才是真正被浏览器加载的文件：规则必须真的拼进去了。

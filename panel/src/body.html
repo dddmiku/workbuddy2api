@@ -200,6 +200,21 @@
           <span class="sp"></span>
           <button class="btn sm" id="btnUsageReload">刷新</button>
         </div>
+        <div class="usage-filter" id="usageFilter"></div>
+        <div class="usage-range">
+          <label class="fld">
+            <span class="k">起</span>
+            <input type="date" id="usageFrom" aria-label="筛选起始日期">
+          </label>
+          <label class="fld">
+            <span class="k">止</span>
+            <input type="date" id="usageTo" aria-label="筛选结束日期">
+          </label>
+          <label class="fld">
+            <span class="k">单日</span>
+            <select id="usageDayPick" aria-label="按天筛选"></select>
+          </label>
+        </div>
         <div class="usage-tiles" id="usageTiles"></div>
         <div id="usageError" class="note err hide" role="alert"></div>
         <div class="panel">

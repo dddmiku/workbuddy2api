@@ -35,6 +35,23 @@ const Version = 1
 // 账本是累计计数，进程崩溃最多丢一个窗口的数据，换来的是写盘次数与请求量解耦。
 const defaultFlushInterval = 5 * time.Second
 
+// maxDayBuckets 账本保留的天桶数量（约 4 个月）。超过后裁掉最旧的天，账本不会无限增长。
+const maxDayBuckets = 120
+
+// dayKeyLayout 天桶键格式（服务端本地时区的日历日）。
+const dayKeyLayout = "2006-01-02"
+
+// dayKeyOf 把一次请求的时间折算成天桶键。
+//
+// 用本地时区而不是 UTC：面板按调用方所在时区显示日期，容器 TZ 与用户一致
+// （compose 里 TZ=Asia/Shanghai）。按 UTC 分桶会把本地 00:00–08:00 的请求记到前一天。
+func dayKeyOf(at time.Time) string {
+	if at.IsZero() {
+		at = time.Now()
+	}
+	return at.In(time.Local).Format(dayKeyLayout)
+}
+
 // Totals 一个维度的累计量。Credit 只在上游 usage 显式带 credit 时累加
 // （缺失 ≠ 0，见 upstream 侧 Credit() 注释）。
 type Totals struct {
@@ -75,13 +92,15 @@ type ModelUsage struct {
 
 // KeyUsage 单密钥维度（对外快照）。
 type KeyUsage struct {
-	KeyID       string       `json:"key_id"`
-	Name        string       `json:"name"`
-	MaskedKey   string       `json:"masked_key"`
-	Totals      Totals       `json:"totals"`
-	Models      []ModelUsage `json:"models"`
-	FirstUsedAt time.Time    `json:"first_used_at"`
-	LastUsedAt  time.Time    `json:"last_used_at"`
+	KeyID     string       `json:"key_id"`
+	Name      string       `json:"name"`
+	MaskedKey string       `json:"masked_key"`
+	Totals    Totals       `json:"totals"`
+	Models    []ModelUsage `json:"models"`
+	// Days 是该密钥的按天累计量（新到旧排序），面板按密钥筛日期时读它。
+	Days        []DayUsage `json:"days"`
+	FirstUsedAt time.Time  `json:"first_used_at"`
+	LastUsedAt  time.Time  `json:"last_used_at"`
 }
 
 // Snapshot 一次读取结果：总量 + 按密钥明细（按总 token 降序）。
@@ -90,6 +109,15 @@ type Snapshot struct {
 	UpdatedAt time.Time  `json:"updated_at"`
 	Totals    Totals     `json:"totals"`
 	Keys      []KeyUsage `json:"keys"`
+	// Days 是按天分桶的累计量（键为本地日历日 YYYY-MM-DD，新到旧排序），
+	// 面板的日期筛选读它。
+	Days []DayUsage `json:"days"`
+}
+
+// DayUsage 单日累计量。
+type DayUsage struct {
+	Day    string `json:"day"`
+	Totals Totals `json:"totals"`
 }
 
 // keyRecord 落盘用的单密钥记录。
@@ -98,6 +126,7 @@ type keyRecord struct {
 	MaskedKey   string             `json:"masked_key"`
 	Totals      Totals             `json:"totals"`
 	Models      map[string]*Totals `json:"models"`
+	Days        map[string]*Totals `json:"days,omitempty"`
 	FirstUsedAt time.Time          `json:"first_used_at"`
 	LastUsedAt  time.Time          `json:"last_used_at"`
 }
@@ -109,6 +138,7 @@ type document struct {
 	UpdatedAt time.Time             `json:"updated_at"`
 	Totals    Totals                `json:"totals"`
 	Keys      map[string]*keyRecord `json:"keys"`
+	Days      map[string]*Totals    `json:"days,omitempty"`
 }
 
 // Store 用量账本。零值不可用，必须经 Open 构造。
@@ -201,6 +231,7 @@ func (s *Store) Record(keyID, name, maskedKey, model string, prompt, completion,
 	} else {
 		at = at.UTC()
 	}
+	day := dayKeyOf(at)
 	if name == "" {
 		name = "未命名密钥"
 	}
@@ -228,6 +259,29 @@ func (s *Store) Record(keyID, name, maskedKey, model string, prompt, completion,
 	record.Totals.add(prompt, completion, cached, credit, hasCredit)
 	s.doc.Totals.add(prompt, completion, cached, credit, hasCredit)
 	s.doc.UpdatedAt = at
+	// 天桶：总量与按密钥各记一份（面板按密钥筛选日期时要能对上）。
+	if s.doc.Days == nil {
+		s.doc.Days = map[string]*Totals{}
+	}
+	if dayTotals := s.doc.Days[day]; dayTotals != nil {
+		dayTotals.add(prompt, completion, cached, credit, hasCredit)
+	} else {
+		created := &Totals{}
+		created.add(prompt, completion, cached, credit, hasCredit)
+		s.doc.Days[day] = created
+	}
+	if record.Days == nil {
+		record.Days = map[string]*Totals{}
+	}
+	if keyDay := record.Days[day]; keyDay != nil {
+		keyDay.add(prompt, completion, cached, credit, hasCredit)
+	} else {
+		created := &Totals{}
+		created.add(prompt, completion, cached, credit, hasCredit)
+		record.Days[day] = created
+	}
+	trimDayBuckets(s.doc.Days)
+	trimDayBuckets(record.Days)
 	if strings.TrimSpace(model) != "" {
 		if record.Models == nil {
 			record.Models = map[string]*Totals{}
@@ -240,6 +294,21 @@ func (s *Store) Record(keyID, name, maskedKey, model string, prompt, completion,
 		counter.add(prompt, completion, cached, credit, hasCredit)
 	}
 	s.dirty = true
+}
+
+// trimDayBuckets 只保留最近 maxDayBuckets 个天桶（键按字典序即时间序）。
+func trimDayBuckets(buckets map[string]*Totals) {
+	if len(buckets) <= maxDayBuckets {
+		return
+	}
+	keys := make([]string, 0, len(buckets))
+	for key := range buckets {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys[:len(keys)-maxDayBuckets] {
+		delete(buckets, key)
+	}
 }
 
 // Snapshot 返回当前累计值的深拷贝快照。
@@ -269,6 +338,7 @@ func (s *Store) Snapshot() Snapshot {
 			Name:        record.Name,
 			MaskedKey:   record.MaskedKey,
 			Totals:      record.Totals,
+			Days:        sortDays(record.Days),
 			FirstUsedAt: record.FirstUsedAt,
 			LastUsedAt:  record.LastUsedAt,
 		}
@@ -291,7 +361,24 @@ func (s *Store) Snapshot() Snapshot {
 		}
 		return out.Keys[i].KeyID < out.Keys[j].KeyID
 	})
+	out.Days = sortDays(view.Days)
 	return out
+}
+
+// sortDays 把天桶摊平成按日期倒序的切片（最新的一天在最前）。
+func sortDays(buckets map[string]*Totals) []DayUsage {
+	if len(buckets) == 0 {
+		return []DayUsage{}
+	}
+	days := make([]DayUsage, 0, len(buckets))
+	for day, totals := range buckets {
+		if totals == nil {
+			continue
+		}
+		days = append(days, DayUsage{Day: day, Totals: *totals})
+	}
+	sort.Slice(days, func(i, j int) bool { return days[i].Day > days[j].Day })
+	return days
 }
 
 // Path 返回账本文件路径（页面展示用）。
@@ -443,6 +530,7 @@ func deltaDocument(mine, prev document) document {
 		UpdatedAt: mine.UpdatedAt,
 		Totals:    deltaTotals(mine.Totals, prev.Totals),
 		Keys:      make(map[string]*keyRecord, len(mine.Keys)),
+		Days:      deltaDays(mine.Days, prev.Days),
 	}
 	for id, current := range mine.Keys {
 		if current == nil {
@@ -457,6 +545,7 @@ func deltaDocument(mine, prev document) document {
 			MaskedKey:   current.MaskedKey,
 			Totals:      deltaTotals(current.Totals, before.Totals),
 			Models:      make(map[string]*Totals, len(current.Models)),
+			Days:        deltaDays(current.Days, before.Days),
 			FirstUsedAt: current.FirstUsedAt,
 			LastUsedAt:  current.LastUsedAt,
 		}
@@ -478,6 +567,23 @@ func deltaDocument(mine, prev document) document {
 	return out
 }
 
+// deltaDays 逐天算增量；对方没有的天（本进程新记录）整体作为增量保留。
+func deltaDays(mine, prev map[string]*Totals) map[string]*Totals {
+	out := make(map[string]*Totals, len(mine))
+	for day, totals := range mine {
+		if totals == nil {
+			continue
+		}
+		var before Totals
+		if old := prev[day]; old != nil {
+			before = *old
+		}
+		delta := deltaTotals(*totals, before)
+		out[day] = &delta
+	}
+	return out
+}
+
 // addDocument 把增量并进基线账本（总量、按密钥、按模型逐层累加）。
 func addDocument(base, delta document) document {
 	base.Version = Version
@@ -491,6 +597,7 @@ func addDocument(base, delta document) document {
 	if base.Keys == nil {
 		base.Keys = map[string]*keyRecord{}
 	}
+	base.Days = addDays(base.Days, delta.Days)
 	for id, add := range delta.Keys {
 		if add == nil {
 			continue
@@ -499,6 +606,7 @@ func addDocument(base, delta document) document {
 		if current == nil {
 			copied := *add
 			copied.Models = cloneModels(add.Models)
+			copied.Days = cloneModels(add.Days)
 			base.Keys[id] = &copied
 			continue
 		}
@@ -530,6 +638,46 @@ func addDocument(base, delta document) document {
 				current.Models[model] = &copied
 			}
 		}
+		if current.Days == nil {
+			current.Days = map[string]*Totals{}
+		}
+		for day, totals := range add.Days {
+			if totals == nil {
+				continue
+			}
+			if existing := current.Days[day]; existing != nil {
+				merged := addTotals(*existing, *totals)
+				current.Days[day] = &merged
+			} else {
+				copied := *totals
+				current.Days[day] = &copied
+			}
+		}
+		trimDayBuckets(current.Days)
+	}
+	trimDayBuckets(base.Days)
+	return base
+}
+
+// addDays 逐天累加两个天桶表。
+func addDays(base, delta map[string]*Totals) map[string]*Totals {
+	if len(base) == 0 && len(delta) == 0 {
+		return base
+	}
+	if base == nil {
+		base = map[string]*Totals{}
+	}
+	for day, totals := range delta {
+		if totals == nil {
+			continue
+		}
+		if existing := base[day]; existing != nil {
+			merged := addTotals(*existing, *totals)
+			base[day] = &merged
+		} else {
+			copied := *totals
+			base[day] = &copied
+		}
 	}
 	return base
 }
@@ -538,12 +686,14 @@ func addDocument(base, delta document) document {
 func cloneDocument(doc document) document {
 	out := doc
 	out.Keys = make(map[string]*keyRecord, len(doc.Keys))
+	out.Days = cloneModels(doc.Days)
 	for id, record := range doc.Keys {
 		if record == nil {
 			continue
 		}
 		copied := *record
 		copied.Models = cloneModels(record.Models)
+		copied.Days = cloneModels(record.Days)
 		out.Keys[id] = &copied
 	}
 	return out
