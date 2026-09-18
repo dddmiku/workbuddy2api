@@ -1,3 +1,5 @@
+// ═══ 更新日志 ═══
+// 2026-09-18：乱序及重复调用编号不能借用历史结果，更新原先按全局集合保留坏配对的旧断言。
 package upstream
 
 import (
@@ -39,7 +41,7 @@ func TestCleanupOrphanToolCallWithoutResult(t *testing.T) {
 	}
 }
 
-// TestCleanupOrphanPartialBatch 一批两个 tool_call，只有 c1 拿到结果 → 整批剔除。
+// TestCleanupOrphanPartialBatch 一批两个 tool_call，只有 c1 拿到结果 → 保留 c1 完整配对。
 func TestCleanupOrphanPartialBatch(t *testing.T) {
 	messages := []any{
 		map[string]any{"role": "assistant", "tool_calls": []any{
@@ -109,8 +111,7 @@ func TestCleanupOrphanPairingPreserved(t *testing.T) {
 	}
 }
 
-// TestCleanupOrphanOutOfOrderToolBeforeResult 乱序：tool 结果消息出现在 assistant
-// tool_call 之前（不按顺序但 id 齐全）→ 仍保留（按 id 集合配对，与顺序无关）。
+// 结果出现在调用前时不能作为该调用的结果，否则出站仍是非法 Chat 历史。
 func TestCleanupOrphanOutOfOrderToolBeforeResult(t *testing.T) {
 	messages := []any{
 		map[string]any{"role": "tool", "tool_call_id": "call_9", "content": "res"},
@@ -119,16 +120,18 @@ func TestCleanupOrphanOutOfOrderToolBeforeResult(t *testing.T) {
 		}},
 	}
 	out, changed := cleanupOrphanToolCalls(messages)
-	if changed {
-		t.Fatal("id-complete out-of-order pairing must be preserved")
+	if !changed {
+		t.Fatal("out-of-order orphan pair must be cleaned")
 	}
-	if len(out) != 2 {
-		t.Fatalf("message count changed: %d", len(out))
+	if len(out) != 1 || out[0].(map[string]any)["role"] != "assistant" {
+		t.Fatalf("orphan result remains: %#v", out)
+	}
+	if _, exists := out[0].(map[string]any)["tool_calls"]; exists {
+		t.Fatal("call borrowed a preceding orphan result")
 	}
 }
 
-// TestCleanupOrphanDuplicateID 重复 tool_call id（两处引用同一结果 id）：
-// 结果侧唯一、调用侧重复——每次按集合取并，保持「id 命中结果即保留」的最宽口径。
+// 两个后续调用不能复用一条先前结果来伪装完整配对。
 func TestCleanupOrphanDuplicateID(t *testing.T) {
 	messages := []any{
 		map[string]any{"role": "tool", "tool_call_id": "dup", "content": "r"},
@@ -139,9 +142,14 @@ func TestCleanupOrphanDuplicateID(t *testing.T) {
 			map[string]any{"id": "dup", "type": "function", "function": map[string]any{"name": "b", "arguments": "{}"}},
 		}},
 	}
-	_, changed := cleanupOrphanToolCalls(messages)
-	if changed {
-		t.Fatal("duplicate id referencing an existing result must be preserved (widest keep)")
+	out, changed := cleanupOrphanToolCalls(messages)
+	if !changed || len(out) != 2 {
+		t.Fatal("duplicate calls borrowed an unrelated earlier result")
+	}
+	for _, raw := range out {
+		if _, exists := raw.(map[string]any)["tool_calls"]; exists {
+			t.Fatal("unmatched repeated call remains")
+		}
 	}
 }
 

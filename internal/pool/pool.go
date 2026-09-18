@@ -1,5 +1,8 @@
 // Pool 账号池核心：结构定义、构造（New/Set* 注入）、在途租约（Acquire/Release）
 // 与账号增删（Add/SyncToDir/upsertLocked）。选号/冷却/状态/持久化见同包其他文件。
+// ═══ 更新日志 ═══
+// 2026-09-18：记录后台落盘退出信号，确保 Close 返回后不会再有旧进程的后台写入。
+// 2026-09-18：显式 Add 观察当前删除代次，既阻止陈旧创建意图，也允许删除后的合法重新添加。
 package pool
 
 import (
@@ -11,10 +14,12 @@ import (
 )
 
 type Pool struct {
-	mu      sync.RWMutex
-	byUID   map[string]*entry
-	stateFp string
-	dirty   atomic.Bool // 内存有变更待落盘
+	mu           sync.RWMutex
+	byUID        map[string]*entry
+	stateFp      string
+	persistBase  stateFile
+	stateIntents map[string]*stateIntent
+	dirty        atomic.Bool // 内存有变更待落盘
 	// store 池状态快照镜像（redisstore.Store）；nil = 无需镜像（未配置 Redis / Noop 之外也可能 nil）。
 	// SaveState/LoadState 经它接线，与本地 state.json 并存作启动恢复备份。
 	store StoreSnapshotter
@@ -46,7 +51,8 @@ type Pool struct {
 	pickSeq uint64
 	// stopCh 关闭信号：Close 关闭它使 startFlusher 的后台 goroutine 退出。
 	// nil = 未启动 flusher（stateFp 为空时 New 不起 flusher）。
-	stopCh chan struct{}
+	stopCh      chan struct{}
+	flusherDone chan struct{}
 	// closeOnce 保证 Close 幂等（多次调用不重复 close channel）。
 	closeOnce sync.Once
 }
@@ -196,6 +202,8 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	changed := false
 	for uid := range p.byUID {
 		if !seen[uid] {
+			change := p.stateIntentLocked(uid)
+			change.deleted, change.deletedEpoch = true, 0
 			delete(p.byUID, uid)
 			changed = true
 		}
@@ -208,9 +216,22 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 // upsertLocked 更新或插入单个账号；已存在则只换凭证、保留 credits/cooling 状态。
 // 调用方必须已持有 p.mu；Add 与 SyncToDir 共用此 upsert 逻辑。
 func (p *Pool) upsertLocked(a *auth.Auth) {
+	epoch, persisted, observed := p.observeAccountEpochLocked(a.UID)
 	if e, ok := p.byUID[a.UID]; ok {
 		e.a = a // 保留 credits/cooling 状态
+		if p.stateFp != "" && observed && (!persisted || epoch != p.persistBase.AccountEpochs[a.UID]) {
+			change := p.stateIntentLocked(a.UID)
+			change.created, change.deleted, change.createdEpoch = true, false, epoch
+		}
 		return
 	}
 	p.byUID[a.UID] = &entry{a: a}
+	if p.stateFp != "" {
+		if p.persistBase.Accounts == nil {
+			p.persistBase.Accounts = make(map[string]stateAccount)
+		}
+		p.persistBase.Accounts[a.UID] = stateAccount{}
+		change := p.stateIntentLocked(a.UID)
+		change.created, change.deleted, change.createdEpoch = true, false, epoch
+	}
 }

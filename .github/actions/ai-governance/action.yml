@@ -19,7 +19,7 @@ inputs:
     required: false
     default: ''
   ai-api-key:
-    description: '自定义 API key；缺省使用 GitHub token'
+    description: '自定义 API key；非 GitHub Models 端点必须单独配置，只有官方 GitHub Models 端点可回退使用 GitHub token'
     required: false
     default: ''
   ai-api-type:

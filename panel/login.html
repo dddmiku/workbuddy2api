@@ -125,7 +125,7 @@ $('#f').addEventListener('submit', async function(e){
   try{
     var r = await fetch('api/auth/login', {
       method:'POST',
-      headers:{'Content-Type':'application/json'},
+      headers:{'Content-Type':'application/json','X-Admin-Request':'1'},
       cache:'no-store',
       body: JSON.stringify({ username: $('#u').value, password: $('#p').value })
     });

@@ -1,9 +1,12 @@
+// ═══ 更新日志 ═══
+// 2026-09-18：只在支持 POSIX 权限位的平台断言 0600，Windows 继续执行完整密钥生命周期回归。
 package apikeys
 
 import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -80,7 +83,7 @@ func TestKeyLifecycleAndRestart(t *testing.T) {
 		t.Fatal("plaintext key persisted")
 	}
 	stat, _ := os.Stat(path)
-	if stat.Mode().Perm() != 0600 {
+	if runtime.GOOS != "windows" && stat.Mode().Perm() != 0600 {
 		t.Fatalf("permissions=%o", stat.Mode().Perm())
 	}
 	enabled := false

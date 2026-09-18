@@ -1,5 +1,6 @@
 "use strict";
 // ═══ 更新日志 ═══
+// 2026-09-18：日期筛选使用实际天桶，停止按占比虚构模型明细；全部按钮显示完整历史次数。
 // 2026-09-17：新增用量统计页：总量卡片 + 按密钥明细 + 单密钥模型拆分，
 //             数据经本机管理通道读取网关记账（/usage）。
 // 2026-09-18：输入卡片补「其中缓存命中」说明并新增缓存命中卡片：思考模式每轮重发整段
@@ -141,7 +142,7 @@ function filtered(){
 }
 
 // usageTotalsFor 单密钥在筛选范围内的累计量。
-// 账本没有天桶（升级前的旧数据）时退回总量，避免页面突然清零。
+// 缺少天桶的旧数据只在全部时间显示，不能推算到所选日期。
 function usageTotalsFor(item){
   if (!filtered()) return item.totals || {};
   var days = item.days || [];
@@ -156,26 +157,9 @@ function usageLastUsedFor(item){
   return (Number(totals.requests) || 0) > 0 ? item.last_used_at : '';
 }
 
-// usageModelsFor 单密钥的模型拆分；筛选后按区间占比折算（天桶不记模型维度）。
+// usageModelsFor 仅在全部时间展示模型拆分，现有天桶没有模型维度。
 function usageModelsFor(item){
-  var models = item.models || [];
-  if (!filtered() || !models.length) return models;
-  var scopeTotals = usageTotalsFor(item);
-  var allTotals = item.totals || {};
-  var scale = (Number(allTotals.total_tokens) || 0) > 0
-    ? (Number(scopeTotals.total_tokens) || 0) / Number(allTotals.total_tokens)
-    : 0;
-  return models.map(function(model){
-    var totals = model.totals || {};
-    return {model: model.model, totals: {
-      requests: Math.round((Number(totals.requests) || 0) * scale),
-      prompt_tokens: Math.round((Number(totals.prompt_tokens) || 0) * scale),
-      cached_tokens: Math.round((Number(totals.cached_tokens) || 0) * scale),
-      completion_tokens: Math.round((Number(totals.completion_tokens) || 0) * scale),
-      total_tokens: Math.round((Number(totals.total_tokens) || 0) * scale),
-      credit: (Number(totals.credit) || 0) * scale
-    }};
-  });
+  return filtered() ? [] : (item.models || []);
 }
 
 async function loadUsage(){
@@ -204,7 +188,7 @@ async function loadUsage(){
     note.classList.add('hide');
   }
   var payload = (US.data && US.data.ok) ? US.data : {totals: {}, keys: []};
-  renderUsageFilter(payload.days);
+  renderUsageFilter(payload.days, (payload.totals || {}).requests);
   renderUsageTiles(usageTotalsForScope(payload));
   renderUsageRows(payload.keys, payload.totals);
   var since = $('#usageSince');
@@ -219,11 +203,10 @@ async function loadUsage(){
 }
 
 // usageTotalsForScope 顶部卡片的口径：选了区间就只统计范围内，否则用账本总量。
-// 账本没有天桶（升级前的旧数据）时退回总量，不会突然显示 0。
+// 所选日期没有每日记录时返回零，保持卡片与明细使用同一个口径。
 function usageTotalsForScope(payload){
   if (!filtered()) return payload.totals || {};
   var days = payload.days || [];
-  if (!days.length) return payload.totals || {};
   return sumTotals(selectedDays(days));
 }
 
@@ -244,12 +227,13 @@ function usageScopeLabel(){
 //
 // 只列「账本里真的有数据」的日期，避免选到空白天导致整页看着像坏了；
 // 每个日期后面标出当天的请求数，方便直接判断哪天的量值得看。
-function renderUsageFilter(days){
+function renderUsageFilter(days, lifetimeRequests){
   var box = $('#usageFilter');
   if (!box) return;
   var list = days || [];
   var totalRequests = 0;
   list.forEach(function(day){ totalRequests += Number((day.totals || {}).requests) || 0; });
+  if (lifetimeRequests !== undefined && lifetimeRequests !== null) totalRequests = Number(lifetimeRequests) || 0;
 
   var today = localDayKey(new Date());
   var week = cutoffDayKey(6);
@@ -258,7 +242,7 @@ function renderUsageFilter(days){
   function sumSince(cutoff){
     var sum = 0;
     list.forEach(function(day){
-      if (day.day >= cutoff) sum += Number((day.totals || {}).requests) || 0;
+      if (day.day >= cutoff && day.day <= today) sum += Number((day.totals || {}).requests) || 0;
     });
     return sum;
   }
@@ -332,7 +316,7 @@ document.addEventListener('click', function(e){
 // applyUsageFilter 用当前区间重绘卡片与表格（数据已在内存里，无需再请求）。
 function applyUsageFilter(){
   var payload = (US.data && US.data.ok) ? US.data : {totals: {}, keys: [], days: []};
-  renderUsageFilter(payload.days);
+  renderUsageFilter(payload.days, (payload.totals || {}).requests);
   renderUsageTiles(usageTotalsForScope(payload));
   renderUsageRows(payload.keys, payload.totals);
   var since = $('#usageSince');

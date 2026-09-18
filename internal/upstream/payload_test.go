@@ -1,5 +1,6 @@
 // ═══ 更新日志 ═══
 // 2026-09-16：明确角色兼容测试独立于已弃用的指纹清洗配置，保持原有协议行为。
+// 2026-09-18：工具角色保留测试改用完整调用/结果配对，避免依赖清理器漏掉无编号孤儿的旧行为。
 package upstream
 
 import (
@@ -31,7 +32,7 @@ func TestNormalizeRoles(t *testing.T) {
 		{"assistant 原样保留",
 			`{"messages":[{"role":"assistant","content":"x"}]}`, []string{"assistant"}},
 		{"tool 原样保留（不因未知而改写）",
-			`{"messages":[{"role":"tool","content":"x"}]}`, []string{"tool"}},
+			`{"messages":[{"role":"assistant","tool_calls":[{"id":"role_check","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"role_check","content":"x"}]}`, []string{"assistant", "tool"}},
 		{"messages 缺失不 panic 且其余字段不变",
 			`{"model":"glm-5.2"}`, []string{}},
 		{"messages 为空数组不 panic",

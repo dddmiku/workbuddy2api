@@ -19,11 +19,17 @@
 //	「一句话一个命令」的叙述式输出（原生 DeepSeek 不会这样，反代链路实测会）。
 //
 // 2026-09-18：保留 namespace 内嵌函数定义，拒绝无实际工具的工具终态和畸形工具列表，避免静默结束。
+// 2026-09-18：执行工具选择与严格参数契约，保留合并消息的多模态内容、工具拒绝结果和自定义格式说明。
+// 2026-09-18：忽略未知历史 item，避免其 content 被提升为新的用户消息。
+// 2026-09-18：将命名空间的使用说明附在扁平工具描述中，保留分组提供的单位和业务语义。
+// 2026-09-18：展平名字使用稳定摘要限制在64字节内，声明、历史、指名选择和返回项共用别名。
+// 2026-09-18：顶层公开工具也使用同一别名规则，保留原始声明和模型可见的工具身份说明。
 package server
 
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -32,6 +38,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 	"workbuddy2api/internal/jsonutil"
 	"workbuddy2api/internal/prompt"
 )
@@ -117,6 +124,7 @@ type responsesRequest struct {
 	PreviousResponseID string          `json:"previous_response_id"`
 	Store              *bool           `json:"store"`
 	output             *outputContract
+	toolPolicy         *responseToolPolicy
 	// reasoning 记录本次历史里的推理项形态（非 JSON 字段，翻译时填充）：
 	// 上游 11155 归因日志要用它区分「客户端根本没带推理项」与「带了但被丢掉」。
 	reasoning reasoningStats
@@ -168,6 +176,10 @@ func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
 	if len(req.Tools) > 0 {
 		chatTools = responsesTools(req.Tools, &req)
 	}
+	chatTools, chatChoice, err := req.prepareToolPolicy(chatTools)
+	if err != nil {
+		return nil, nil, err
+	}
 	msgs, stats, err := responsesMessages(req.Input, req.Instructions, req.toolAliasIndex(), req.Model)
 	if err != nil {
 		return nil, nil, err
@@ -218,8 +230,8 @@ func responsesToChat(body []byte) ([]byte, *responsesRequest, error) {
 	}
 	if len(chatTools) > 0 {
 		chat["tools"] = chatTools
-		if tc := responsesToolChoice(req.ToolChoice, req.toolAliasIndex()); tc != nil {
-			chat["tool_choice"] = tc
+		if chatChoice != nil {
+			chat["tool_choice"] = chatChoice
 		}
 	}
 	// metadata 透传：它不参与推理，但会话粘性（session.ExtractKey）会读它，
@@ -352,6 +364,9 @@ func responsesMessages(input json.RawMessage, instructions string, toolNames map
 				}
 			}
 			continue
+		case "", "message":
+		default:
+			continue
 		}
 		role, _ := m["role"].(string)
 		if role == "" {
@@ -449,13 +464,21 @@ func mergeAdjacentAssistants(msgs []any) []any {
 
 // mergeAssistantInto 把 later 并入 earlier（earlier 保持原位，供其后的 tool 消息继续配对）。
 func mergeAssistantInto(earlier, later map[string]any) {
-	if text, ok := earlier["content"].(string); ok {
-		if extra, ok := later["content"].(string); ok && strings.TrimSpace(extra) != "" {
+	text, earlierText := earlier["content"].(string)
+	extra, laterText := later["content"].(string)
+	if earlierText && laterText {
+		if strings.TrimSpace(extra) != "" {
 			if strings.TrimSpace(text) == "" {
 				earlier["content"] = extra
 			} else {
 				earlier["content"] = text + "\n\n" + extra
 			}
+		}
+	} else {
+		parts := append([]any{}, assistantContentParts(earlier["content"])...)
+		parts = append(parts, assistantContentParts(later["content"])...)
+		if len(parts) > 0 {
+			earlier["content"] = parts
 		}
 	}
 	if calls, ok := later["tool_calls"].([]any); ok && len(calls) > 0 {
@@ -469,6 +492,16 @@ func mergeAssistantInto(earlier, later map[string]any) {
 			earlier["reasoning_content"] = text
 		}
 	}
+}
+
+func assistantContentParts(content any) []any {
+	if parts, ok := content.([]any); ok {
+		return parts
+	}
+	if text, ok := content.(string); ok && text != "" {
+		return []any{map[string]any{"type": "text", "text": text}}
+	}
+	return nil
 }
 
 // lastAssistantWithoutReasoning 返回最后一条还没带 reasoning_content 的 assistant 消息。
@@ -635,6 +668,11 @@ func responsesToolOutput(v any) any {
 					hasImage = true
 					parts = append(parts, p)
 				}
+			case "refusal":
+				if text, ok := em["refusal"].(string); ok && text != "" {
+					texts = append(texts, text)
+					parts = append(parts, map[string]any{"type": "text", "text": text})
+				}
 			}
 		}
 		if hasImage {
@@ -667,7 +705,8 @@ func responsesTools(tools []any, req *responsesRequest) []any {
 	customNames := map[string]bool{}
 	aliases := map[string]toolAlias{}
 	taken := map[string]bool{}
-	// 第一遍预占顶层工具名：命名空间扁平名不得与它们撞名，否则回程无法判断调用归属。
+	// Reserve existing short public names before allocating aliases; a long
+	// public name must not steal another declaration's real name.
 	for _, raw := range tools {
 		tm, ok := raw.(map[string]any)
 		if !ok {
@@ -675,10 +714,27 @@ func responsesTools(tools []any, req *responsesRequest) []any {
 		}
 		switch typ, _ := tm["type"].(string); typ {
 		case "function", "custom":
-			if name := chatToolName(tm); name != "" {
+			if name := chatToolName(tm); name != "" && len(name) <= 64 {
 				taken[name] = true
 			}
 		}
+	}
+	topNames := map[string]string{}
+	for _, raw := range tools {
+		tool, _ := raw.(map[string]any)
+		if tool["type"] != "function" && tool["type"] != "custom" {
+			continue
+		}
+		name := chatToolName(tool)
+		if name == "" {
+			continue
+		}
+		alias := name
+		if len(name) > 64 {
+			alias = uniqueChatToolName(name, taken)
+		}
+		topNames[name] = alias
+		taken[alias] = true
 	}
 	for _, raw := range tools {
 		tm, ok := raw.(map[string]any)
@@ -710,9 +766,22 @@ func responsesTools(tools []any, req *responsesRequest) []any {
 				if fn == nil {
 					continue
 				}
+				if groupDescription, _ := tm["description"].(string); strings.TrimSpace(groupDescription) != "" {
+					function, _ := fn["function"].(map[string]any)
+					description, _ := function["description"].(string)
+					context := "Namespace " + namespace + ": " + groupDescription
+					if description != "" {
+						context = description + "\n\n" + context
+					}
+					function["description"] = context
+				}
 				flat := flatToolName(namespace, inner, taken)
 				taken[flat] = true
 				setChatToolName(fn, flat)
+				if flat != namespace+namespaceSeparator+inner {
+					function, _ := fn["function"].(map[string]any)
+					describeToolAlias(function, namespace+namespaceSeparator+inner)
+				}
 				out = append(out, fn)
 				if custom {
 					customNames[flat] = true
@@ -725,21 +794,33 @@ func responsesTools(tools []any, req *responsesRequest) []any {
 			if fn == nil {
 				continue
 			}
-			out = append(out, fn)
-			if name := chatToolName(fn); name != "" {
-				customNames[name] = true
-				taken[name] = true
+			name := chatToolName(tm)
+			alias := topNames[name]
+			setChatToolName(fn, alias)
+			customNames[alias] = true
+			if alias != name {
+				aliases[alias] = toolAlias{Name: name, Custom: true}
+				describeToolAlias(fn["function"].(map[string]any), name)
 			}
+			out = append(out, fn)
 			continue
 		case "function":
-			if name := chatToolName(tm); name == "" {
+			name := chatToolName(tm)
+			if name == "" {
 				continue
 			}
-			if fn, ok := tm["function"].(map[string]any); ok && fn != nil {
+			alias := topNames[name]
+			if fn, ok := tm["function"].(map[string]any); ok && fn != nil && alias == name {
 				out = append(out, tm) // 已是 chat 形状，原样保留
 				continue
 			}
-			out = append(out, responsesFunctionTool(tm))
+			fn := responsesFunctionTool(tm)
+			setChatToolName(fn, alias)
+			if alias != name {
+				aliases[alias] = toolAlias{Name: name}
+				describeToolAlias(fn["function"].(map[string]any), name)
+			}
+			out = append(out, fn)
 			continue
 		}
 		// web_search / file_search 等网关侧无对应实现，保持丢弃。
@@ -760,7 +841,12 @@ func responsesFunctionTool(tm map[string]any) map[string]any {
 		for key, value := range nested {
 			fn[key] = value
 		}
-		return map[string]any{"type": "function", "function": fn}
+		copy := make(map[string]any, len(tm))
+		for key, value := range tm {
+			copy[key] = value
+		}
+		copy["function"] = fn
+		return copy
 	}
 	for _, k := range []string{"name", "description", "parameters", "strict"} {
 		if v, ok := tm[k]; ok && v != nil {
@@ -772,6 +858,10 @@ func responsesFunctionTool(tm map[string]any) map[string]any {
 
 // chatToolName 读取 chat/Responses 两种形状里的工具名。
 func chatToolName(tm map[string]any) string {
+	if tm["type"] == "custom" {
+		name, _ := tm["name"].(string)
+		return name
+	}
 	if fn, ok := tm["function"].(map[string]any); ok {
 		if name, _ := fn["name"].(string); name != "" {
 			return name
@@ -779,6 +869,18 @@ func chatToolName(tm map[string]any) string {
 	}
 	name, _ := tm["name"].(string)
 	return name
+}
+
+func describeToolAlias(function map[string]any, original string) {
+	if function == nil {
+		return
+	}
+	description, _ := function["description"].(string)
+	identity := "Client tool identity: " + original + ". Use the declared function name for calls."
+	if description != "" {
+		identity = description + "\n\n" + identity
+	}
+	function["description"] = identity
 }
 
 // setChatToolName 只改写 chat 形状里的函数名，保留描述与参数原文。
@@ -790,16 +892,42 @@ func setChatToolName(tool map[string]any, name string) {
 
 // flatToolName 生成命名空间工具的扁平名 namespace__name；撞名时追加 __2、__3……
 func flatToolName(namespace, name string, taken map[string]bool) string {
-	base := namespace + namespaceSeparator + name
+	return uniqueChatToolName(namespace+namespaceSeparator+name, taken)
+}
+
+func uniqueChatToolName(name string, taken map[string]bool) string {
+	base := boundedChatToolName(name)
 	if !taken[base] {
 		return base
 	}
 	for index := 2; ; index++ {
-		candidate := fmt.Sprintf("%s%s%d", base, namespaceSeparator, index)
+		suffix := fmt.Sprintf("%s%d", namespaceSeparator, index)
+		prefix := toolNamePrefix(base, 64-len(suffix))
+		candidate := prefix + suffix
 		if !taken[candidate] {
 			return candidate
 		}
 	}
+}
+
+func toolNamePrefix(name string, limit int) string {
+	if len(name) <= limit {
+		return name
+	}
+	prefix := name[:limit]
+	for !utf8.ValidString(prefix) {
+		prefix = prefix[:len(prefix)-1]
+	}
+	return prefix
+}
+
+func boundedChatToolName(name string) string {
+	if len(name) <= 64 {
+		return name
+	}
+	digest := sha256.Sum256([]byte(name))
+	suffix := namespaceSeparator + hex.EncodeToString(digest[:6])
+	return toolNamePrefix(name, 64-len(suffix)) + suffix
 }
 
 // toolAliasIndex 返回「命名空间 + 工具名」→ 出站扁平名的索引，供历史调用写回使用。
@@ -815,15 +943,15 @@ func (req *responsesRequest) toolAliasIndex() map[string]string {
 }
 
 // upstreamToolName 把 Responses 历史项的（命名空间, 名字）还原成出站扁平名。
-// 没有命名空间时保持原样：顶层工具名就是上游名。
+// 顶层长名与命名空间名字都经相同索引，避免声明与历史使用不同名字。
 func upstreamToolName(toolNames map[string]string, namespace, name string) string {
-	if namespace == "" {
-		return name
-	}
 	if flat, ok := toolNames[namespace+"\x00"+name]; ok {
 		return flat
 	}
-	return namespace + namespaceSeparator + name
+	if namespace == "" {
+		return boundedChatToolName(name)
+	}
+	return boundedChatToolName(namespace + namespaceSeparator + name)
 }
 
 // namespaceOf 读取调用项上的 namespace 字段。
@@ -852,6 +980,13 @@ func customToolToFunction(tm map[string]any) map[string]any {
 		return nil
 	}
 	desc, _ := tm["description"].(string)
+	if format, ok := tm["format"].(map[string]any); ok && format["type"] == "grammar" {
+		definition, _ := format["definition"].(string)
+		syntax, _ := format["syntax"].(string)
+		if definition != "" {
+			desc += "\n\nFollow this " + syntax + " grammar for the raw input:\n" + definition
+		}
+	}
 	return map[string]any{
 		"type": "function",
 		"function": map[string]any{
@@ -891,34 +1026,6 @@ func customInputFromArgs(args string) string {
 		}
 	}
 	return args
-}
-
-// responsesToolChoice 把 Responses 的 tool_choice 转成 chat 形状。
-// toolNames 用于把命名空间内的指名选择翻译成出站扁平名。
-func responsesToolChoice(raw json.RawMessage, toolNames map[string]string) any {
-	s := strings.TrimSpace(string(raw))
-	if s == "" || s == "null" {
-		return nil
-	}
-	if strings.HasPrefix(s, `"`) {
-		var v string
-		if json.Unmarshal(raw, &v) == nil && v != "" {
-			return v
-		}
-		return nil
-	}
-	var m map[string]any
-	if json.Unmarshal(raw, &m) != nil {
-		return nil
-	}
-	if name, ok := m["name"].(string); ok && name != "" {
-		name = upstreamToolName(toolNames, namespaceOf(m), name)
-		return map[string]any{"type": "function", "function": map[string]any{"name": name}}
-	}
-	if t, _ := m["type"].(string); t == "allowed_tools" || t == "function" {
-		return "auto"
-	}
-	return nil
 }
 
 // responses 处理 POST /v1/responses。
@@ -1608,6 +1715,16 @@ func (rw *responsesWriter) CompletionError() error {
 				break
 			}
 		}
+		if rw.streamErr == nil && rw.req != nil {
+			calls := make([]responseToolInvocation, 0, len(rw.order))
+			for _, index := range rw.order {
+				call := rw.calls[index]
+				calls = append(calls, responseToolInvocation{name: call.name, arguments: call.args.String()})
+			}
+			if err := rw.req.toolPolicy.validate(calls, rw.refusal.Len() > 0); err != nil {
+				rw.failOutput("tool_contract_violation", err.Error())
+			}
+		}
 		if rw.streamErr == nil && len(rw.order) == 0 && rw.refusal.Len() == 0 && rw.req != nil {
 			if err := rw.req.output.validate(rw.text.String()); err != nil {
 				rw.failOutput("response_format_violation", err.Error())
@@ -1688,6 +1805,18 @@ func (rw *responsesWriter) validateJSONCompletion(chat, result map[string]any) e
 		if err := validateResponseToolCall(name, args, ok); err != nil {
 			return err
 		}
+	}
+	invocations := make([]responseToolInvocation, 0, len(calls))
+	for _, value := range calls {
+		call, _ := value.(map[string]any)
+		fn, _ := call["function"].(map[string]any)
+		name, _ := fn["name"].(string)
+		args, _ := fn["arguments"].(string)
+		invocations = append(invocations, responseToolInvocation{name: name, arguments: args})
+	}
+	refusal, _ := message["refusal"].(string)
+	if err := rw.req.toolPolicy.validate(invocations, refusal != ""); err != nil {
+		return err
 	}
 	if len(calls) > 0 {
 		return nil

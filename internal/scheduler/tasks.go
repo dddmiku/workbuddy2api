@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-18：手动任务复用可取消生命周期，并计入关停等待，停止后拒绝新任务。
 // 2026-09-15: 新增。排程任务自省 + 手动触发：供 /tasks 端点与账户管理面板读取各类任务的
 //   小时 / 开关 / 下次运行 / 上次完成 / 是否在跑，并可按 key 手动触发任意一类。
 //   互斥复用 dispatch 的 beginTask/endTask，手动触发与定时点不会重复打上游。
@@ -6,7 +7,6 @@
 package scheduler
 
 import (
-	"context"
 	"errors"
 	"log"
 	"time"
@@ -30,8 +30,9 @@ const (
 
 // ErrUnknownTask 未知任务 key；ErrTaskBusy 该任务当前正在执行。
 var (
-	ErrUnknownTask = errors.New("unknown task key")
-	ErrTaskBusy    = errors.New("task is already running")
+	ErrUnknownTask      = errors.New("unknown task key")
+	ErrTaskBusy         = errors.New("task is already running")
+	ErrSchedulerStopped = errors.New("scheduler is stopping")
 )
 
 // TaskInfo 单类任务的对外快照。时间字段用指针：JSON 里 null 表达"从未运行过 / 已禁用无排程"，
@@ -192,10 +193,11 @@ func (s *Scheduler) beginTask(k taskKind) bool {
 	}
 	s.taskMu.Lock()
 	defer s.taskMu.Unlock()
-	if s.taskBusy[key] {
+	if s.stopping || s.lifecycle.Err() != nil || s.taskBusy[key] {
 		return false
 	}
 	s.taskBusy[key] = true
+	s.taskWG.Add(1)
 	return true
 }
 
@@ -207,8 +209,12 @@ func (s *Scheduler) endTask(k taskKind) {
 	}
 	s.taskMu.Lock()
 	defer s.taskMu.Unlock()
+	if !s.taskBusy[key] {
+		return
+	}
 	s.taskBusy[key] = false
 	s.taskLast[key] = time.Now()
+	s.taskWG.Done()
 }
 
 // TriggerTask 手动触发单类任务。任务在后台 goroutine 里跑，调用立即返回。
@@ -218,6 +224,9 @@ func (s *Scheduler) TriggerTask(key string) error {
 	k, ok := kindOf(key)
 	if !ok {
 		return ErrUnknownTask
+	}
+	if s.lifecycle.Err() != nil {
+		return ErrSchedulerStopped
 	}
 	if !s.beginTask(k) {
 		return ErrTaskBusy
@@ -230,7 +239,7 @@ func (s *Scheduler) TriggerTask(key string) error {
 			}
 		}()
 		log.Printf("scheduler: 手动触发 %s", key)
-		s.runTask(context.Background(), k)
+		s.runTask(s.lifecycle, k)
 	}()
 	return nil
 }

@@ -1,3 +1,5 @@
+// ═══ 更新日志 ═══
+// 2026-09-18：归并目标必须存在于本轮 canonical 索引且不能指向当前工单，防止模型猜测触发误关闭。
 const baseConfig = require('../config.json');
 const { applyLocale } = require('../src/utils/config');
 const IssueGovernanceService = require('../src/services/issueGovernanceService');
@@ -40,6 +42,25 @@ const issue = {
 };
 
 describe('IssueGovernanceService', () => {
+  test.each([
+    { target: 999, indexed: 57 },
+    { target: issue.number, indexed: issue.number }
+  ])('invalid duplicate target $target leaves the issue open', async ({ target, indexed }) => {
+    const openai = makeOpenai([
+      JSON.stringify({ '要点': 'fixture', '要做的事': ['fixture'] }),
+      'WELL_FORMED',
+      `DUPLICATE(#${target})`
+    ]);
+    const ops = makeOps({ canonicalItems: [{ number: indexed, title: 'fixture', body: 'fixture' }] });
+    const service = new IssueGovernanceService(openai, 'model', buildConfig(), { dryRun: false }, ops);
+    const result = await service.govern({}, 'o', 'r', issue, 'enhancement');
+    expect(result.decision).toBe(GOVERNANCE_DECISIONS.UNCERTAIN);
+    expect(ops.updateIssueState).not.toHaveBeenCalled();
+    expect(ops.addLabels).not.toHaveBeenCalled();
+    expect(ops.createIssue).not.toHaveBeenCalled();
+    expect(ops.addComment.mock.calls.every(call => call[3] === issue.number)).toBe(true);
+  });
+
   test('DUPLICATE 归并：打 duplicate 标签、评论、关闭原 issue，并在 canonical 追加记录', async () => {
     const config = buildConfig();
     // 依次: extract(structured) -> well_formed -> merge_match

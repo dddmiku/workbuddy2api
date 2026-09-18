@@ -1,6 +1,8 @@
 // ═══ 更新日志 ═══
 // 2026-09-16：成功流夹具使用合法工具参数；只有明确结束才允许补 DONE，空流验证真实错误。
 // 2026-09-17：保留 fork 错误详情透传断言，错误返回改验 typed 失败，并覆盖完整错误信封与数字字面量。
+// ═══ 更新日志 ═══
+// 2026-09-18：名称去重状态加入 choice 索引，保留既有单 choice 分片回归。
 package upstream
 
 import (
@@ -173,12 +175,12 @@ func TestStripToolCallNames(t *testing.T) {
 	getFn := func(f map[string]any) map[string]any {
 		return f["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
 	}
-	seen := map[int]bool{}
+	seen := map[[2]int]bool{}
 
 	// 首片带 name：保留，seen 建立
 	f0 := mkFrame(0, "lookup", "")
 	stripToolCallNames(f0, seen)
-	if !seen[0] {
+	if !seen[[2]int{0, 0}] {
 		t.Fatal("index 0 should be marked seen after first chunk")
 	}
 	if getFn(f0)["name"] != "lookup" {
@@ -211,7 +213,7 @@ func TestStripToolCallNames(t *testing.T) {
 	if getFn(f3)["name"] != "other" {
 		t.Errorf("index 1 first name=%v want other", getFn(f3)["name"])
 	}
-	if !seen[1] {
+	if !seen[[2]int{0, 1}] {
 		t.Error("index 1 should be marked seen")
 	}
 

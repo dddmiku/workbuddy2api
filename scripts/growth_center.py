@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-18：连登状态读取失败同样返回非零退出码，防止后台把无法执行的任务当作成功。
 # 2026-09-15: 新增。成长中心两项日常动作：连登档位兑换（redeem）+ 抽奖清空（lottery）。
 #   网关原有六类排程不含这两项，参考 workbuddy.py 的 do_redeem_by_streak / do_lottery
 #   实现，落到与 school/cat 同一条路上（排程 -> runScript -> python3 scripts/*.py）。
@@ -352,7 +353,7 @@ def main():
           + " draw_fail=" + str(stats["draw_fail"])
           + " streak_fail=" + str(stats["streak_fail"]))
     # 有真实失败才非零退出：兑换/补签/抽奖都设计成幂等，重复执行不算失败。
-    if stats["redeem_fail"] or stats["draw_fail"] or stats["makeup_fail"]:
+    if stats["redeem_fail"] or stats["draw_fail"] or stats["makeup_fail"] or stats["streak_fail"]:
         sys.exit(1)
 
 

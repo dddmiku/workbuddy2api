@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-18：更新目录优先采用监督进程显式传入的值，避免下载位置与容器重启指针分离。
 // 2026-09-16：废弃正文清洗并保留配置兼容，避免默认设置篡改业务数据。
 // config.go 加载 JSON 配置 + 环境变量覆盖。
 package main
@@ -220,9 +221,12 @@ func Default() *Config {
 	return c
 }
 
-// updateDir 热更新下载目录：显式配置优先，否则落在 state.json 同目录的 updates/
+// updateDir 热更新目录：监督进程明确指定的目录优先，其次配置，最后 state.json 同目录的 updates/
 // （容器里就是挂载出来的 data 卷，重启后 current 指针仍在）。
 func updateDir(c *Config) string {
+	if dir := strings.TrimSpace(os.Getenv("WB2API_UPDATE_DIR")); dir != "" {
+		return dir
+	}
 	if dir := strings.TrimSpace(c.Update.Dir); dir != "" {
 		return dir
 	}

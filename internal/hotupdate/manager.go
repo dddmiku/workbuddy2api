@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-18：新实例就绪后才原子提交重启指针，提交失败终止候选实例，并保留原启动参数。
 // 2026-09-17：新增热更新管理器：查版本、下载校验、监听套接字交接、优雅停机，
 //
 //	并把状态暴露给管理台。全过程不中断在途请求（含长 SSE 对话）。
@@ -224,20 +225,20 @@ func (m *Manager) Apply(ctx context.Context, target string) (Status, error) {
 	}
 	log.Printf("[update] downloaded %s (%s, sha256=%s)", release.Tag, path, sum[:12])
 
-	// current 指针：容器 entrypoint 优先执行它，重启后仍是新版本。
-	if err := writeCurrentPointer(m.opts.Dir, path); err != nil {
-		log.Printf("WARN: [update] write current pointer: %v", err)
-	}
-
 	m.mu.Lock()
 	m.state = StateHandover
 	m.mu.Unlock()
 
-	args := m.opts.Args
-	if len(args) == 0 {
-		args = []string{"-config", "/app/config.json"}
-	}
-	if err := Handover(path, args, m.opts.Listener, m.opts.AdminListener, readyTimeout); err != nil {
+	if err := handover(path, m.opts.Args, m.opts.Listener, m.opts.AdminListener, readyTimeout, func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// 就绪和重启指针共同构成提交点：任一步失败仍由旧实例服务。
+		if err := writeCurrentPointer(m.opts.Dir, path); err != nil {
+			return fmt.Errorf("write current pointer: %w", err)
+		}
+		return nil
+	}); err != nil {
 		m.fail(err)
 		return m.Status(), err
 	}
@@ -255,8 +256,23 @@ func (m *Manager) Apply(ctx context.Context, target string) (Status, error) {
 // writeCurrentPointer 记录当前生效的二进制路径（原子替换）。
 func writeCurrentPointer(dir, binaryPath string) error {
 	pointer := filepath.Join(dir, "current")
-	tmp := pointer + ".tmp"
-	if err := os.WriteFile(tmp, []byte(binaryPath+"\n"), 0o644); err != nil {
+	file, err := os.CreateTemp(dir, ".current-*")
+	if err != nil {
+		return err
+	}
+	tmp := file.Name()
+	defer os.Remove(tmp)
+	defer file.Close()
+	if _, err := file.WriteString(binaryPath + "\n"); err != nil {
+		return err
+	}
+	if err := file.Chmod(0o644); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp, pointer)

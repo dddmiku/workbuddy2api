@@ -1,3 +1,5 @@
+// ═══ 更新日志 ═══
+// 2026-09-18：按实际工具回合配对结果，避免跨轮借用旧结果；重排覆盖首结果前的插入说明。
 // tool_pairing.go 出站请求体的孤儿 tool_call↔tool 配对清理（吸收参考仓库
 // sse.ts:91-123 resolveToolPairing 语义，适配网关的 OpenAI wire 消息形态）。
 //
@@ -14,10 +16,9 @@ package upstream
 // cleanupOrphanToolCalls 剔除无法配对的 tool_call 与 tool 结果（所有模型，独立于
 // deepseek-only 的 sanitize 开关）。语义对齐参考仓库 resolveToolPairing：
 //
-//   - 收集全线 role:tool 消息的 tool_call_id（结果集）与 assistant.tool_calls[].id（调用集）；
-//   - 一批 assistant tool_calls 只有全部 id 都拿到结果才整体保留（部分保留会留下无结果的
-//     tool_call，上游照样拒绝）；
-//   - role:tool 只在对应 tool_call 被保留时才保留，否则删除整条消息；
+//   - 每批 assistant.tool_calls 只匹配紧随其后的工具结果块；
+//   - 同批每个 id 只对应一条调用与结果；缺结果的调用和无前置调用的结果对称删除；
+//   - 不从历史其他回合借用结果；正常完整配对保持原始内容；
 //   - 无任何工具流量 -> 原 slice 原样返回，changed=false（零分配零改动）。
 //
 // 这是「让请求通过」的安全网：只要存在合法配对就整段保留这些字段，绝不吞掉正确配对。
@@ -41,7 +42,7 @@ package upstream
 //	assistant tool_calls=[c00 c01] | tool c00 | X | tool c01
 //	-> assistant tool_calls=[c00 c01] | tool c00 | tool c01 | X
 //
-// 结果顺序保持不变（同批 tool_call id 顺序 = 结果顺序），因此不引入新的顺序敏感问题。
+// 同组结果仍按原出现顺序排列，因此不引入新的顺序敏感问题。
 // 无插入消息时零改动零分配。
 func repackToolResultBlocks(messages []any) ([]any, bool) {
 	if len(messages) < 3 {
@@ -77,6 +78,8 @@ func repackToolResultBlocks(messages []any) ([]any, bool) {
 		var results []any
 		var between []any
 		sawNonTool := false
+		remaining := len(want)
+		seen := map[string]bool{}
 		for i < len(messages) {
 			mm, ok := messages[i].(map[string]any)
 			if !ok {
@@ -89,14 +92,18 @@ func repackToolResultBlocks(messages []any) ([]any, bool) {
 					break
 				}
 				results = append(results, messages[i])
+				if !seen[id] {
+					seen[id] = true
+					remaining--
+				}
 				if sawNonTool {
 					changed = true
 				}
 				i++
+				if remaining == 0 {
+					break
+				}
 				continue
-			}
-			if len(results) == 0 {
-				break // assistant 后没有结果：交由 cleanupOrphanToolCalls 处理
 			}
 			// 下一组 assistant.tool_calls 是新的组头，绝不能当插入物吞掉：收进
 			// between 它就被原样吐出，且永远不再被外层循环当作组头处理，它自己
@@ -124,107 +131,92 @@ func repackToolResultBlocks(messages []any) ([]any, bool) {
 }
 
 func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
-	if len(messages) == 0 {
-		return messages, false
-	}
-	callIDs := map[string]bool{}
-	resultIDs := map[string]bool{}
 	hasTraffic := false
-	for _, m := range messages {
-		msg, ok := m.(map[string]any)
-		if !ok {
-			continue
-		}
-		switch msg["role"] {
-		case "tool":
-			if id, ok := msg["tool_call_id"].(string); ok && id != "" {
-				resultIDs[id] = true
+	for _, item := range messages {
+		if message, ok := item.(map[string]any); ok {
+			calls, _ := message["tool_calls"].([]any)
+			if message["role"] == "tool" || (message["role"] == "assistant" && len(calls) > 0) {
 				hasTraffic = true
-			}
-		case "assistant":
-			if tcs, ok := msg["tool_calls"].([]any); ok {
-				for _, tci := range tcs {
-					tc, ok := tci.(map[string]any)
-					if !ok {
-						continue
-					}
-					if id, ok := tc["id"].(string); ok && id != "" {
-						callIDs[id] = true
-						hasTraffic = true
-					}
-				}
+				break
 			}
 		}
 	}
 	if !hasTraffic {
 		return messages, false
 	}
-	// keepCalls：调用 id 是否双侧齐全（调用存在且结果存在）。重复 id 与乱序均按集合处理。
-	keepCalls := map[string]bool{}
-	for id := range callIDs {
-		if resultIDs[id] {
-			keepCalls[id] = true
-		}
-	}
 	changed := false
-	// 1) assistant.tool_calls：按 keepCalls 过滤，只留有结果的调用；过滤后为空则删键。
-	//
-	// 历史实现是「批内每个 id 都齐才整批保留，否则删掉整个 tool_calls 键」。那会留下
-	// 无主结果：批 [c1,c2] 只回了 c1 时，调用侧整批被删，而 tool{c1} 仍按 id 命中
-	// keepCalls 得以保留 —— 出站载荷于是变成「无 tool_calls 的 assistant + 孤儿 tool」，
-	// 上游判 11148（tool calls and tool results do not match）并顶死整条会话。
-	// 现在两侧共用同一份 keepCalls 按 id 对称裁剪，任何输入都不会再产生半截配对。
-	for _, m := range messages {
-		msg, ok := m.(map[string]any)
+	out := make([]any, 0, len(messages))
+	for index := 0; index < len(messages); {
+		message, ok := messages[index].(map[string]any)
 		if !ok {
+			out = append(out, messages[index])
+			index++
 			continue
 		}
-		if role, _ := msg["role"].(string); role != "assistant" {
+		if message["role"] == "tool" {
+			changed = true
+			index++
 			continue
 		}
-		tcs, ok := msg["tool_calls"].([]any)
-		if !ok || len(tcs) == 0 {
+		calls, _ := message["tool_calls"].([]any)
+		if message["role"] != "assistant" || len(calls) == 0 {
+			out = append(out, messages[index])
+			index++
 			continue
 		}
-		keptCalls := make([]any, 0, len(tcs))
-		for _, tci := range tcs {
-			tc, ok := tci.(map[string]any)
-			if !ok {
-				continue
-			}
-			if id, _ := tc["id"].(string); keepCalls[id] {
-				keptCalls = append(keptCalls, tc)
+		declared := map[string]bool{}
+		for _, raw := range calls {
+			if call, ok := raw.(map[string]any); ok {
+				if id, _ := call["id"].(string); id != "" {
+					declared[id] = true
+				}
 			}
 		}
-		if len(keptCalls) == len(tcs) {
-			continue // 整批齐全：零改动
-		}
-		changed = true
-		if len(keptCalls) == 0 {
-			delete(msg, "tool_calls")
-			continue
-		}
-		msg["tool_calls"] = keptCalls
-	}
-	// 2) role:tool 结果：只有对应 tool_call 被保留才保留；孤儿结果整条删除。
-	kept := make([]any, 0, len(messages))
-	for _, m := range messages {
-		msg, ok := m.(map[string]any)
-		if !ok {
-			kept = append(kept, m)
-			continue
-		}
-		if role, _ := msg["role"].(string); role == "tool" {
-			id, _ := msg["tool_call_id"].(string)
-			if !keepCalls[id] {
+		matched := map[string]bool{}
+		var results []any
+		end := index + 1
+		for end < len(messages) {
+			result, ok := messages[end].(map[string]any)
+			if !ok || result["role"] != "tool" {
+				break
+			}
+			id, _ := result["tool_call_id"].(string)
+			if declared[id] && !matched[id] {
+				matched[id] = true
+				results = append(results, messages[end])
+			} else {
 				changed = true
-				continue
+			}
+			end++
+		}
+		keptCalls := make([]any, 0, len(calls))
+		for _, raw := range calls {
+			if call, ok := raw.(map[string]any); ok {
+				if id, _ := call["id"].(string); matched[id] {
+					keptCalls = append(keptCalls, raw)
+					delete(matched, id)
+				}
 			}
 		}
-		kept = append(kept, m)
+		if len(keptCalls) != len(calls) {
+			changed = true
+			copy := make(map[string]any, len(message))
+			for key, value := range message {
+				copy[key] = value
+			}
+			if len(keptCalls) == 0 {
+				delete(copy, "tool_calls")
+			} else {
+				copy["tool_calls"] = keptCalls
+			}
+			message = copy
+		}
+		out = append(out, message)
+		out = append(out, results...)
+		index = end
 	}
 	if !changed {
 		return messages, false
 	}
-	return kept, true
+	return out, true
 }

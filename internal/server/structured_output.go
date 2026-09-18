@@ -3,6 +3,9 @@
 // 2026-09-18：text.verbosity 改为接受并忽略：新版 Codex 默认携带，上游没有对应开关，
 //
 //	把它当错误回 400 会让整个会话不可用。
+//
+// 2026-09-18：把工具选择和 strict 函数参数纳入本地终态校验，防止不受支持的上游行为伪装契约成功。
+// 2026-09-18：裸字符串指名选择同样解析公开长名别名，避免声明已缩短而选择仍指向原名。
 package server
 
 import (
@@ -20,6 +23,161 @@ type outputContract struct {
 	chatFormat map[string]any
 	schema     *jsonschema.Schema
 	jsonObject bool
+}
+
+type responseToolInvocation struct {
+	name      string
+	arguments string
+}
+
+type responseToolPolicy struct {
+	mode    string
+	exact   bool
+	allowed map[string]bool
+	schemas map[string]*jsonschema.Schema
+}
+
+func compileResponseSchema(schema map[string]any) (*jsonschema.Schema, error) {
+	encoded, err := json.Marshal(schema)
+	if err != nil {
+		return nil, err
+	}
+	compiler := jsonschema.NewCompiler()
+	compiler.LoadURL = func(string) (io.ReadCloser, error) {
+		return nil, fmt.Errorf("external schema references are not supported")
+	}
+	const schemaURL = "https://workbuddy2api.invalid/contract.schema.json"
+	if err := compiler.AddResource(schemaURL, bytes.NewReader(encoded)); err != nil {
+		return nil, err
+	}
+	return compiler.Compile(schemaURL)
+}
+
+// Keep the original Responses declarations intact for response echoes and alias
+// lookup. Only the model-facing Chat tool set is narrowed by allowed_tools.
+func (req *responsesRequest) prepareToolPolicy(tools []any) ([]any, any, error) {
+	policy := &responseToolPolicy{mode: "auto", schemas: map[string]*jsonschema.Schema{}}
+	req.toolPolicy = policy
+	available := map[string]bool{}
+	for _, raw := range tools {
+		tool, _ := raw.(map[string]any)
+		function, _ := tool["function"].(map[string]any)
+		name, _ := function["name"].(string)
+		available[name] = true
+		if strict, _ := function["strict"].(bool); strict {
+			parameters, _ := function["parameters"].(map[string]any)
+			if parameters == nil {
+				parameters = map[string]any{"type": "object", "additionalProperties": false}
+			}
+			schema, err := compileResponseSchema(parameters)
+			if err != nil {
+				return nil, nil, fmt.Errorf("tool %q has an invalid or unsupported strict schema: %w", name, err)
+			}
+			policy.schemas[name] = schema
+		}
+	}
+	resolve := func(reference map[string]any) (string, error) {
+		name, _ := reference["name"].(string)
+		name = upstreamToolName(req.toolAliasIndex(), namespaceOf(reference), name)
+		if !available[name] {
+			return "", fmt.Errorf("tool_choice references undeclared or unsupported tool %q", name)
+		}
+		if (reference["type"] == "custom") != req.customTools[name] {
+			return "", fmt.Errorf("tool_choice type does not match declared tool %q", name)
+		}
+		return name, nil
+	}
+	var choice any
+	if len(req.ToolChoice) > 0 {
+		if err := json.Unmarshal(req.ToolChoice, &choice); err != nil {
+			return nil, nil, err
+		}
+	}
+	var wire any
+	if mode, ok := choice.(string); ok {
+		wire = mode
+		switch mode {
+		case "auto", "none", "required":
+			policy.mode = mode
+		default:
+			// Existing CN clients may use the bare declared function name.
+			name := upstreamToolName(req.toolAliasIndex(), "", mode)
+			if !available[name] {
+				return nil, nil, fmt.Errorf("tool_choice references undeclared tool %q", mode)
+			}
+			policy.mode, policy.exact = "required", true
+			policy.allowed = map[string]bool{name: true}
+			wire = name
+		}
+	} else if object, ok := choice.(map[string]any); ok {
+		if object["type"] == "allowed_tools" {
+			if mode, ok := object["mode"].(string); ok {
+				policy.mode = mode
+			}
+			policy.allowed = map[string]bool{}
+			references, _ := object["tools"].([]any)
+			for _, raw := range references {
+				reference, _ := raw.(map[string]any)
+				name, err := resolve(reference)
+				if err != nil {
+					return nil, nil, err
+				}
+				policy.allowed[name] = true
+			}
+			selected := make([]any, 0, len(policy.allowed))
+			for _, raw := range tools {
+				tool, _ := raw.(map[string]any)
+				if policy.allowed[chatToolName(tool)] {
+					selected = append(selected, raw)
+				}
+			}
+			tools, wire = selected, policy.mode
+		} else {
+			name, err := resolve(object)
+			if err != nil {
+				return nil, nil, err
+			}
+			policy.mode, policy.exact = "required", true
+			policy.allowed = map[string]bool{name: true}
+			wire = map[string]any{"type": "function", "function": map[string]any{"name": name}}
+		}
+	}
+	if policy.mode == "required" && len(tools) == 0 {
+		return nil, nil, fmt.Errorf("tool_choice=required needs at least one supported declared tool")
+	}
+	return tools, wire, nil
+}
+
+func (policy *responseToolPolicy) validate(calls []responseToolInvocation, refusal bool) error {
+	if policy == nil || (refusal && len(calls) == 0) {
+		return nil
+	}
+	if policy.mode == "none" && len(calls) > 0 {
+		return fmt.Errorf("model returned a tool call despite tool_choice=none")
+	}
+	if policy.mode == "required" && len(calls) == 0 {
+		return fmt.Errorf("model returned no tool call despite a required tool choice")
+	}
+	if policy.exact && len(calls) != 1 {
+		return fmt.Errorf("model must return exactly one call for a named tool choice")
+	}
+	for _, call := range calls {
+		if policy.allowed != nil && !policy.allowed[call.name] {
+			return fmt.Errorf("model called tool %q outside tool_choice", call.name)
+		}
+		if schema := policy.schemas[call.name]; schema != nil {
+			decoder := json.NewDecoder(strings.NewReader(call.arguments))
+			decoder.UseNumber()
+			var value any
+			if err := decoder.Decode(&value); err != nil {
+				return fmt.Errorf("model returned invalid JSON arguments for strict tool %q", call.name)
+			}
+			if err := schema.Validate(value); err != nil {
+				return fmt.Errorf("model arguments do not match strict tool %q schema", call.name)
+			}
+		}
+	}
+	return nil
 }
 
 func parseOutputContract(raw json.RawMessage) (*outputContract, error) {
@@ -67,19 +225,7 @@ func parseOutputContract(raw json.RawMessage) (*outputContract, error) {
 		if !ok {
 			return nil, fmt.Errorf("text.format.schema must be an object")
 		}
-		encoded, err := json.Marshal(rawSchema)
-		if err != nil {
-			return nil, err
-		}
-		compiler := jsonschema.NewCompiler()
-		compiler.LoadURL = func(string) (io.ReadCloser, error) {
-			return nil, fmt.Errorf("external schema references are not supported")
-		}
-		const schemaURL = "https://workbuddy2api.invalid/output.schema.json"
-		if err := compiler.AddResource(schemaURL, bytes.NewReader(encoded)); err != nil {
-			return nil, fmt.Errorf("invalid output schema: %w", err)
-		}
-		schema, err := compiler.Compile(schemaURL)
+		schema, err := compileResponseSchema(rawSchema)
 		if err != nil {
 			return nil, fmt.Errorf("invalid output schema: %w", err)
 		}

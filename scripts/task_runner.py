@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# ═══ 更新日志 ═══
+# 2026-09-18：任务或账号加载失败返回非零退出码，避免调度器将失败任务记录为执行成功。
 """task_runner —— 批量「查询 → 完成(点亮) → 领取」成长任务的一体化辅助工具.
 
 用途
@@ -1029,6 +1031,7 @@ def main():
             c = tc.load_auth(p)
         except SystemExit as e:
             print(f"ERR: {e}")
+            stats["fail"] += 1
             continue
         stats["accounts"] += 1
         # global realm 不适用 CN 任务中心：明确跳过、不发起任何请求（P2 门控结论）。
@@ -1040,7 +1043,8 @@ def main():
         process_account(c, a, stats)
 
     print_summary(stats)
+    return 1 if stats["fail"] or not prefixes2 else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

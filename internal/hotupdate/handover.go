@@ -1,12 +1,16 @@
 // ═══ 更新日志 ═══
+// 2026-09-18：校验完整 ready 握手，允许就绪后原子提交；失败回收候选进程并保留旧监听器清理语义。
+// 2026-09-18：复制监听 FD 时保留 O_NONBLOCK，避免候选启动失败后旧进程 Accept/Close 永久阻塞。
 // 2026-09-17：新增热更新的监听套接字交接：父进程把 listener 以 FD 传给新实例，
 //
 //	新实例 ready 后父进程再优雅停机，在途请求（含长 SSE）不受影响。
 package hotupdate
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -108,6 +112,10 @@ func NotifyReady() error {
 // 调用方在返回后应当停止接受新连接并等待在途请求收尾（srv.Shutdown）：
 // 此刻新实例已经在同一个套接字上 accept，旧连接继续由本进程服务到结束。
 func Handover(binary string, args []string, ln net.Listener, adminLn net.Listener, wait time.Duration) error {
+	return handover(binary, args, ln, adminLn, wait, nil)
+}
+
+func handover(binary string, args []string, ln net.Listener, adminLn net.Listener, wait time.Duration, commit func() error) error {
 	if _, ok := ln.(*net.TCPListener); !ok {
 		return fmt.Errorf("listener is %T, need *net.TCPListener", ln)
 	}
@@ -121,10 +129,6 @@ func Handover(binary string, args []string, ln net.Listener, adminLn net.Listene
 	// 重新 bind（apikeys.ListenUnix 会判定 already in use），只能继承 FD。
 	var adminFile *os.File
 	if adminLn != nil {
-		if unixLn, ok := adminLn.(*net.UnixListener); ok {
-			// 关掉"关闭时删除 socket 文件"：老进程收尾时不能把新进程正服务的路径删掉。
-			unixLn.SetUnlinkOnClose(false)
-		}
 		adminFile, err = listenerFile(adminLn)
 		if err != nil {
 			return fmt.Errorf("dup admin listener: %w", err)
@@ -166,22 +170,36 @@ func Handover(binary string, args []string, ln net.Listener, adminLn net.Listene
 	}
 	ready := make(chan error, 1)
 	go func() {
-		buf := make([]byte, 32)
-		_, readErr := readPipe.Read(buf)
+		line, readErr := bufio.NewReader(io.LimitReader(readPipe, 64)).ReadString('\n')
+		if readErr == nil && line != "ready\n" {
+			readErr = errors.New("unexpected readiness message")
+		}
 		ready <- readErr
 	}()
+	stopCandidate := func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}
 
 	select {
 	case readErr := <-ready:
 		if readErr != nil {
-			_ = cmd.Process.Kill()
-			_, _ = cmd.Process.Wait()
+			stopCandidate()
 			return fmt.Errorf("new instance exited before reporting ready: %w", readErr)
 		}
 	case <-time.After(wait):
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
+		stopCandidate()
 		return fmt.Errorf("new instance did not report ready within %s", wait)
+	}
+	if commit != nil {
+		if err := commit(); err != nil {
+			stopCandidate()
+			return fmt.Errorf("commit new instance: %w", err)
+		}
+	}
+	if unixLn, ok := adminLn.(*net.UnixListener); ok {
+		// 仅在交接提交后保留路径；失败时旧实例仍负责关闭和清理自己的 socket。
+		unixLn.SetUnlinkOnClose(false)
 	}
 
 	// 新实例已在服务：后台回收它，父进程继续把手上的在途请求跑完。
@@ -191,14 +209,20 @@ func Handover(binary string, args []string, ln net.Listener, adminLn net.Listene
 
 // listenerFile 取监听器的可传递副本（TCP 与 Unix domain 都支持）。
 func listenerFile(ln net.Listener) (*os.File, error) {
+	var raw syscall.RawConn
+	var err error
 	switch item := ln.(type) {
 	case *net.TCPListener:
-		return item.File()
+		raw, err = item.SyscallConn()
 	case *net.UnixListener:
-		return item.File()
+		raw, err = item.SyscallConn()
 	default:
 		return nil, fmt.Errorf("listener is %T, need *net.TCPListener or *net.UnixListener", ln)
 	}
+	if err != nil {
+		return nil, err
+	}
+	return duplicateListenerFile(raw)
 }
 
 // stripHandoverEnv 去掉继承来的交接环境变量，避免子进程里出现重复键

@@ -1,9 +1,25 @@
+// ═══ 更新日志 ═══
+// 2026-09-18：仅允许官方 GitHub Models 端点回退使用仓库凭据，自定义 AI 端点缺独立密钥时提前失败。
 const core = require('@actions/core');
 const fs = require('fs');
 const path = require('path');
 
 const SUPPORTED_LANGUAGES = new Set(['en', 'zh-cn']);
 const SUPPORTED_AI_API_TYPES = new Set(['chat-completions', 'responses']);
+const GITHUB_MODEL_ORIGINS = new Set(['https://models.github.ai', 'https://models.inference.ai.azure.com']);
+
+function validateAICredentialBoundary(baseUrl, independentKey) {
+  if (independentKey) return;
+  let endpoint;
+  try {
+    endpoint = new URL(baseUrl);
+  } catch (_error) {
+    throw new Error('A valid AI base URL and a separate ai-api-key are required.');
+  }
+  if (!GITHUB_MODEL_ORIGINS.has(endpoint.origin) || endpoint.username || endpoint.password) {
+    throw new Error('A separate ai-api-key is required for a non-GitHub Models endpoint; github-token will not be forwarded.');
+  }
+}
 
 function normalizeLanguage(language) {
   return language?.trim().toLowerCase() === 'zh-cn' ? 'zh-CN' : 'en';
@@ -97,6 +113,7 @@ function parseInputs(config) {
   // 获取自定义AI配置参数
   const customBaseUrl = core.getInput('ai-base-url') || process.env.INPUT_AI_BASE_URL || '';
   const customApiKey = core.getInput('ai-api-key') || process.env.INPUT_AI_API_KEY || '';
+  validateAICredentialBoundary(customBaseUrl || config.defaults.api_base_url, customApiKey);
   const aiApiType = (core.getInput('ai-api-type') || process.env.INPUT_AI_API_TYPE || config.defaults.ai_api_type).trim().toLowerCase();
 
   if (!SUPPORTED_AI_API_TYPES.has(aiApiType)) {

@@ -1,5 +1,7 @@
 "use strict";
 // ═══ 更新日志 ═══
+// 2026-09-18：所有管理写请求携带同源标记，覆盖账号、任务、会话和服务操作。
+// 2026-09-18：退出失败时保留页面并显示错误，不再跳转伪装成功；重启提示与后台收尾行为保持一致。
 // 2026-09-16：接入密钥管理导航与本页刷新，侧栏不再下发或复制完整配置密钥。
 
 var $  = function(s, r){ return (r || document).querySelector(s); };
@@ -90,8 +92,8 @@ $('#btnTheme').addEventListener('click', function(){
 /* ── 通讯 ─────────────────────────────────────────── */
 async function api(path, body){
   var opt = { headers:{ 'Content-Type':'application/json' }, cache:'no-store' };
-  // 写操作要带管理标记：面板自身的同源校验据此拒绝第三方页面代发请求。
-  if (path.indexOf('api/keys') === 0 || path.indexOf('api/update/') === 0){
+  // 所有写操作统一携带同源管理标记。
+  if (body !== undefined){
     opt.headers['X-Admin-Request'] = '1';
   }
   if (body !== undefined){ opt.method = 'POST'; opt.body = JSON.stringify(body || {}); }
@@ -586,7 +588,7 @@ function actDelete(uid, name){
     });
 }
 function actRestart(){
-  ask('重启网关', '重启期间服务中断约十秒，账号与配置改动会在此后生效。', '重启', false, async function(){
+  ask('重启网关', '重启期间服务会暂时中断，后台任务可能需要等待结束；账号与配置改动将在重新启动后生效。', '重启', false, async function(){
     busy(true);
     try{
       var r = await api('api/service/restart', {});
@@ -871,7 +873,8 @@ $('#btnTaskReload').addEventListener('click', async function(){
 $('#btnLogs').addEventListener('click', loadLogs);
 $('#btnLogout').addEventListener('click', function(){
   ask('退出登录', '将结束本机的登录会话，需要重新输入用户名和密码。', '退出', false, async function(){
-    try{ await api('api/auth/logout', {}); }catch(e){}
+    try{ await api('api/auth/logout', {}); }
+    catch(e){ toast(e.message || '退出失败，请稍后重试', 'err'); return; }
     location.replace('login');
   });
 });

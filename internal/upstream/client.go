@@ -1,6 +1,7 @@
 // Package upstream 封装对 CodeBuddy 上游（chat / billing / auth）的全部 HTTP 调用，
 // 以及错误分类（驱动 pool 冷却状态机）。
 // ═══ 更新日志 ═══
+// 2026-09-18：错误响应正文也遵守聊天空闲超时，避免已收到错误响应头后永久阻塞读体及账号租约。
 // 2026-09-16：请求全程使用同一凭据快照，同账号刷新合并并由 Auth 原子提交，消除刷新与聊天/模型/计费的竞争。
 // 2026-09-16：把明确的未批准渠道错误与内容策略拦截分开，避免伪造违禁词原因。
 // 2026-09-17：合并较新模型目录、限流及传输修复，并保留请求快照与刷新合并以防回归。
@@ -963,8 +964,9 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 				return nil, 0, nil, err
 			}
 			if resp.StatusCode >= 400 {
-				raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-				resp.Body.Close()
+				errorBody := monitorBody(resp.Body, c.IdleTimeout, cancel)
+				raw, rerr := io.ReadAll(io.LimitReader(errorBody, 1<<20))
+				errorBody.Close()
 				cancel()
 				// body 读失败（掐流/截断）→ 传输层错误：半截 raw 不交回调用方进 Classify，
 				// 否则 handler 侧 applyErrorPolicy 会按误判分类罚号。

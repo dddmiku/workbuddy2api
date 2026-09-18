@@ -1,9 +1,11 @@
 // ═══ 更新日志 ═══
 // 2026-09-16：增加持久化多密钥管理，保留原密钥并使启停、删除立即生效，只保存随机密钥的 SHA-256。
 // 2026-09-17：密钥可绑定模型白名单；空列表保持不限制，非法模型名拒绝保存。
+// 2026-09-18：热更新并存实例按文件版本同步密钥，持锁读改写避免丢失撤销和新建操作；返回策略使用独立副本。
 package apikeys
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -23,6 +25,7 @@ import (
 )
 
 const MaxKeys = 256
+const maxKeyFileBytes = 8 << 20
 
 // MaxBoundModels 单个密钥可绑定的模型数量上限。
 const MaxBoundModels = 64
@@ -58,10 +61,11 @@ type document struct {
 }
 
 type Store struct {
-	mu      sync.RWMutex
-	path    string
-	keys    []record
-	persist func(document) error
+	mu       sync.RWMutex
+	path     string
+	keys     []record
+	persist  func(document) error
+	fileInfo os.FileInfo
 }
 
 func Open(path, existingKey string) (*Store, error) {
@@ -70,7 +74,12 @@ func Open(path, existingKey string) (*Store, error) {
 	}
 	s := &Store{path: path, keys: []record{}}
 	s.persist = s.write
-	f, err := os.Open(path)
+	unlock, err := lockKeyStore(path)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	keys, info, err := readKeyRecords(path)
 	if errors.Is(err, os.ErrNotExist) {
 		if existingKey != "" {
 			s.keys = append(s.keys, record{Info: Info{ID: "legacy", Name: "现有密钥", Note: "创建管理页前已在使用，原有客户端可继续使用", MaskedKey: mask(existingKey), Enabled: true, CreatedAt: time.Now().UTC(), Legacy: true}, Digest: digest(existingKey)})
@@ -78,38 +87,81 @@ func Open(path, existingKey string) (*Store, error) {
 		if err := s.persist(document{Version: 1, Keys: s.keys}); err != nil {
 			return nil, err
 		}
+		s.fileInfo, _ = os.Stat(path)
 		return s, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("open API keys: %w", err)
 	}
-	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, (1<<20)+1))
+	s.keys, s.fileInfo = keys, info
+	return s, nil
+}
+
+func readKeyRecords(path string) ([]record, os.FileInfo, error) {
+	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if len(data) > 1<<20 {
-		return nil, errors.New("API key file exceeds 1 MiB")
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxKeyFileBytes+1))
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(data) > maxKeyFileBytes {
+		return nil, nil, errors.New("API key file exceeds size limit")
 	}
 	var doc document
 	if err := json.Unmarshal(data, &doc); err != nil {
-		return nil, fmt.Errorf("invalid API key file: %w", err)
+		return nil, nil, fmt.Errorf("invalid API key file: %w", err)
 	}
 	if doc.Version != 1 || len(doc.Keys) > MaxKeys {
-		return nil, errors.New("unsupported API key file version or size")
+		return nil, nil, errors.New("unsupported API key file version or size")
 	}
 	seenIDs, seenDigests := map[string]bool{}, map[string]bool{}
 	for _, key := range doc.Keys {
 		decoded, e := hex.DecodeString(key.Digest)
 		if e != nil || len(decoded) != sha256.Size || key.ID == "" || strings.ContainsAny(key.ID, "/\\") || seenIDs[key.ID] || seenDigests[key.Digest] || !validLabel(key.Name, key.Note) || !validModels(key.Models) {
-			return nil, errors.New("invalid or duplicate API key record")
+			return nil, nil, errors.New("invalid or duplicate API key record")
 		}
 		seenIDs[key.ID], seenDigests[key.Digest] = true, true
 	}
-	if doc.Keys != nil {
-		s.keys = doc.Keys
+	info, err := f.Stat()
+	return doc.Keys, info, err
+}
+
+func (s *Store) refreshLocked() error {
+	info, err := os.Stat(s.path)
+	if err != nil {
+		return err
 	}
-	return s, nil
+	if s.fileInfo != nil && os.SameFile(s.fileInfo, info) && s.fileInfo.Size() == info.Size() && s.fileInfo.ModTime() == info.ModTime() {
+		return nil
+	}
+	keys, loaded, err := readKeyRecords(s.path)
+	if err != nil {
+		return err
+	}
+	s.keys, s.fileInfo = keys, loaded
+	return nil
+}
+
+// Mutations reread under the same cross-process lock used by writers. A
+// draining process must not overwrite a newer instance's key revocations.
+func (s *Store) lockAndRefresh() (func(), error) {
+	unlock, err := lockKeyStore(s.path)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.refreshLocked(); err != nil {
+		unlock()
+		return nil, err
+	}
+	return unlock, nil
+}
+
+func copyInfo(info Info) Info {
+	info.Models = append([]string(nil), info.Models...)
+	return info
 }
 
 func digest(key string) string {
@@ -184,24 +236,28 @@ func (s *Store) Resolve(key string) (Info, bool) {
 		return Info{}, false
 	}
 	want := digest(key)
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.refreshLocked(); err != nil {
+		return Info{}, false
+	}
 	for _, entry := range s.keys {
 		if entry.Enabled && subtle.ConstantTimeCompare([]byte(want), []byte(entry.Digest)) == 1 {
-			info := entry.Info
-			info.Models = append([]string(nil), entry.Models...)
-			return info, true
+			return copyInfo(entry.Info), true
 		}
 	}
 	return Info{}, false
 }
 
 func (s *Store) List() []Info {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.refreshLocked(); err != nil {
+		return nil
+	}
 	result := make([]Info, 0, len(s.keys))
 	for _, entry := range s.keys {
-		result = append(result, entry.Info)
+		result = append(result, copyInfo(entry.Info))
 	}
 	return result
 }
@@ -227,6 +283,11 @@ func (s *Store) Create(name, note string, models []string) (Info, string, error)
 	entry := record{Info: Info{ID: "key_" + hex.EncodeToString(id[:]), Name: name, Note: note, MaskedKey: mask(key), Enabled: true, CreatedAt: time.Now().UTC(), Models: models}, Digest: digest(key)}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := s.lockAndRefresh()
+	if err != nil {
+		return Info{}, "", err
+	}
+	defer unlock()
 	if len(s.keys) >= MaxKeys {
 		return Info{}, "", ErrLimit
 	}
@@ -234,12 +295,17 @@ func (s *Store) Create(name, note string, models []string) (Info, string, error)
 	if err := s.commit(next); err != nil {
 		return Info{}, "", err
 	}
-	return entry.Info, key, nil
+	return copyInfo(entry.Info), key, nil
 }
 
 func (s *Store) Update(id string, name, note *string, enabled *bool, models *[]string) (Info, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := s.lockAndRefresh()
+	if err != nil {
+		return Info{}, err
+	}
+	defer unlock()
 	next := append([]record{}, s.keys...)
 	for i := range next {
 		if next[i].ID != id {
@@ -266,7 +332,7 @@ func (s *Store) Update(id string, name, note *string, enabled *bool, models *[]s
 		if err := s.commit(next); err != nil {
 			return Info{}, err
 		}
-		return next[i].Info, nil
+		return copyInfo(next[i].Info), nil
 	}
 	return Info{}, ErrNotFound
 }
@@ -274,6 +340,11 @@ func (s *Store) Update(id string, name, note *string, enabled *bool, models *[]s
 func (s *Store) Delete(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := s.lockAndRefresh()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	next := make([]record, 0, len(s.keys))
 	found := false
 	for _, key := range s.keys {
@@ -294,10 +365,18 @@ func (s *Store) commit(keys []record) error {
 		return err
 	}
 	s.keys = keys
+	s.fileInfo, _ = os.Stat(s.path)
 	return nil
 }
 
 func (s *Store) write(doc document) error {
+	var encoded bytes.Buffer
+	if err := json.NewEncoder(&encoded).Encode(doc); err != nil {
+		return err
+	}
+	if encoded.Len() > maxKeyFileBytes {
+		return errors.New("API key file exceeds size limit")
+	}
 	dir := filepath.Dir(s.path)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
@@ -309,7 +388,7 @@ func (s *Store) write(doc document) error {
 	tmp := f.Name()
 	defer os.Remove(tmp)
 	if err = f.Chmod(0600); err == nil {
-		err = json.NewEncoder(f).Encode(doc)
+		_, err = f.Write(encoded.Bytes())
 	}
 	if err == nil {
 		err = f.Sync()

@@ -1,9 +1,12 @@
+# ═══ 更新日志 ═══
+# 2026-09-18：网关停机宽限设为 3 分钟，覆盖默认在途 RPC 与最终状态落盘，避免 Docker 提前强杀。
 services:
   wb2api:
     build: .
     image: workbuddy2api-wb2api:local
     container_name: workbuddy2api
     restart: unless-stopped
+    stop_grace_period: 3m
     environment:
       - TZ=Asia/Shanghai
     ports:

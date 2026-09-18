@@ -1,3 +1,5 @@
+# ═══ 更新日志 ═══
+# 2026-09-18：发布镜像同样给网关 3 分钟停机宽限，保留在途 RPC 收尾和状态落盘时间。
 # 用 ghcr.io 上已发布的镜像启动，不在本地构建。
 #
 #   cd /opt/workbuddy2api
@@ -12,6 +14,7 @@ services:
     image: ghcr.io/dddmiku/workbuddy2api:latest
     container_name: workbuddy2api
     restart: unless-stopped
+    stop_grace_period: 3m
     environment:
       - TZ=Asia/Shanghai
     ports:

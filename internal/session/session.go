@@ -7,6 +7,9 @@
 //   - 分配优先"空闲账号"（未绑定任何会话的可用号）哈希，其次全池哈希（双段策略）；
 //   - LastActive 滚动续期，TTL 过期由后台 GC 或快路径惰性过期清理；
 //   - 每次绑定变更 fire-and-forget 镜像到 redisstore（防重启丢粘性）。
+//
+// ═══ 更新日志 ═══
+// 2026-09-18：GC 捕获本轮停止信号并等待退出，避免停止/重启后旧协程继续清理会话。
 package session
 
 import (
@@ -46,7 +49,9 @@ type Router struct {
 	mu      sync.RWMutex
 	entries map[string]entry
 	cfg     Config
+	gcMu    sync.Mutex
 	stop    chan struct{}
+	gcDone  chan struct{}
 }
 
 // New 构建路由器。若 cfg.Store 为 nil 则用 Noop（纯内存）；cfg.Available 为 nil 视为空池。
@@ -66,20 +71,21 @@ func New(cfg Config) *Router {
 
 // StartGC 启动后台 GC goroutine（幂等）。进程退出时调 StopGC。
 func (r *Router) StartGC() {
-	r.mu.Lock()
+	r.gcMu.Lock()
+	defer r.gcMu.Unlock()
 	if r.stop != nil {
-		r.mu.Unlock()
 		return
 	}
-	r.stop = make(chan struct{})
-	r.mu.Unlock()
+	stop, done := make(chan struct{}), make(chan struct{})
+	r.stop, r.gcDone = stop, done
 
 	go func() {
+		defer close(done)
 		t := time.NewTicker(r.cfg.GCInterval)
 		defer t.Stop()
 		for {
 			select {
-			case <-r.stop:
+			case <-stop:
 				return
 			case <-t.C:
 				r.gcOnce(time.Now())
@@ -90,11 +96,12 @@ func (r *Router) StartGC() {
 
 // StopGC 停止后台 GC（幂等）。
 func (r *Router) StopGC() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.gcMu.Lock()
+	defer r.gcMu.Unlock()
 	if r.stop != nil {
 		close(r.stop)
-		r.stop = nil
+		<-r.gcDone
+		r.stop, r.gcDone = nil, nil
 	}
 }
 

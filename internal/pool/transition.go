@@ -21,6 +21,9 @@
 //     disableLocked 只清冷却域、不动熔断——禁用是授权/session 终态，不应覆盖熔断观测。
 //   - clearCoolingLocked 是「冷却域归零」的单一来源，被 disableLocked 与
 //     reviveCoolingLocked（签到解冻）共用，二者对冷却域的处置因此永远一致。
+//
+// ═══ 更新日志 ═══
+// 2026-09-18：记录禁用与解冻的显式字段意图，跨实例合并时不把同值赋值误判为旧快照。
 package pool
 
 import "time"
@@ -49,7 +52,7 @@ func (p *Pool) disableLocked(e *entry, reason string) {
 	e.clearCoolingLocked()
 	e.disabled = true
 	e.reason = reason
-	p.dirty.Store(true)
+	p.markStateFieldsLocked(e.a.UID, "disabled", "reason", "until", "cool_kind", "soft_streak", "model_cooldowns")
 }
 
 // reviveCoolingLocked 只清冷却域（until/coolKind/reason/softStreak/modelCooldowns）
@@ -62,4 +65,5 @@ func (p *Pool) disableLocked(e *entry, reason string) {
 func (p *Pool) reviveCoolingLocked(e *entry, credits int64) {
 	e.credits = credits
 	e.clearCoolingLocked()
+	p.markStateFieldsLocked(e.a.UID, "credits", "reason", "until", "cool_kind", "soft_streak", "model_cooldowns")
 }

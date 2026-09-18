@@ -2,6 +2,7 @@
 // 2026-09-18：用一条"新版 Codex 客户端真实形态"的请求锁定兼容边界：风格/提示类字段
 // 一律接受并忽略，能力/状态类字段才报错。此前 namespace / tool_search / text.verbosity
 // 都是各自炸过一次才发现，这个用例把整面一次性钉住。
+// 2026-09-18：allowed_tools 现在实际约束转发子集，原始 custom/namespace 声明仍保留供响应回显。
 package server
 
 import (
@@ -58,15 +59,15 @@ func TestModernCodexRequestIsAccepted(t *testing.T) {
 			t.Errorf("上游 body 不应带 %q: %v", forbidden, chat[forbidden])
 		}
 	}
-	// 工具：function / custom / namespace 子工具照常扁平化，内置工具丢弃。
+	// 只转发 allowed_tools 选中的函数；其它声明仍留在 req 的映射与回显中。
 	tools := chatToolsByName(t, body)
-	for _, name := range []string{"exec_command", "apply_patch", "mcp__node_repl__js"} {
+	for _, name := range []string{"exec_command"} {
 		if tools[name] == nil {
 			t.Errorf("工具 %q 丢失: %v", name, tools)
 		}
 	}
-	if len(tools) != 3 {
-		t.Errorf("上游应只看到 3 个函数工具，实际 %d: %v", len(tools), tools)
+	if len(tools) != 1 {
+		t.Errorf("上游应只看到白名单中的 1 个函数工具，实际 %d: %v", len(tools), tools)
 	}
 	if req.customTools["apply_patch"] != true || req.toolAliases["mcp__node_repl__js"].Namespace != "mcp__node_repl" {
 		t.Errorf("工具映射记录不对: custom=%v alias=%+v", req.customTools, req.toolAliases)

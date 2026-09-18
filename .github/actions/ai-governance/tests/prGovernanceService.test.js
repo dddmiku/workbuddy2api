@@ -1,3 +1,5 @@
+// ═══ 更新日志 ═══
+// 2026-09-18：PR 复用 canonical 边界校验，模型给出不存在的关联目标时不改标题或正文。
 const baseConfig = require('../config.json');
 const { applyLocale } = require('../src/utils/config');
 const PrGovernanceService = require('../src/services/prGovernanceService');
@@ -43,6 +45,18 @@ const pr = {
 };
 
 describe('PrGovernanceService', () => {
+  test('an unindexed duplicate target does not rewrite the PR', async () => {
+    const openai = makeOpenai([JSON.stringify({ '要点': 'fixture', '要做的事': ['fixture'] }), 'DUPLICATE(#999)']);
+    const ops = makeOps({ canonicalItems: [{ number: 57, title: 'fixture', body: 'fixture' }] });
+    const service = new PrGovernanceService(openai, 'model', buildConfig(), { dryRun: false }, ops);
+    const result = await service.govern({}, 'o', 'r', pr, 'enhancement');
+    expect(result.decision).toBe(GOVERNANCE_DECISIONS.UNCERTAIN);
+    expect(ops.updatePullRequest).not.toHaveBeenCalled();
+    expect(ops.updateIssueState).not.toHaveBeenCalled();
+    expect(ops.createIssue).not.toHaveBeenCalled();
+    expect(ops.addComment.mock.calls.every(call => call[3] === pr.number)).toBe(true);
+  });
+
   test('匹配成功：规范化标题 + 评论关联 + 正文顶部追加 Related to + canonical 记录，绝不关闭 PR', async () => {
     const config = buildConfig();
     // 调用顺序：extract(structured) -> merge_match -> title（标题「加个缓存功能」不规范）

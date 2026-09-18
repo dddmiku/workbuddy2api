@@ -1,5 +1,9 @@
 // 持久化：本地 state.json 落盘/加载、Redis 快照镜像（StoreSnapshotter）、
 // 后台 flusher、择新恢复（RestoreFromSnapshot）。
+// ═══ 更新日志 ═══
+// 2026-09-18：缺失本地文件时恢复有效远端快照，写盘失败保留待写状态，关闭时等待后台落盘退出。
+// 2026-09-18：多实例先锁定并合并本实例变更，再用唯一临时文件原子替换；Redis 镜像使用合并后状态。
+// 2026-09-18：快照导入重置计数基线但保留恢复下限，并把账号删除代次贯穿文件与 Redis 恢复。
 package pool
 
 import (
@@ -28,15 +32,15 @@ type snapshot struct {
 }
 
 // StoreSnapshotter 池状态快照镜像的最小接口（redisstore.Store 满足；Noop 空实现安全）。
-// 与本地 state.json 并存，作启动恢复备份：快照比本地新才采用，否则本地优先。
+// 与本地 state.json 并存，作启动恢复备份：本地缺失或快照不早于本地时采用，否则本地优先。
 type StoreSnapshotter interface {
 	SaveState(data []byte)
 	LoadState() ([]byte, bool)
 }
 
 // RestoreFromSnapshot 择新恢复：比较本地 state.json 与 Redis 快照，采用较新者。
-// 无快照、快照无 savedAt、或本地不存在/不可读时，都会被判定为"本地优先/跳过快照"，
-// 同时打一条恢复来源日志。必须在 SyncToDir 之前调用（SyncToDir 只增删不入值）。
+// 本地文件缺失或不晚于有效快照时恢复；本地较新、快照缺失/无 savedAt，或其他 stat 错误时保留本地。
+// 必须在 SyncToDir 之前调用（SyncToDir 只增删不入值），恢复来源会写入日志。
 func (p *Pool) RestoreFromSnapshot() {
 	store := p.store
 	if store == nil || p.stateFp == "" {
@@ -56,7 +60,7 @@ func (p *Pool) RestoreFromSnapshot() {
 		log.Printf("[pool] 恢复来源=本地 state.json（Redis 快照无 saved_at）")
 		return
 	}
-	if localErr == nil && !localInfo.ModTime().After(snap.SavedAt) {
+	if os.IsNotExist(localErr) || (localErr == nil && !localInfo.ModTime().After(snap.SavedAt)) {
 		// 快照不早于本地 → 采用快照。
 		p.mu.Lock()
 		p.applySnapshotLocked(snap)
@@ -74,7 +78,9 @@ func (p *Pool) RestoreFromSnapshot() {
 func (p *Pool) startFlusher() {
 	interval := flushInterval // 在启动 goroutine 前同步读取，避免与测试对 flushInterval 的恢复写竞争
 	p.stopCh = make(chan struct{})
+	p.flusherDone = make(chan struct{})
 	go func() {
+		defer close(p.flusherDone)
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
@@ -99,6 +105,7 @@ func (p *Pool) Close() {
 	p.closeOnce.Do(func() {
 		if p.stopCh != nil {
 			close(p.stopCh)
+			<-p.flusherDone
 		}
 	})
 	p.Flush()
@@ -125,6 +132,7 @@ func (p *Pool) load() {
 		return
 	}
 	p.applyAccountsLocked(sf.Accounts)
+	p.persistBase = sf
 }
 
 // applyAccountsLocked 用持久化账号状态覆盖/插入 byUID（placeholder 凭证，Add 时换全）。
@@ -206,8 +214,34 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 
 // applySnapshotLocked 用 Redis 快照覆盖内存状态（已在择新判定后采用）。调用方必须已持有 p.mu。
 func (p *Pool) applySnapshotLocked(s snapshot) {
+	p.stateIntents = nil
+	for uid := range p.byUID {
+		if _, exists := s.Accounts[uid]; !exists {
+			change := p.stateIntentLocked(uid)
+			change.deleted, change.deletedEpoch = true, s.AccountEpochs[uid]
+		}
+	}
 	p.byUID = map[string]*entry{}
 	p.applyAccountsLocked(s.Accounts)
+	if p.persistBase.Accounts == nil {
+		p.persistBase.Accounts = make(map[string]stateAccount)
+	}
+	if p.persistBase.AccountEpochs == nil {
+		p.persistBase.AccountEpochs = make(map[string]uint64)
+	}
+	for uid, epoch := range s.AccountEpochs {
+		p.persistBase.AccountEpochs[uid] = max(p.persistBase.AccountEpochs[uid], epoch)
+	}
+	for uid, e := range p.byUID {
+		base, known := p.persistBase.Accounts[uid]
+		base.SuccessCount, base.ErrTotal, base.ErrCount = e.successCount, e.errTotal, 0
+		p.persistBase.Accounts[uid] = base
+		change := p.stateIntentLocked(uid)
+		change.importedCounters, change.importedSuccess, change.importedErrors = true, e.successCount, e.errTotal
+		if !known {
+			change.created, change.createdEpoch = true, s.AccountEpochs[uid]
+		}
+	}
 }
 
 // saveLocked 把内存状态原子落盘（tmp + rename），并 fire-and-forget 镜像一份快照
@@ -216,24 +250,57 @@ func (p *Pool) saveLocked() {
 	if p.stateFp == "" {
 		return
 	}
-	sf := p.stateOverviewLocked()
+	if dir := filepath.Dir(p.stateFp); dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			p.notePersistFail(err)
+			return
+		}
+	}
+	unlock, err := lockPoolState(p.stateFp)
+	if err != nil {
+		p.notePersistFail(err)
+		return
+	}
+	defer unlock()
+	current := p.stateOverviewLocked()
+	sf, err := p.mergedStateLocked(current)
+	if err != nil {
+		p.notePersistFail(err)
+		return
+	}
 	raw, err := json.MarshalIndent(sf, "", "  ")
 	if err != nil {
 		p.notePersistFail(err)
 		return
 	}
-	if dir := filepath.Dir(p.stateFp); dir != "" {
-		_ = os.MkdirAll(dir, 0o755)
-	}
-	tmp := p.stateFp + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(p.stateFp), ".pool-state-*.tmp")
+	if err != nil {
 		p.notePersistFail(err)
 		return
 	}
-	if err := os.Rename(tmp, p.stateFp); err != nil {
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(raw); err != nil {
+		_ = tmp.Close()
 		p.notePersistFail(err)
 		return
 	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		p.notePersistFail(err)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		p.notePersistFail(err)
+		return
+	}
+	if err := os.Rename(tmp.Name(), p.stateFp); err != nil {
+		p.notePersistFail(err)
+		return
+	}
+	current.AccountEpochs = cloneAccountEpochs(sf.AccountEpochs)
+	p.persistBase = current
+	p.stateIntents = nil
+	p.dirty.Store(false)
 	if p.persistFails > 0 {
 		// 从连续失败中恢复：打一条恢复日志，避免"错误打完却无人知道已恢复"。
 		log.Printf("[pool] state.json 落盘恢复（此前连续失败 %d 次）", p.persistFails)
@@ -254,6 +321,7 @@ func (p *Pool) saveLocked() {
 // 恢复成功的日志由 saveLocked 在成功路径统一打。与 redisstore 三处异步写的
 // "失败仅打日志、不向上抛"范式对齐，但落盘失败对运维是盲区，故多一层节流（notification）。
 func (p *Pool) notePersistFail(err error) {
+	p.dirty.Store(true)
 	if p.persistFails == 0 {
 		log.Printf("WARN: [pool] state.json 落盘失败（首次详报）: path=%s err=%v %s",
 			p.stateFp, err, persistFailDiag(p.stateFp))
@@ -301,7 +369,7 @@ func cooledReasonLocked(e *entry, now time.Time) (coolKind CoolKind, reason stri
 // stateOverviewLocked 收集当前内存状态为 stateFile（供落盘 + 快照镜像复用）。调用方必须已持 p.mu。
 func (p *Pool) stateOverviewLocked() stateFile {
 	now := time.Now()
-	sf := stateFile{Accounts: map[string]stateAccount{}}
+	sf := stateFile{Accounts: map[string]stateAccount{}, AccountEpochs: cloneAccountEpochs(p.persistBase.AccountEpochs)}
 	for uid, e := range p.byUID {
 		// 模型级冷却落盘（复用既有落盘循环，不新增遍历）。只写 Until 在未来的条目，
 		// 与恢复时过期过滤同口径——落盘即清理，避免 state.json 残留已过期条目。

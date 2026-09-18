@@ -6,10 +6,13 @@
 //
 // 未配置 url / 连接失败时降级为 Noop：一切功能照常工作（纯内存模式），
 // 上层只打一条启动警告日志。
+// ═══ 更新日志 ═══
+// 2026-09-18：关闭时排空已提交写入，并按键保持镜像写入顺序，避免旧绑定或旧状态倒序覆盖。
 package redisstore
 
 import (
 	"context"
+	"errors"
 	"log"
 	"strings"
 	"sync"
@@ -24,6 +27,8 @@ const keyTTL = 7 * 24 * time.Hour
 // writeConcurrencyLimit fire-and-forget 异步写的在途上限（发现 4：写 goroutine
 // 无信号量限制，高写入速率下可瞬时堆积）。超过的排队不丢弃——写语义不变（见 goWrite）。
 const writeConcurrencyLimit = 8
+
+var closeWaitTimeout = 10 * time.Second
 
 // Store 只放本期需要的方法。上下文由实现内部构造（读操作配短超时，写操作 fire-and-forget）。
 type Store interface {
@@ -116,25 +121,53 @@ type Upstash struct {
 	done chan struct{}
 	// closeOnce 保证 Close 幂等（多次调用只关一次 done channel）。
 	closeOnce sync.Once
+	initOnce  sync.Once
+	writeMu   sync.Mutex
+	pending   sync.WaitGroup
+	tails     map[string]chan struct{}
+	closeErr  error
 }
 
 // goWrite 以 fire-and-forget 方式执行 fn：写槽（sem）有界并发，Close 前提交的写
 // 必然执行（停机镜像完整性），Close 后提交的写直接丢弃（进程已在退出）。
 func (u *Upstash) goWrite(fn func()) {
+	u.goWriteKey("", fn)
+}
+
+func (u *Upstash) goWriteKey(key string, fn func()) {
 	u.closeOnceGuard()
+	u.writeMu.Lock()
+	select {
+	case <-u.done:
+		u.writeMu.Unlock()
+		return
+	default:
+	}
+	var previous, completed chan struct{}
+	if key != "" {
+		previous = u.tails[key]
+		completed = make(chan struct{})
+		u.tails[key] = completed
+	}
+	u.pending.Add(1)
+	u.writeMu.Unlock()
 	go func() {
-		// 先检查关停标志再抢写槽：Close 之后的提交直接丢弃。
-		select {
-		case <-u.done:
-			return
-		default:
+		defer u.pending.Done()
+		if previous != nil {
+			<-previous
 		}
-		select {
-		case <-u.done:
-			return
-		case u.sem <- struct{}{}:
-		}
+		u.sem <- struct{}{}
 		defer func() { <-u.sem }()
+		if completed != nil {
+			defer func() {
+				u.writeMu.Lock()
+				if u.tails[key] == completed {
+					delete(u.tails, key)
+				}
+				close(completed)
+				u.writeMu.Unlock()
+			}()
+		}
 		fn()
 	}()
 }
@@ -142,10 +175,15 @@ func (u *Upstash) goWrite(fn func()) {
 // closeOnceGuard 防零值 Upstash（未经 New 构造）在 goWrite/Close 上 nil-map 式崩溃：
 // sem/done 为 nil 时补建（cap=1）。仅测试会走到该路径。
 func (u *Upstash) closeOnceGuard() {
-	if u.sem == nil || u.done == nil {
-		u.sem = make(chan struct{}, 1)
-		u.done = make(chan struct{})
-	}
+	u.initOnce.Do(func() {
+		if u.sem == nil {
+			u.sem = make(chan struct{}, 1)
+		}
+		if u.done == nil {
+			u.done = make(chan struct{})
+		}
+		u.tails = make(map[string]chan struct{})
+	})
 }
 
 // Close 等待已提交的异步写全部执行完毕，再关底层 redis 连接；幂等。
@@ -153,23 +191,23 @@ func (u *Upstash) closeOnceGuard() {
 // pool 的最后一次 Flush→SaveState 已提交，本方法保证它写完才返回。
 func (u *Upstash) Close() error {
 	u.closeOnceGuard()
-	u.closeOnce.Do(func() { close(u.done) })
-	// 等在途 + 排队的写排空：写槽可被全部腾出，说明没有写在执行或排队
-	//（已持槽的写释放即归位，排队者会立刻取到——所以持续占满直到排空为止）。
-	deadline := time.Now().Add(10 * time.Second)
-	for i := 0; i < cap(u.sem); i++ {
+	u.closeOnce.Do(func() {
+		u.writeMu.Lock()
+		close(u.done)
+		u.writeMu.Unlock()
+		drained := make(chan struct{})
+		go func() { u.pending.Wait(); close(drained) }()
+		timer := time.NewTimer(closeWaitTimeout)
+		defer timer.Stop()
 		select {
-		case u.sem <- struct{}{}:
-		case <-time.After(time.Until(deadline)):
-			// 兜底超时（单写上限 5s×cap，10s 富余）：卡死的写不应阻塞进程退出。
+		case <-drained:
+		case <-timer.C:
 			log.Printf("[redisstore] WARN: Close 等待在途写超时，放弃（镜像可能未写完）")
-			return u.closeClient()
+			u.closeErr = errors.New("redisstore: timed out draining submitted writes")
 		}
-	}
-	for i := 0; i < cap(u.sem); i++ {
-		<-u.sem
-	}
-	return u.closeClient()
+		u.closeErr = errors.Join(u.closeErr, u.closeClient())
+	})
+	return u.closeErr
 }
 
 // closeClient 关底层 redis 连接（client 为 nil——测试构造——时跳过）。
@@ -187,7 +225,7 @@ func (u *Upstash) SetBind(key, uid string, ttl time.Duration) {
 	if ttl <= 0 {
 		ttl = keyTTL
 	}
-	u.goWrite(func() {
+	u.goWriteKey(bindKey(key), func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := u.client.Set(ctx, bindKey(key), uid, ttl).Err(); err != nil {
@@ -198,7 +236,7 @@ func (u *Upstash) SetBind(key, uid string, ttl time.Duration) {
 
 // DelBind 异步删除粘性会话绑定。
 func (u *Upstash) DelBind(key string) {
-	u.goWrite(func() {
+	u.goWriteKey(bindKey(key), func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := u.client.Del(ctx, bindKey(key)).Err(); err != nil {
@@ -209,7 +247,7 @@ func (u *Upstash) DelBind(key string) {
 
 // SaveState 异步写池状态 JSON 快照。
 func (u *Upstash) SaveState(data []byte) {
-	u.goWrite(func() {
+	u.goWriteKey(stateKey, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := u.client.Set(ctx, stateKey, data, keyTTL).Err(); err != nil {

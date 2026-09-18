@@ -6,6 +6,9 @@
 //
 //	服务端工具），风格与提示类字段（text.verbosity、truncation、allowed_tools、
 //	未知历史项）一律接受并忽略，避免客户端升级反复炸在 400 上。
+//
+// 2026-09-18：工具白名单是执行约束，校验 mode 和引用结构，不能静默放宽为任意工具。
+// 2026-09-18：拒绝无法区分的重复工具身份，避免名称映射和参数 schema 被覆盖。
 package server
 
 import (
@@ -120,6 +123,16 @@ func requestValidationTools(value any, path string, responses bool) error {
 	if !ok {
 		return fmt.Errorf("%s must be an array", path)
 	}
+	identities := map[string]bool{}
+	register := func(namespace string, tool map[string]any, toolPath string) error {
+		name := chatToolName(tool)
+		key := namespace + "\x00" + name
+		if identities[key] {
+			return fmt.Errorf("%s duplicates tool name %q in namespace %q", toolPath, name, namespace)
+		}
+		identities[key] = true
+		return nil
+	}
 	for i, raw := range tools {
 		toolPath := fmt.Sprintf("%s[%d]", path, i)
 		tool, err := requestValidationObject(raw, toolPath)
@@ -128,6 +141,21 @@ func requestValidationTools(value any, path string, responses bool) error {
 		}
 		if err := requestValidationToolSpec(tool, toolPath, responses, true); err != nil {
 			return err
+		}
+		switch tool["type"] {
+		case "function", "custom":
+			if err := register("", tool, toolPath); err != nil {
+				return err
+			}
+		case "namespace":
+			namespace, _ := tool["name"].(string)
+			children, _ := tool["tools"].([]any)
+			for index, raw := range children {
+				child, _ := raw.(map[string]any)
+				if err := register(namespace, child, fmt.Sprintf("%s.tools[%d]", toolPath, index)); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	return nil
@@ -352,14 +380,40 @@ func requestValidationToolChoice(value any, path string, responses bool) error {
 	kind := choice["type"].(string)
 	if responses {
 		if kind == "allowed_tools" {
-			// 白名单式选择：responsesToolChoice 会折成 auto。这是"限制模型可调用的工具"
-			// 的提示，网关没有等价物，接受声明但不收缩上游的可选工具集。
+			mode := "auto"
+			if value := choice["mode"]; value != nil {
+				var ok bool
+				mode, ok = value.(string)
+				if !ok || (mode != "auto" && mode != "required") {
+					return fmt.Errorf("%s.mode must be auto or required", path)
+				}
+			}
+			tools, ok := choice["tools"].([]any)
+			if !ok || (mode == "required" && len(tools) == 0) {
+				return fmt.Errorf("%s.tools must be an array and cannot be empty in required mode", path)
+			}
+			for index, raw := range tools {
+				toolPath := fmt.Sprintf("%s.tools[%d]", path, index)
+				tool, err := requestValidationObject(raw, toolPath)
+				if err != nil {
+					return err
+				}
+				if tool["type"] != "function" && tool["type"] != "custom" {
+					return fmt.Errorf("%s.type is not supported; select function or custom tools", toolPath)
+				}
+				if err := requestValidationString(tool["name"], toolPath+".name", true); err != nil {
+					return err
+				}
+				if err := requestValidationOptionalStrings(tool, toolPath, "namespace"); err != nil {
+					return err
+				}
+			}
 			return nil
 		}
 		if kind != "function" && kind != "custom" {
 			return fmt.Errorf("%s.type %q is not supported; use auto/none/required strings or a named function/custom choice", path, kind)
 		}
-		// This is the shape that responsesToolChoice actually maps. A nested
+		// This is the shape that prepareToolPolicy actually maps. A nested
 		// chat-style choice would otherwise silently fall back to auto.
 		// 命名空间内的工具额外带 namespace，映射时拼回出站扁平名。
 		if err := requestValidationOptionalStrings(choice, path, "namespace"); err != nil {

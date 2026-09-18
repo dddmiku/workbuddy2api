@@ -4,6 +4,9 @@
 // 2026-09-16：保留调用者指令，停止全局自动降级；校验输入并按真实流结果记录成功。
 // 2026-09-17：热更新触发不再要求先手动检查远端版本（没查过时由 Apply 自己查）。
 // Package server 暴露 OpenAI 兼容 HTTP 接口，内部驱动 pool 挑号 + upstream 转发。
+// 2026-09-18：直接 Chat 的工具选择与结构化输出复用严格契约，在校验通过前不发布成功终态。
+// 2026-09-18：直接 Chat 与 Responses 一致过滤未实现的内置声明，保持无工具请求的上游兼容性。
+// 2026-09-18：Chat别名只用于上游传输，验证后恢复公开工具名再交付客户端。
 package server
 
 import (
@@ -709,6 +712,30 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	if _, responses := w.(*responsesWriter); !responses {
+		contract, err := newChatOutputContract(requestObject)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			return
+		}
+		changed, err := normalizeChatToolDeclarations(requestObject, contract)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			return
+		}
+		if changed {
+			body, err = json.Marshal(requestObject)
+			if err != nil {
+				writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+				return
+			}
+		}
+		if contract != nil {
+			checked := &chatContractWriter{inner: w, req: contract}
+			w = checked
+			defer checked.finish()
+		}
+	}
 
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/账本/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
@@ -1044,6 +1071,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = http.StatusBadGateway
 				return
 			}
+		}
+		if formatter, ok := w.(interface{ PrepareCompletion(map[string]any) }); ok {
+			formatter.PrepareCompletion(resp)
 		}
 		h.cfg.Pool.NoteSuccess(acct.UID)
 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)

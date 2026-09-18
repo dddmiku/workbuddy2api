@@ -1,6 +1,8 @@
 // 冷却与熔断：Cooldown（固定时长账号级冷却）、CooldownSoftRate（账号级软冷却，对齐
 // 上游重置时间或有界退避）、CooldownSoftForModel（模型级软冷却，对齐重置墙钟）、
 // 软冷却封顶、熔断失败累计、签到解冻（ReenableIfCredits/reviveCoolingLocked）。
+// ═══ 更新日志 ═══
+// 2026-09-18：为余额赋值及冷却/模型操作记录字段意图，多实例合并时保留其他账号与模型的独立更新。
 package pool
 
 import (
@@ -13,7 +15,7 @@ func (p *Pool) SetCredits(uid string, credits int64) {
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		e.credits = credits
-		p.dirty.Store(true)
+		p.markStateFieldsLocked(uid, "credits")
 	}
 }
 
@@ -31,7 +33,7 @@ func (p *Pool) SetCreditsDetailed(uid string, credits, expiring int64) {
 		}
 		e.credits = credits
 		e.creditsExpiring = expiring
-		p.dirty.Store(true)
+		p.markStateFieldsLocked(uid, "credits", "credits_expiring")
 	}
 }
 
@@ -54,7 +56,7 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 		// 避免上一次模型级限流的模型豁免泄漏到本次**账号级**限流上
 		// （否则换模型请求会错误绕过本次冷却）。
 		e.modelCooldowns = nil
-		p.dirty.Store(true)
+		p.markStateFieldsLocked(uid, "until", "cool_kind", "reason", "model_cooldowns")
 	}
 }
 
@@ -86,6 +88,7 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 				ResetAt: resetAt,
 				Reason:  reason,
 			}
+			p.markStateModelLocked(uid, model)
 		} else {
 			// 无解析时间（普通软冷却）：有界退避（base 起按 softStreak 翻倍、封顶
 			// softRateMax）。注意：**在软冷却中**（until 未到期）时不推进/不延长。
@@ -97,6 +100,7 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 			e.coolKind = CoolSoft
 			e.reason = reason
 			e.modelCooldowns = nil
+			p.markStateFieldsLocked(uid, "until", "cool_kind", "reason", "soft_streak", "model_cooldowns")
 		}
 		p.dirty.Store(true)
 	}
@@ -146,7 +150,7 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 		Reason: reason,
 		Hits:   hits,
 	}
-	p.dirty.Store(true)
+	p.markStateModelLocked(uid, model)
 }
 
 // BlockModelClear 清除 (账号, 模型) 的 11102 负缓存条目（该模型实测又通了）。半开探测或正常
@@ -171,7 +175,7 @@ func (p *Pool) BlockModelClear(uid, model string) {
 	if len(e.modelCooldowns) == 0 {
 		e.modelCooldowns = nil
 	}
-	p.dirty.Store(true)
+	p.markStateModelLocked(uid, model)
 }
 
 // CooldownSoftRate 429/限流文案的**账号级**软冷却入口（handler.applyErrorPolicy 调用）。
@@ -204,7 +208,7 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
 		e.coolKind = CoolSoft
 		e.reason = reason
 		e.modelCooldowns = nil // 账号级软冷却：清空模型豁免（切模型不绕过）
-		p.dirty.Store(true)
+		p.markStateFieldsLocked(uid, "until", "cool_kind", "reason", "soft_streak", "model_cooldowns")
 	}
 }
 

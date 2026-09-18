@@ -29,7 +29,9 @@ GitHub Action：把 NoMore Spam 改造成面向本仓库（workbuddy2api）的 *
 |--------|------|
 | **dry-run** | 默认 `true`：只评论「本应执行什么」，不关闭、不创建、不打标签 |
 | **维护者豁免** | 仓库协作者提交的 issue/PR 跳过治理（只做垃圾检测 + 分类） |
-| **AI 失败不误关** | 任何 AI 调用失败 → 只评论「已放行」+ 保持开启；**宁可漏判，不可误关** |
+| **AI 失败不误关** | AI 调用失败、拒答、输出长度截断或内容过滤均不作为完整治理判断 |
+| **凭据边界** | 只有官方 GitHub Models 端点可使用 GitHub token；自定义端点必须另配 AI key |
+| **归并目标校验** | AI 给出的编号必须存在于本次 canonical 索引，且不能是当前工单自身；否则按不确定处理 |
 | **先建后关** | 新主题时先创建 canonical，成功后才关闭原 issue；创建失败绝不关闭 |
 | **UNCERTAIN 放行** | 归并匹配证据不足时放行，仅评论，由维护者人工判断 |
 | **bot 自环防护** | 跳过 `github-actions[bot]` 自身 issue/PR，避免治理自己创建的 canonical 造成死循环 |
@@ -82,7 +84,7 @@ jobs:
 | `github-token` | `${{ github.token }}` | issues:write 足够；PR 治理改写标题/正文需 pull-requests:write；走 GitHub Models 还需 models:read |
 | `ai-model` | `openai/gpt-4o` | 模型名（`AI_MODEL` secret 可覆盖） |
 | `ai-base-url` | 空 | 自定义 OpenAI 兼容 base URL；缺省回落 GitHub Models |
-| `ai-api-key` | 空 | 自定义 API key；缺省用 GitHub token |
+| `ai-api-key` | 空 | 自定义端点必填；仅官方 GitHub Models 端点可使用 GitHub token |
 | `ai-api-type` | `chat-completions` | `chat-completions` 或 `responses` |
 | `labels` | `bug,enhancement,question,documentation` | 分类标签（对齐仓库 label） |
 | `language` | `zh-CN` | 机器人评论语言 |
@@ -98,6 +100,7 @@ jobs:
 ### 3. Secrets
 
 - `AI_MODEL` / `AI_BASE_URL` / `AI_API_KEY`：可选，自定义 AI 端点。**缺省三者都可以不配**——action 回落到 GitHub Models（用 `github.token` 做鉴权，靠 workflow 的 `models: read` 权限）。
+- 使用其他 AI 服务时必须配置独立的 `AI_API_KEY`。缺少该值会在调用前失败，不会将具有仓库写权限的 `github.token` 发到自定义地址。
 - 标签 `canonical` 与 `duplicate` 需在仓库 `Settings > Labels` 里预先建好（`canonical` 不存在时归并匹配退化：找不到索引 → 视为新主题，不会报错）。
 
 ### 4. 行为流程

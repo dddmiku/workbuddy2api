@@ -1,5 +1,6 @@
 // ═══ 更新日志 ═══
 // 2026-09-17：锁定命名空间工具（Codex 0.155 的 tools[].type=namespace）在请求、历史与回程的完整映射。
+// 2026-09-18：保留工具自身描述和分组说明，避免扁平化丢失使用上下文。
 package server
 
 import (
@@ -46,7 +47,7 @@ func TestNamespaceToolsFlattenForUpstream(t *testing.T) {
 	if _, dropped := tools["web_search"]; dropped {
 		t.Fatalf("web_search must stay dropped, got %v", tools)
 	}
-	if tools["mcp__node_repl__js"]["description"] != "run js" {
+	if tools["mcp__node_repl__js"]["description"] != "run js\n\nNamespace mcp__node_repl: node repl" {
 		t.Errorf("description lost: %v", tools["mcp__node_repl__js"])
 	}
 	custom := tools["mcp__node_repl__apply_patch"]["parameters"].(map[string]any)

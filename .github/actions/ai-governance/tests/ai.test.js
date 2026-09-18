@@ -1,3 +1,5 @@
+// ═══ 更新日志 ═══
+// 2026-09-18：Chat 截断或输出过滤不得成为治理判定，也不得被当成输入恶意而自动关闭工单。
 const { callAI, isContentFilterError } = require('../src/services/ai');
 
 describe('isContentFilterError', () => {
@@ -50,6 +52,23 @@ describe('callAI', () => {
       ai_response_body: '{body}'
     }
   };
+
+  test.each(['length', 'content_filter', 'tool_calls', 'function_call'])('rejects nonfinal Chat verdicts with finish_reason=%s', async finishReason => {
+    const openai = { chat: { completions: { create: jest.fn().mockResolvedValue({
+      choices: [{ message: { content: 'SPAM' }, finish_reason: finishReason }]
+    }) } } };
+    const pending = callAI(openai, 'model', { instructions: 'Classify spam.', input: 'fixture' }, config);
+    await expect(pending).rejects.toMatchObject({ code: 'response_incomplete' });
+    const error = await pending.catch(value => value);
+    expect(isContentFilterError(error)).toBe(false);
+  });
+
+  test('retains an explicit successful Chat stop verdict', async () => {
+    const openai = { chat: { completions: { create: jest.fn().mockResolvedValue({
+      choices: [{ message: { content: 'NOT_SPAM' }, finish_reason: 'stop' }]
+    }) } } };
+    await expect(callAI(openai, 'model', { instructions: 'Classify spam.', input: 'fixture' }, config)).resolves.toBe('NOT_SPAM');
+  });
 
   test('preserves generated answer casing when normalization is disabled', async () => {
     const openai = {

@@ -4,14 +4,18 @@
 // scripts/school_open_day_cron.sh 执行——依赖外部系统 cron、容器重建可能丢失、
 // 不在 config 里配置。迁入后成为独立任务，时点由 schedule.school_hours /
 // schedule.cat_hours 配置，school_open_day_cron.sh 保留为手动触发入口。
+// ═══ 更新日志 ═══
+// 2026-09-18：脚本继承排程取消并设置执行上限，关停时终止子进程及阻止后续命令。
 package scheduler
 
 import (
+	"context"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // repoRoot 定位仓库根（容器内 /app、宿主 /root/workbuddy2api）。
@@ -54,9 +58,17 @@ func (c *scriptCmd) SetDir(dir string) { c.cmd.Dir = dir }
 // 不接管时 exec.Cmd 会把子进程输出直接丢弃，开学季/夜猫子任务在容器日志里
 // 只剩一行 "school: ok"——脚本报了什么错、点了几个任务全看不见。
 func (c *scriptCmd) Run() error {
-	c.cmd.Stdout = scriptSink{}
-	c.cmd.Stderr = scriptSink{}
-	return c.cmd.Run()
+	return c.RunContext(context.Background())
+}
+
+func (c *scriptCmd) RunContext(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, c.cmd.Path, c.cmd.Args[1:]...)
+	cmd.Dir, cmd.Env, cmd.Stdin = c.cmd.Dir, c.cmd.Env, c.cmd.Stdin
+	cmd.Stdout, cmd.Stderr = scriptSink{}, scriptSink{}
+	cmd.WaitDelay = 2 * time.Second
+	return cmd.Run()
 }
 
 // newScriptCmd 构建脚本子进程。包级变量便于测试注入 fake（installFakeExec 覆盖）。
@@ -85,10 +97,23 @@ func pythonCmd() string {
 // runScript 依次执行若干脚本命令：任一命令失败只记一行 WARN，不向上抛、
 // 不影响调度主循环继续跑下一个时点。单命令失败不中断后续命令。
 func runScript(name, root string, commands [][]string) {
+	runScriptContext(context.Background(), name, root, commands)
+}
+
+func runScriptContext(ctx context.Context, name, root string, commands [][]string) {
 	for _, cmdArgs := range commands {
+		if ctx.Err() != nil {
+			return
+		}
 		c := newScriptCmd(cmdArgs[0], cmdArgs[1:]...)
 		c.SetDir(root)
-		if err := c.Run(); err != nil {
+		var err error
+		if runner, ok := c.(interface{ RunContext(context.Context) error }); ok {
+			err = runner.RunContext(ctx)
+		} else {
+			err = c.Run()
+		}
+		if err != nil {
 			log.Printf("WARN: %s (%s): %v", name, cmdArgs[1], err)
 			continue
 		}
@@ -100,8 +125,12 @@ func runScript(name, root string, commands [][]string) {
 // 全量跑任务点亮 + 领奖 + 自动抽空抽奖余额。活动下线（in_period=false）时脚本
 // 各段全量跳过、正常退出，不视为失败。失败只记 WARN。
 func (s *Scheduler) RunSchoolNow() {
+	s.runSchool(context.Background())
+}
+
+func (s *Scheduler) runSchool(ctx context.Context) {
 	root := repoRoot()
-	runScript("school", root, [][]string{
+	runScriptContext(ctx, "school", root, [][]string{
 		{pythonCmd(), "scripts/school_open_day_2026.py", "ALL", "--run", "--yes"},
 	})
 }
@@ -110,8 +139,12 @@ func (s *Scheduler) RunSchoolNow() {
 // black_cat 时段敏感：夜猫窗口 23:00–08:00 CST 内最多补 1 次（task_runner 内部
 // 判定，非窗口期打印 skip 正常退出）。失败只记 WARN。
 func (s *Scheduler) RunCatNow() {
+	s.runCat(context.Background())
+}
+
+func (s *Scheduler) runCat(ctx context.Context) {
 	root := repoRoot()
-	runScript("cat", root, [][]string{
+	runScriptContext(ctx, "cat", root, [][]string{
 		{pythonCmd(), "scripts/task_runner.py", "ALL", "--yes", "--only", "black_cat"},
 	})
 }

@@ -4,6 +4,11 @@
 // ═══ 更新日志 ═══
 // 2026-09-17：保留较新调度上下文及奖励幂等，统一凭据快照读取。
 // 2026-09-16：定时任务的凭据存在性判断改读快照，避免与聊天触发的刷新并发竞争。
+// ═══ 更新日志 ═══
+// 2026-09-18：排队任务在获取执行锁后再次检查取消，脚本类任务传递排程生命周期上下文。
+// 2026-09-18：签到和刷新在取消后停止后续请求，已完成的凭据刷新仍先落盘再退出。
+// 2026-09-18：统一手动与定时任务生命周期，Run 结束前取消并等待所有已接受的后台任务。
+// 2026-09-18：Run 在任务锁内补齐零值生命周期和任务映射，避免空取消回调崩溃且不替换已有任务上下文。
 package scheduler
 
 import (
@@ -87,9 +92,13 @@ type Scheduler struct {
 	// taskMu/taskLast/taskBusy 任务自省状态：供 /tasks 与账户管理面板读取"上次完成时刻"
 	// 与"是否正在跑"，并由 beginTask 统一做定时入口与手动触发的互斥。
 	// 只存内存、重启即清零（与 adoptTried 同口径：这些是观测值，不是要持久化的业务状态）。
-	taskMu   sync.Mutex
-	taskLast map[TaskKey]time.Time
-	taskBusy map[TaskKey]bool
+	taskMu    sync.Mutex
+	taskLast  map[TaskKey]time.Time
+	taskBusy  map[TaskKey]bool
+	taskWG    sync.WaitGroup
+	stopping  bool
+	lifecycle context.Context
+	cancel    context.CancelFunc
 
 	// runMu 全局任务互斥：同一时刻只允许一类任务在跑。这些任务打的是同一批上游
 	// 账号，并发只会让风控更容易命中；顺带让任务日志有唯一归属者，
@@ -130,8 +139,11 @@ func New(cfg Config) *Scheduler {
 	if cfg.ActivityReportCount <= 0 {
 		cfg.ActivityReportCount = 1
 	}
+	lifecycle, cancel := context.WithCancel(context.Background())
 	return &Scheduler{
 		cfg:           cfg,
+		lifecycle:     lifecycle,
+		cancel:        cancel,
 		adoptTried:    make(map[string]string),
 		rewardClaimed: make(map[string]string),
 		taskLast:      make(map[TaskKey]time.Time),
@@ -254,6 +266,31 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 
 // Run 主循环，阻塞直到 ctx 取消。
 func (s *Scheduler) Run(ctx context.Context) {
+	s.taskMu.Lock()
+	if s.lifecycle == nil || s.cancel == nil {
+		base := s.lifecycle
+		if base == nil {
+			base = context.Background()
+		}
+		s.lifecycle, s.cancel = context.WithCancel(base)
+	}
+	if s.taskLast == nil {
+		s.taskLast = make(map[TaskKey]time.Time)
+	}
+	if s.taskBusy == nil {
+		s.taskBusy = make(map[TaskKey]bool)
+	}
+	cancel := s.cancel
+	s.taskMu.Unlock()
+	stopForward := context.AfterFunc(ctx, cancel)
+	defer stopForward()
+	defer func() {
+		cancel()
+		s.taskMu.Lock()
+		s.stopping = true
+		s.taskMu.Unlock()
+		s.taskWG.Wait()
+	}()
 	for {
 		next, kinds := s.nextWake(time.Now())
 		if next.IsZero() {
@@ -307,8 +344,14 @@ func (s *Scheduler) dispatch(ctx context.Context, k taskKind) {
 // runTask 串行执行单类任务：全局互斥 + 日志归集。
 // 定时入口（dispatch）与手动触发（TriggerTask）都走这里，保证同一时刻只有一类任务在跑。
 func (s *Scheduler) runTask(ctx context.Context, k taskKind) {
+	if ctx.Err() != nil {
+		return
+	}
 	s.runMu.Lock()
 	defer s.runMu.Unlock()
+	if ctx.Err() != nil {
+		return
+	}
 	key := k.key()
 	taskSink.begin(key)
 	defer taskSink.end()
@@ -330,29 +373,33 @@ func (s *Scheduler) runTask(ctx context.Context, k taskKind) {
 func (s *Scheduler) runKind(ctx context.Context, k taskKind) {
 	switch k {
 	case taskCheckin:
-		s.RunCheckinNow()
+		s.runCheckin(ctx)
 	case taskTravel:
 		s.runTravel(ctx)
 	case taskActivity:
 		s.runActivity(ctx)
 	case taskKeepalive:
-		s.RunKeepaliveNow()
+		s.runKeepalive(ctx)
 	case taskSchool:
-		s.RunSchoolNow()
+		s.runSchool(ctx)
 	case taskCat:
-		s.RunCatNow()
+		s.runCat(ctx)
 	case taskRedeem:
-		s.RunRedeemNow()
+		s.runRedeem(ctx)
 	case taskLottery:
-		s.RunLotteryNow()
+		s.runLottery(ctx)
 	case taskMakeup:
-		s.RunMakeupNow()
+		s.runMakeup(ctx)
 	}
 }
 
 // RunCheckinNow 定时触发的立即签到：逐账号结果由 CheckinAll 记日志，此处只兜住"撞车跳过"。
 func (s *Scheduler) RunCheckinNow() {
-	if _, err := s.CheckinAll(); err != nil {
+	s.runCheckin(context.Background())
+}
+
+func (s *Scheduler) runCheckin(ctx context.Context) {
+	if _, err := s.checkinAll(ctx); err != nil {
 		log.Printf("scheduled checkin skipped: %v", err)
 	}
 }
@@ -364,6 +411,10 @@ func (s *Scheduler) RunCheckinNow() {
 // session dead 走 Pool.NoteSessionDead 的**连续计数**语义（与 keepalive 一致）：
 // 一次刷新失败不再立即杀号，连续 sessionDeadThreshold 次才禁用，刷新成功清计数。
 func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
+	return s.checkinAll(context.Background())
+}
+
+func (s *Scheduler) checkinAll(ctx context.Context) ([]CheckinOutcome, error) {
 	if !s.checkinMu.TryLock() {
 		return nil, ErrBusy
 	}
@@ -373,6 +424,9 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 	out := make([]CheckinOutcome, 0, len(statuses))
 	var okN, alreadyN, failN, skipN int
 	for _, st := range statuses {
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
 		oc := CheckinOutcome{UID: st.UID, Nickname: st.Nickname}
 		if st.Disabled {
 			oc.Status, oc.Detail = CheckinSkipped, "disabled"
@@ -423,6 +477,9 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 			}
 		}
 		// 签到返回错误（含"今天已签到"）也继续查余额：余额恢复即可解冻账号。
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
 		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
 			if upstream.IsAlreadyCheckin(err) {
 				// "今天已签到"是幂等成功，不是错误：不填 detail，免得回执里
@@ -438,6 +495,9 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 		}
 		// 分桶查余额：快过期窗口内的积分单独标记，pool 优先消耗（issue:积分过期）。
 		// ExpiringSoonWindow<=0 时退化为纯总量（与引入前一致）。
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
 		remain, buckets, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
 		if err != nil {
 			log.Printf("user-resource %s: %v", logfmt.UID8(st.UID), err)
@@ -501,6 +561,9 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 	count := s.cfg.ActivityReportCount
 	first := true
 	for _, st := range s.cfg.Pool.List() {
+		if ctx.Err() != nil {
+			return
+		}
 		if st.Disabled {
 			continue
 		}
@@ -521,6 +584,9 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		cid := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())
 		ok := 0
 		for i := 1; i <= count; i++ {
+			if ctx.Err() != nil {
+				return
+			}
 			rid := fmt.Sprintf("%s-r%d", cid, i)
 			if err := s.cfg.Upstream.ReportChatActivity(a, cid, rid); err != nil {
 				log.Printf("activity %s: report %d/%d: %v", logfmt.UID8(a.UID), i, count, err)
@@ -538,9 +604,15 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		if ok < count {
 			continue // N 条未发满：streak 自检与领养均无意义，下个账号
 		}
-		s.checkActivityStreak(a) // N 条全发满 → 回读 streak 自检（只留结论行）
-		s.travelAdoptForce(a)    // 无猫账号对话量刚补满 → 立即重试领养（豁免防抖）
-		s.claimGrowthRewards(a)  // 连登奖励 + 抽奖：点亮连登后按天领取（finally 语义：失败不拖累上报）
+		if ctx.Err() != nil {
+			return
+		}
+		s.checkActivityStreak(a)
+		if ctx.Err() != nil {
+			return
+		}
+		s.travelAdoptForce(ctx, a)
+		s.claimGrowthRewardsContext(ctx, a)
 	}
 }
 
@@ -579,6 +651,13 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 //
 // 日志每号一行可 grep：`activity %s: redeem tier=%s ...` / `activity %s: lottery ...`。
 func (s *Scheduler) claimGrowthRewards(a *auth.Auth) {
+	s.claimGrowthRewardsContext(context.Background(), a)
+}
+
+func (s *Scheduler) claimGrowthRewardsContext(ctx context.Context, a *auth.Auth) {
+	if ctx.Err() != nil {
+		return
+	}
 	if a == nil || a.Snapshot().AccessToken == "" {
 		return
 	}
@@ -604,6 +683,9 @@ func (s *Scheduler) claimGrowthRewards(a *auth.Auth) {
 		// 无新达标档位：不动写接口（不刷 WARN，这是正常态——很多天没到 7d）。
 		return
 	}
+	if ctx.Err() != nil {
+		return
+	}
 	res, err := s.cfg.Upstream.GrowthRedeem(a, tier, "")
 	switch {
 	case err == nil:
@@ -617,7 +699,7 @@ func (s *Scheduler) claimGrowthRewards(a *auth.Auth) {
 	// 标记当日已处理（无论 redeem 是否成功都记一次：领取类各状态当日不再重试，
 	// 避免对上游重复写；成功→无需再领，失败→当日不轰炸，次日自然日重置/上游幂等兜底）。
 	s.markRewardClaimed(a.UID)
-	s.claimGrowthLottery(a)
+	s.claimGrowthLotteryContext(ctx, a)
 }
 
 // growthEligibleTier 按当前连登天数挑选「尚未领取且达标」的最高档位。
@@ -640,6 +722,13 @@ func growthEligibleTier(days int, rs *upstream.GrowthRedemptionStatus) string {
 // （400 insufficient 正常态静默）；抽奖未开启（400 lottery disabled）静默。
 // client_token 每次 draw 必须新键（security-relevant，见 upstream.GrowthLotteryDraw）。
 func (s *Scheduler) claimGrowthLottery(a *auth.Auth) {
+	s.claimGrowthLotteryContext(context.Background(), a)
+}
+
+func (s *Scheduler) claimGrowthLotteryContext(ctx context.Context, a *auth.Auth) {
+	if ctx.Err() != nil {
+		return
+	}
 	chances, err := s.cfg.Upstream.GrowthLotteryChances(a)
 	if err != nil {
 		log.Printf("WARN: activity %s: lottery-chances: %v", logfmt.UID8(a.UID), err)
@@ -647,6 +736,9 @@ func (s *Scheduler) claimGrowthLottery(a *auth.Auth) {
 	}
 	if chances <= 0 {
 		log.Printf("activity %s: lottery skip (no chances)", logfmt.UID8(a.UID))
+		return
+	}
+	if ctx.Err() != nil {
 		return
 	}
 	res, err := s.cfg.Upstream.GrowthLotteryDraw(a, "") // 每次自动新 client_token
@@ -679,6 +771,10 @@ func (s *Scheduler) markRewardClaimed(uid string) {
 // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
 // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
 func (s *Scheduler) RunKeepaliveNow() {
+	s.runKeepalive(context.Background())
+}
+
+func (s *Scheduler) runKeepalive(ctx context.Context) {
 	// 成功路径本来完全静默（只在失败时打 WARN），面板上会是一片空白。
 	// 统计后补一行汇总，至少能看出"刷了几个号、失败几个"。
 	okCnt, failCnt, skipCnt := 0, 0, 0
@@ -686,6 +782,9 @@ func (s *Scheduler) RunKeepaliveNow() {
 		log.Printf("keepalive: 刷新成功 %d，失败 %d，跳过 %d", okCnt, failCnt, skipCnt)
 	}()
 	for _, st := range s.cfg.Pool.List() {
+		if ctx.Err() != nil {
+			return
+		}
 		if st.Disabled {
 			skipCnt++
 			continue

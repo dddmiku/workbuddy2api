@@ -1,6 +1,8 @@
 // travel.go 猫猫旅行巡检状态机：随旅行时点（travel_hours，默认 09 点）对池内每个可用账号单趟推进一次。
 // 无猫 → 同意协议 + 领养；有猫 → 按 travel/status 分派 派出 / 领奖 / 跳过。
 // 2026-09-16：旅行任务使用凭据快照检查刷新令牌，消除与其它刷新任务的读取竞争。
+// ═══ 更新日志 ═══
+// 2026-09-18：旅行及领养在单账号的请求之间检查取消，关停后不继续发送下一步请求。
 package scheduler
 
 import (
@@ -72,6 +74,9 @@ func (s *Scheduler) RunTravelNow() {
 func (s *Scheduler) runTravel(ctx context.Context) {
 	first := true
 	for _, st := range s.cfg.Pool.List() {
+		if ctx.Err() != nil {
+			return
+		}
 		if st.Disabled {
 			continue
 		}
@@ -88,24 +93,30 @@ func (s *Scheduler) runTravel(ctx context.Context) {
 			}
 		}
 		first = false
-		s.travelOne(a)
+		s.travelOne(ctx, a)
 	}
 }
 
 // travelOne 单账号单趟状态机：查有无猫 + 查状态 + 最多一个动作，不轮询不等待。
-func (s *Scheduler) travelOne(a *auth.Auth) {
+func (s *Scheduler) travelOne(ctx context.Context, a *auth.Auth) {
 	buddy, err := s.cfg.Upstream.BuddyInfo(a)
 	if err != nil {
 		log.Printf("travel %s: buddy-info: %v", logfmt.UID8(a.UID), err)
 		return
 	}
+	if ctx.Err() != nil {
+		return
+	}
 	if buddy == nil {
-		s.travelAdopt(a)
+		s.adoptBuddy(ctx, a, false)
 		return
 	}
 	ts, err := s.cfg.Upstream.TravelStatus(a)
 	if err != nil {
 		log.Printf("travel %s: status: %v", logfmt.UID8(a.UID), err)
+		return
+	}
+	if ctx.Err() != nil {
 		return
 	}
 	switch ts.State {
@@ -149,34 +160,43 @@ func (s *Scheduler) travelClaim(a *auth.Auth, ts *upstream.TravelState) {
 
 // travelAdopt 旅行巡检时领养：受 adoptTriedToday 当日防抖约束。
 func (s *Scheduler) travelAdopt(a *auth.Auth) {
-	s.adoptBuddy(a, false)
+	s.adoptBuddy(context.Background(), a, false)
 }
 
 // travelAdoptForce 活跃上报补满对话量后领养：豁免 adoptTriedToday 当日防抖。
 // 背景：旅行排程 09 点已领养且因对话量未达 skip，10 点活跃上报 5 连发把
 // 对话量补满——此时是「门槛刚达成」的新状态，不算对上游重试轰炸，放行重试。
 // 有猫账号 BuddyInfo 非空时直接跳过（不重复领养）。
-func (s *Scheduler) travelAdoptForce(a *auth.Auth) {
+func (s *Scheduler) travelAdoptForce(ctx context.Context, a *auth.Auth) {
 	buddy, err := s.cfg.Upstream.BuddyInfo(a)
 	if err != nil {
 		log.Printf("activity %s: buddy-info: %v", logfmt.UID8(a.UID), err)
 		return
 	}
+	if ctx.Err() != nil {
+		return
+	}
 	if buddy != nil {
 		return // 已有猫，无需领养
 	}
-	s.adoptBuddy(a, true) // force=true 豁免当日防抖
+	s.adoptBuddy(ctx, a, true) // force=true 豁免当日防抖
 }
 
 // adoptBuddy 无猫时领养：先同意协议（幂等）再 buddy/first。
 // conversation 门槛未达标（HTTP 400 first_buddy task not completed yet）属预期行为，
 // 记一次当日已试后静默跳过，不再重试。force=true 时豁免当日防抖（活跃上报补满对话量后重试）。
-func (s *Scheduler) adoptBuddy(a *auth.Auth, force bool) {
+func (s *Scheduler) adoptBuddy(ctx context.Context, a *auth.Auth, force bool) {
+	if ctx.Err() != nil {
+		return
+	}
 	if !force && s.adoptTriedToday(a.UID) {
 		return
 	}
 	if err := s.cfg.Upstream.BuddyAgreement(a); err != nil {
 		log.Printf("travel %s: agreement: %v", logfmt.UID8(a.UID), err)
+		return
+	}
+	if ctx.Err() != nil {
 		return
 	}
 	err := s.cfg.Upstream.BuddyFirst(a)

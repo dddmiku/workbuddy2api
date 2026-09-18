@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-18：发布名称编码为单个文件名，下载使用独占临时文件并在校验后设可执行位，防止越界和符号链接覆盖。
 // 2026-09-17：新增自更新取件：查 GitHub Release 最新版本、按架构挑二进制并校验
 //
 //	SHA-256，供管理台一键热更新使用。
@@ -13,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -183,34 +185,36 @@ func (c *Client) Download(ctx context.Context, release Release, dir string) (str
 		return "", "", fmt.Errorf("download asset: HTTP %d", resp.StatusCode)
 	}
 
-	target := filepath.Join(dir, release.Tag+"-"+release.AssetName)
-	tmp := target + ".part"
-	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	target := filepath.Join(dir, url.PathEscape(release.Tag)+"-"+url.PathEscape(release.AssetName))
+	file, err := os.CreateTemp(dir, ".download-*.part")
 	if err != nil {
 		return "", "", err
 	}
+	tmp := file.Name()
+	defer os.Remove(tmp)
+	defer file.Close()
 	hasher := sha256.New()
 	written, copyErr := io.Copy(io.MultiWriter(file, hasher), io.LimitReader(resp.Body, maxReleaseBytes+1))
-	closeErr := file.Close()
 	if copyErr != nil {
-		_ = os.Remove(tmp)
 		return "", "", fmt.Errorf("download asset: %w", copyErr)
 	}
-	if closeErr != nil {
-		_ = os.Remove(tmp)
-		return "", "", closeErr
-	}
 	if written > maxReleaseBytes {
-		_ = os.Remove(tmp)
 		return "", "", fmt.Errorf("asset exceeds %d bytes", maxReleaseBytes)
 	}
 	sum := hex.EncodeToString(hasher.Sum(nil))
 	if want := strings.TrimPrefix(release.Digest, "sha256:"); want != "" && !strings.EqualFold(want, sum) {
-		_ = os.Remove(tmp)
 		return "", "", fmt.Errorf("sha256 mismatch: want %s got %s", want, sum)
 	}
+	if err := file.Chmod(0o755); err != nil {
+		return "", "", err
+	}
+	if err := file.Sync(); err != nil {
+		return "", "", err
+	}
+	if err := file.Close(); err != nil {
+		return "", "", err
+	}
 	if err := os.Rename(tmp, target); err != nil {
-		_ = os.Remove(tmp)
 		return "", "", err
 	}
 	return target, sum, nil

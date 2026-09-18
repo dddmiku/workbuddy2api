@@ -1,137 +1,139 @@
 # 接口兼容性
 
-网关将请求转换为上游可接受的格式，再转换回客户端接口。协议支持不代表上游会接受任何账号、模型或渠道。
+网关适配 `/v1/responses` 与 `/v1/chat/completions`，把请求转换为上游格式，并把结果还原给客户端。请求结构可以接受，不代表选定的上游模型、账号或渠道一定支持该能力。
 
 ## Responses
 
 | 能力 | 当前行为 |
 |---|---|
-| 文本输入、历史消息 | 支持，客户端发送完整历史 |
-| 图片输入 | 支持相关内容块转换，受出站图片预算影响 |
-| function 工具 | 支持调用与结果往返 |
-| custom 工具 | 桥接为函数参数，输出还原为 custom 调用 |
-| namespace 工具分组 | 展开为出站函数（`命名空间__工具名`），回程还原 `name` + `namespace`；保留子工具的扁平及嵌套 `function` 定义 |
-| `reasoning.effort` / `summary` | 转发；具体档位按模型能力处理 |
-| `parallel_tool_calls` | 保留；显式禁止并行时检查返回结果 |
-| `prompt_cache_key` | 保留，不等于服务端保存会话内容 |
-| `text.format` | 支持 text、json_object 和 json_schema |
-| `text.verbosity` | 接受声明但不转发（风格提示，上游无对应开关） |
-| `truncation` | 接受声明但不转发（网关无状态，是否自动截断由上游决定） |
-| `tool_choice.allowed_tools` | 接受声明，按 auto 处理（不收缩上游可选工具集） |
-| 未知的历史项类型（`tool_search_call`、`web_search_call` 等） | 忽略；`item_reference` 例外，它指向服务端保存的内容，仍然报错 |
-| `previous_response_id` | 不支持，返回 400 |
-| `store=true` | 不支持，返回 400 |
-| `background=true` | 不支持，返回 400 |
-| 服务端 `conversation` / `prompt` | 不支持非空值 |
-| 客户端自带的内置工具（`web_search`、`tool_search`） | 接受声明但不转发上游。官方 Codex 默认就会带上，拒绝会让整个会话不可用；模型只是不会去调用它们 |
-| 需要服务端能力的工具（`file_search`、`mcp`、`image_generation`、`computer_use`、`local_shell`） | 不支持，返回明确错误。这些是用户显式声明的能力，静默丢弃会让人误以为在生效 |
-| `text.verbosity` | 不支持非空值 |
+| 文本输入与历史消息 | 支持；客户端应发送所需的完整历史 |
+| 图片输入 | 转换已支持的图片内容块，受入站大小和出站图片预算限制 |
+| function 工具 | 支持声明、调用、结果与历史往返；`strict:true` 参数在成功终态前按 JSON Schema 校验 |
+| custom 工具 | 桥接为 `{input: string}` 函数参数，回程恢复原始 `input` 和 `custom_tool_call` |
+| namespace 工具分组 | 展开 function/custom 子工具，回程恢复 `name` 与 `namespace`；不支持分组继续嵌套 |
+| `tool_choice` | 支持 auto、none、required、指定 function/custom，以及下文的 allowed_tools 子集 |
+| `parallel_tool_calls` | 保留；显式 false 时检查成功结果是否返回多个调用 |
+| `text.format` | 支持 text、json_object、json_schema；结构化格式检查最终文本输出 |
+| `text.verbosity` | 接受有效字符串声明但不转发；上游没有对应的风格开关 |
+| `reasoning.effort` / `summary` | 转发，具体可用档位由模型决定 |
+| `prompt_cache_key` | 保留；它不是服务端历史存储 |
+| `truncation` | 接受有效声明但不实现本地自动截断；是否接受上下文由上游决定 |
+| 未知历史 item 类型 | 忽略其不支持的元数据，不把它提升为用户消息或聊天正文 |
+| 未知内容块类型 | Responses 内容适配器返回 400，避免接受后静默丢失正文 |
+| `previous_response_id`、`store=true`、`background=true` | 不支持，返回 400 |
+| 非空 `conversation` / `prompt`、`item_reference` | 不支持服务端会话、模板和引用解析，返回 400 |
 
-JSON Schema 校验针对最终文本输出，允许先完成工具调用。外部 schema 引用不受支持。模型拒答、上限截断和上游错误分别处理，不能只依赖 HTTP 200 判断最终业务结果。
+历史 item 与消息 content 是两个层级：未知的状态/扩展 item 可以忽略；已知消息里的正文不能因为转换器不认识内容类型而被静默丢掉。已支持的文字、图片和 refusal 内容会保留，工具结果中的 refusal 也不会变成空输出。
+
+custom 的 grammar/CFG 描述仅作为模型提示，不提供原生语法执行或语法约束保证。当前 custom 调用通过最终 `input` 与 `response.output_item.done` 交付；不声明完整支持专用 `custom_tool_call_input.delta/done` 事件族。
+
+## 工具选择与严格约束
+
+| 选择方式 | 成功完成时的约束 |
+|---|---|
+| `auto` | 模型可返回正文或工具调用 |
+| `none` | 不得返回工具调用 |
+| `required` | 至少声明一个可执行工具，且成功结果必须包含调用 |
+| 指定 function/custom | 必须恰好调用一次所指定的工具 |
+| `allowed_tools` | 只向上游提供选中的工具，并检查返回调用没有超出该子集；mode 支持 auto 或 required |
+
+`allowed_tools` 是 `tool_choice` 的一种对象形式，不是附加后按 auto 忽略。下面是选择已声明命名空间函数时的 `tool_choice` 值：
+
+```json
+{
+  "type": "allowed_tools",
+  "mode": "required",
+  "tools": [
+    {"type": "function", "namespace": "catalog", "name": "lookup"}
+  ]
+}
+```
+
+引用必须对应已声明且可执行的 function/custom 工具，类型和命名空间也必须匹配。非法 mode、未声明引用、required 下的空子集返回 400；重复的同一子集引用会去重。原始工具声明和返回时的公开名称保持不变。
+
+`strict:true` 函数参数按声明的 JSON Schema 校验，非法 schema 或外部 schema 引用在请求阶段拒绝。`strict:false` 或未声明 strict 的函数保持尽力模式，不额外套用严格参数 schema；工具名称、参数形状和完整性仍按相应协议路径检查。
+
+`text.format=json_schema` 检查最终文本是否匹配 schema；`json_object` 要求完整 JSON 对象，不能带 Markdown 围栏或尾随文字。可以先返回工具调用，随后再给最终结构化文本。纯拒答以及明确的 length/content_filter 不完整结果有独立语义，不会被 required 或指定工具约束强改成工具违约。
+
+## 内置工具的边界
+
+`web_search`、`tool_search` 及其版本后缀声明可以出现在两种接口中，但会从出站工具列表过滤。接受声明只用于兼容客户端默认元数据，不代表网关已实现联网搜索、工具发现或客户端内置工具执行。
+
+- 过滤后没有可执行工具，且选择为省略、auto 或 none 时，可移除无意义的工具控制字段。
+- 只剩不可执行内置工具却要求 required，或强制选择被过滤的工具时，前置返回 400，不发送上游请求，也不静默降级为 auto。
+- 混合声明中的 function/custom 仍按工具选择规则处理。
+- 需要服务端能力的 file_search、mcp、image_generation、computer_use、code_interpreter、local_shell 等内置类型不受支持，返回明确错误。
+
+这里区分的是工具的 type；用户声明的普通 function 不会仅因名称类似内置工具就被当成内置类型。
+
+## 命名空间与长工具名
+
+命名空间子函数支持 Responses 顶层 `name/parameters` 形式，也支持嵌套 `function.name/function.parameters` 形式。分组的使用说明会保留到出站描述。相同命名空间内的重复工具身份会被拒绝，不靠覆盖顺序猜选工具。
+
+一般出站名使用 `命名空间__工具名`。超过 64 字节时生成稳定短别名，采用保留 UTF-8 边界的前缀与摘要后缀，碰撞后缀也受长度限制。顶层长工具名同样处理。声明、历史调用、工具选择和回程还原共用映射；客户端继续使用原始名称，无需自行猜短别名。
+
+命名空间调用的回程形状例如：
+
+```json
+{
+  "type": "function_call",
+  "name": "lookup",
+  "namespace": "catalog",
+  "call_id": "call_example",
+  "arguments": "{\"query\":\"hello\"}"
+}
+```
+
+`/v1/chat/completions` 不接受 namespace/custom 类型声明；需要它们时使用 Responses 接口。直接 Chat 的普通 function 长名与兼容的 legacy function 字段也会同步映射和恢复。
+
+## Chat Completions
+
+直接 Chat 支持普通消息、function 工具和兼容的 legacy `functions/function_call` 形态。`response_format` 支持 text、json_object、json_schema；存在工具选择、严格参数或结构化输出要求时，复用上述成功完成校验，并逐个检查返回的 choice。
+
+流式请求中的正文、refusal 和工具参数增量保持实时输出。需要契约校验或别名还原时，仅推迟成功的 finish、末尾 usage 和 `[DONE]`；完整结果校验后再发终态。迟到的上游错误保留错误信封，不先发成功结束再补报错。非流式输出违约返回 502。
+
+已经发出的增量无法撤回，因此调用方必须检查最终状态或流内错误。收到 HTTP 200 或若干正文片段不能视为完整成功。Chat 的其他结构合法的内容形态可继续交给选定上游处理，不等同于网关保证该模态可用。
 
 ## 完成状态
 
-- 正常完成：`response.completed`，内部状态为 `completed`。
+- 正常完成：`response.completed`，内部状态为 completed。
 - 输出上限或内容过滤截断：`response.incomplete`，携带 `incomplete_details`。
-- 上游流错误、意外结束或输出契约不满足：失败状态或相应 HTTP 错误。
-- 不完整的工具参数不会作为可执行的完整工具调用交付。
-- 工具结束原因（`tool_calls` / `function_call`）没有实际调用时，返回 `missing_tool_call` 失败，不能静默当作成功正文。
-- 非数组的 `tool_calls` 返回格式错误；`null` 和空数组配合正常文字结束仍可接受。
+- 上游流错误、意外结束或输出契约不满足：`response.failed` 或相应 HTTP 错误。
+- refusal 按拒答字段和 `response.refusal.delta/done` 保留，不伪装成普通正文，也不把纯拒答当作缺少必需工具。
+- 不完整或无效的工具调用不会作为可执行的成功 `output_item.done` 交付。
+- `tool_calls/function_call` 结束原因没有实际调用时，返回 missing_tool_call 失败。
+- 非数组 tool_calls 是格式错误；null 或空数组配合正常正文结束仍可接受。
 
-`response.completed` 是响应的协议终态，不是整个用户任务的验收结论。工具调用与纯文字都可以有这个终态。模型用纯文字预告下一步却没有调用工具时，属于需要另行核对的提前收尾；网关的运行约定见 [Codex 接入](codex.md#预告文字与回合结束)。
+工具条目建立后，增量与最终结果保持同一 item/call 身份；早于名称到达的参数会暂存，不能靠猜测工具身份提前交付。失败或截断不会用成功工具终态掩盖缺失的数据。
 
-非流式请求由本地聚合上游 SSE。客户端取消、读取错误与格式错误保留其失败语义。
+`response.completed` 是一次响应的协议终态，不是整个用户任务的验收结论。工具调用与纯文字均可正常完成；模型只用文字预告下一步时，不能仅凭协议终态判断已完成所有工作。接入约定见 [Codex 接入](codex.md#预告文字与回合结束)。
+
+## 思考模式的推理回灌（上游 11155）
+
+Responses 的明文 reasoning 历史会转换为上游的 `reasoning_content`。DeepSeek 的兼容路径还会为相关 assistant 消息补齐字段存在性；只有 encrypted_content 时，网关不能解密并恢复推理原文。
+
+转换层会合并连续 assistant 片段，保留正文、多模态内容、工具调用及可用推理内容，兼容对消息形状敏感的上游。11155 不能单独证明是某一个字段缺失，也可能涉及历史消息结构；应检查客户端实际发送的历史形状，而不是把所有情况归结为模型能力或账号故障。
 
 ## 常见错误
 
 | 错误 | 排查方向 |
 |---|---|
-| `invalid_api_key` | 密钥缺失、已停用或已删除 |
-| `invalid_request` | 输入结构错误，或请求了尚未支持的能力 |
+| `invalid_api_key` | 密钥缺失、停用或删除 |
+| `invalid_request` | 输入结构、工具选择、schema 或不支持的服务端能力 |
 | `request_body_too_large` | 入站请求超过配置上限 |
-| `upstream_invalid_request` | 上游拒绝请求参数；查看脱敏诊断 |
-| `missing_tool_call` | 上游声称以工具调用结束，但整个响应没有返回实际调用 |
-| `upstream_channel_rejected` | 上游明确拒绝调用渠道 |
-| `upstream_waf_blocked` | 上游 WAF 按正文特征拦截（HTML/脚本或 SQL 样式文本），请求未到达模型 |
+| `response_contract_violation` | 模型的成功结果未满足声明的工具或输出约束 |
+| `missing_tool_call` | 工具结束原因缺少实际调用 |
+| `upstream_invalid_request` | 上游拒绝请求参数 |
+| `upstream_channel_rejected` | 上游拒绝调用渠道 |
+| `upstream_waf_blocked` | 上游入口拦截请求正文 |
 | `content_blocked` | 上游内容策略拒绝 |
 | `context_length_exceeded` | 模型上下文超限 |
-| `rate_limit_exceeded` | 账号或模型限流，需要等待恢复 |
+| `rate_limit_exceeded` | 账号或模型限流 |
 
-渠道拒绝与内容拒绝是不同原因，不能通过错误码 `11128` 单独判断。网关不会因这类请求错误替换用户正文或修改其他会话的系统指令。
-
-`upstream_channel_rejected` 的触发面已定位到系统说明，并收敛到一句：`Codex CLI is an open source project led by OpenAI.`。真实请求里移除全部工具声明仍然被拒，换成中性说明后立即通过；只删掉这一句、或把它改写成中性说法，整段 21026 字符的说明也能通过；单独的 `OpenAI` 一词（在说明里或在用户消息里）不触发。工具分组、模型名与用户消息不是触发点。网关保持正文原样，需要由客户端自带中性说明（见 [Codex 接入](codex.md)）；桌面版说明不含该句，CLI 默认说明含该句。
-
-`upstream_waf_blocked` 是上游 WAF 的判定结果，不是网关或账号故障。判定看**请求正文**、不看账号：2026-09-17 对国际版 `www.workbuddy.ai` 逐条对照实测，脚本标签与事件处理器、`alert(`/`eval(`、SQL 注入式表达式（`or 1=1`、`union select`、`drop table`）、命令注入片段（`sleep(`、`benchmark(`、`curl http://`）、`${jndi:` 以及 `%3C` / `\x3C` 编码变体返回 403 HTML 拦截页；普通文本、纯标签结构、Markdown 代码块、XML 声明、`information_schema`、`select ... where` 本身都通过。CN 链路上同一批正文全部 200。
-
-## 思考模式的推理回灌（上游 11155）
-
-DeepSeek 系模型在思考模式下，上游要求把上一轮的推理原文随历史带回，缺字段即返回
-`{"code":11155,"extError":{"code":"reasoning_content_missing"}}`（网关包装成
-`upstream_invalid_request`）。Responses 侧的推理项原样翻译成 chat 的 `reasoning_content`：
-
-1. 历史里每个 `reasoning` 项按 `summary[].text` / `content[].text` / 字符串形态取正文，
-   挂到紧随其后的 assistant 消息上；历史以推理项收尾时挂到最后一条 assistant 消息。
-2. 只要历史出现过推理项，deepseek 模型的**所有** assistant 消息都会带 `reasoning_content`
-   （拿不到原文的补空串），对齐官方客户端 `requiresReasoningContentOnAssistantMessages`
-   的匹配规则；非 deepseek 模型零改动。
-3. 只有加密推理（`encrypted_content` 且无明文）时同样会置位，避免整条链缺字段。
-
-上游仍返回 11155 时，网关打一行形状日志（只统计字段，不含正文）：
-`upstream 11155 shape ... assistant=N reasoning_content=N empty=N tool_call_msgs=N last_role=...
-history_reasoning_items=N with_text=N`。据此可区分「客户端没带推理项」「带了但没明文」
-与「assistant 消息缺字段」三种成因。
-
-### 相邻 assistant 消息必须合并（国际版真实成因）
-
-上面第 1–3 条只解决了「字段缺失」，2026-09-18 的真实会话复现表明 11155 还有第二种成因：
-**国际版后端要求「一条 assistant 消息 = 一个回话回合」**。
-
-Codex 在「先写一句话、再调工具」时，历史里是 `message` + `function_call` 两个独立 item，
-翻译后会变成两条相邻的 assistant 消息。国际版后端遇到这种历史直接 400：
-
-```text
-{"code":11155,"msg":"the reasoning content from the previous turn must be passed back in thinking mode",
- "extError":{"code":"reasoning_content_missing",...}}
-```
-
-实测矩阵（同一份最小历史，国际版 / 国内版对照）：
-
-| 历史尾部形状 | global | cn |
-|---|---|---|
-| 相邻 assistant：正文那条后面紧跟带 tool_calls 的那条 | **400 11155** | 200 |
-| 正文与 tool_calls 并成同一条 assistant | 200 | 200 |
-| 带正文的 assistant 后面紧跟 user / developer / system | 200 | 200 |
-| 纯工具往返（assistant(tool_calls) → tool → …） | 200 | 200 |
-
-因此转换层现在把**连续的 assistant 消息合并成一条**：正文按顺序拼接、tool_calls 依序合并、
-`reasoning_content` 取第一条非空值。真实会话复现验证：1361 项历史（1053 条 chat 消息、
-54 处相邻 assistant）合并前 400、合并后 200。国内版后端两种形状都接受，所以这条归一化
-对 CN 链路无行为变化。
-
-排查这类问题时先看上面那行形状日志：`assistant=` 条数明显多于回合数、或
-`last_reasoning_content=false` 而前面又有大量 assistant，就是这个成因。
-
-网关的处理分两步：
-
-1. 原样请求先发一次（正文保真优先）。
-2. 收到 WAF 拦截页时，把正文里命中的模式用零宽字符断开后**同路径自动重试一次**。零宽字符不参与词义、渲染不可见，模型仍读到同一段文本；重试成功后对调用方完全透明。
-
-只有重试后仍被拦，才返回 `upstream_waf_blocked`，并且不轮转账号、不惩罚账号、不回显拦截页 HTML。
-
-这一点对多轮会话尤其重要：**历史消息同样会被上游 WAF 扫描**，一旦某轮把触发片段写进历史，之后每一轮都会命中——网关的断词重试让这种会话可以继续，不需要用户删改历史或开新会话。
-
-## 命名空间工具
-
-新版 Codex 会把 MCP 与内部工具按 `tools[].type="namespace"` 分组上报。网关把分组内的 function/custom 工具展开成上游可用的扁平函数名（`mcp__node_repl__js` 这种三段式），并在返回工具调用时还原成客户端要的形状：
-
-```json
-{"type":"function_call","name":"js","namespace":"mcp__node_repl","call_id":"call_1","arguments":"{\"code\":\"1+1\"}"}
-```
-
-历史里的 `function_call` / `custom_tool_call` 也会按同样规则折回扁平名，模型看到的调用名前后一致。分组内允许 function 与 custom，不允许继续嵌套命名空间；`/v1/chat/completions` 不接受命名空间工具。子函数既可以使用 Responses 的顶层 `name` / `parameters`，也可以使用 Chat 风格的 `function.name` / `function.parameters`；转换时复制定义，原请求中的名称和 schema 保持不变。
+渠道拒绝、入口拦截和模型内容拒绝是不同原因。首次请求按正常转换发送；特定上游拦截可能触发有界的同路径字符串兼容重试，重试仍失败则返回对应错误，不保证任意请求都能通过。具体上游拦截规则不是静态协议承诺。
 
 ## 验证范围
 
-已在官方 codex-cli 0.153.4 中，以独立模型说明配置调用 `cn:deepseek-v4.1-flash`，完成文件读取、代码修改、工具往返、两轮续接及 strict JSON Schema 输出。默认 codex 请求的渠道限制另有失败记录。
+公开回归使用合成数据，覆盖工具子集与选择、严格/非严格参数、长名往返、refusal、未知历史项隔离、正文/图片保留、SSE 增量、截断与迟到错误。可检查 [协议回归](../internal/server/protocol_diagnosis_test.go)、[输出完整性回归](../internal/server/responses_output_integrity_test.go) 和 [请求结构校验](../internal/server/request_validation_test.go)。
 
-公开仓库保存合成回归数据；原始会话记录、账号凭据、个人环境信息和生产日志不作为测试资源发布。global 账号、全部模型和全部客户端组合仍需分别验证。
+这些检查不能等同于全部账号、模型、渠道和客户端组合均已实测通过。开源实现的固定提交、采用原则及未照搬的边界见 [协议实现参考](protocol-references.md)。

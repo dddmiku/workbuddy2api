@@ -1,4 +1,6 @@
 // Package pool 账号池：单一状态机（健康/冷却/熔断）+ 在途租约 + 三因子加权挑选 + state.json 持久化。
+// ═══ 更新日志 ═══
+// 2026-09-18：状态文件保存账号删除代次，阻止尚未落盘的旧创建意图越过已完成的删除。
 package pool
 
 import (
@@ -350,7 +352,8 @@ type modelCooldown struct {
 
 // stateFile 持久化格式。
 type stateFile struct {
-	Accounts map[string]stateAccount `json:"accounts"`
+	Accounts      map[string]stateAccount `json:"accounts"`
+	AccountEpochs map[string]uint64       `json:"account_epochs,omitempty"`
 }
 
 // defaultBreaker* 熔断器默认参数（FreeBuff2API 参考口径）。

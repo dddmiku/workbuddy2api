@@ -1,3 +1,5 @@
+// ═══ 更新日志 ═══
+// 2026-09-18：允许通过 WB2A_REPLAY 指定隔离的真实历史夹具，避免依赖固定 /src 路径或修改生产目录。
 package server
 
 // 真实会话载荷的端到端回归：卡死会话（452 条目 / 25 图 / 6.95MB）走生产转换路径后，
@@ -15,7 +17,11 @@ import (
 )
 
 func TestRealSessionToolPairing(t *testing.T) {
-	raw, err := os.ReadFile("/src/real2.json")
+	path := os.Getenv("WB2A_REPLAY")
+	if path == "" {
+		path = "/src/real2.json"
+	}
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Skipf("无真实载荷（%v），跳过", err)
 	}

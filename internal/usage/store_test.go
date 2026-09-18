@@ -397,8 +397,8 @@ func TestSnapshotSeesOtherProcessRecords(t *testing.T) {
 	}
 }
 
-// TestMergeFromDiskSurvivesBrokenLedger 账本被外部写坏时不能阻断落盘。
-func TestMergeFromDiskSurvivesBrokenLedger(t *testing.T) {
+// TestMergePreservesBrokenLedger 账本被外部写坏时保留原件与待写增量，不以空基线覆盖历史。
+func TestMergePreservesBrokenLedger(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "usage.json")
 	store, err := Open(path, time.Hour)
@@ -411,18 +411,14 @@ func TestMergeFromDiskSurvivesBrokenLedger(t *testing.T) {
 	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
 		t.Fatalf("seed broken ledger: %v", err)
 	}
-	if err := store.Flush(); err != nil {
-		t.Fatalf("flush: %v", err)
+	if err := store.Flush(); err == nil {
+		t.Fatal("broken ledger must be reported instead of overwritten")
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	var doc document
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		t.Fatalf("ledger must be rewritten as valid json: %v", err)
-	}
-	if doc.Totals.TotalTokens != 10 {
-		t.Fatalf("totals = %+v want 10 tokens", doc.Totals)
+	if string(raw) != "{not json" {
+		t.Fatal("original broken ledger was modified")
 	}
 }

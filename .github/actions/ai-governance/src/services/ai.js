@@ -1,3 +1,5 @@
+// ═══ 更新日志 ═══
+// 2026-09-18：拒绝 Chat 未完成输出，按治理失败放行，避免截断/输出过滤片段触发自动关闭。
 const core = require('@actions/core');
 const { logMessage } = require('../utils/helpers');
 
@@ -133,7 +135,15 @@ async function callAI(openai, aiModel, request, config, purpose = 'AI调用', no
         max_tokens: config.ai_settings.max_tokens,
         temperature: config.ai_settings.temperature
       });
-      content = response.choices[0].message.content;
+      const choice = response.choices?.[0];
+      if (choice?.finish_reason && choice.finish_reason !== 'stop') {
+        throw createResponseError(
+          `Chat completion was incomplete: ${choice.finish_reason}`,
+          'response_incomplete',
+          { reason: choice.finish_reason }
+        );
+      }
+      content = choice?.message?.content;
     }
 
     if (!content?.trim()) {

@@ -4,6 +4,7 @@
 // 2026-09-16：将完整消息快照转成缺失增量并核对已有输出，区分工具参数暂缺、显式空串和类型错误。
 // 2026-09-17：合并 fork 的错误信封透传，保留完整诊断字段与数字字面量，同时维持 typed 失败终态。
 // 2026-09-18：拒绝错误形状的工具列表，并在流结束时校验工具终态确有调用，避免预告正文静默收尾。
+// 2026-09-18：逐 choice 隔离工具名称与聚合输出，拒绝被静默忽略的非法正文、delta 和 choices 形状。
 package upstream
 
 import (
@@ -236,6 +237,11 @@ func (c *streamChoice) observeOutput(output map[string]any, wholeMessage bool) (
 		c.role = role
 	}
 	for _, key := range []string{"content", "reasoning_content", "refusal"} {
+		if value := output[key]; value != nil {
+			if _, ok := value.(string); !ok {
+				return nil, &StreamError{Code: "upstream_parse", Message: "upstream " + key + " must be a string or null"}
+			}
+		}
 		if value, ok := output[key].(string); ok {
 			if c.text == nil {
 				c.text = map[string]*streamText{}
@@ -367,6 +373,11 @@ func (c *streamChoice) validateArguments() error {
 }
 
 func (s *streamState) observe(obj map[string]any) error {
+	if value := obj["choices"]; value != nil {
+		if _, ok := value.([]any); !ok {
+			return &StreamError{Code: "upstream_parse", Message: "upstream choices must be an array"}
+		}
+	}
 	choices, _ := obj["choices"].([]any)
 	for _, item := range choices {
 		choice, ok := item.(map[string]any)
@@ -387,6 +398,11 @@ func (s *streamState) observe(obj map[string]any) error {
 		}
 		normalized := map[string]any{}
 		for _, key := range []string{"delta", "message"} {
+			if value := choice[key]; value != nil {
+				if _, ok := value.(map[string]any); !ok {
+					return &StreamError{Code: "upstream_parse", Message: "upstream " + key + " must be an object or null"}
+				}
+			}
 			if output, ok := choice[key].(map[string]any); ok {
 				delta, err := state.observeOutput(output, key == "message")
 				if err != nil {
@@ -436,22 +452,73 @@ func (s *streamState) end() error {
 	return nil
 }
 
-// Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
+func (c *streamChoice) aggregate(index int) map[string]any {
+	role := c.role
+	if role == "" {
+		role = "assistant"
+	}
+	message := map[string]any{"role": role, "content": ""}
+	for _, key := range []string{"content", "reasoning_content", "refusal"} {
+		if text := c.text[key]; text != nil && text.value.Len() > 0 {
+			message[key] = text.value.String()
+		}
+	}
+	incomplete := c.finishReason == "length" || c.finishReason == "content_filter"
+	function := func(value *streamFunction) map[string]any {
+		if value == nil || (incomplete && (!value.arguments.seen || isTruncatedArguments(value.arguments.value.String()))) {
+			return nil
+		}
+		out := map[string]any{}
+		if value.name != "" {
+			out["name"] = value.name
+		}
+		if value.arguments.seen {
+			out["arguments"] = value.arguments.value.String()
+		}
+		return out
+	}
+	if fn := function(c.function); fn != nil {
+		message["function_call"] = fn
+	}
+	indexes := make([]int, 0, len(c.tools))
+	for index := range c.tools {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+	calls := make([]map[string]any, 0, len(indexes))
+	for _, index := range indexes {
+		call := c.tools[index]
+		fn := function(&call.function)
+		if fn == nil {
+			continue
+		}
+		out := map[string]any{"index": index, "function": fn}
+		if call.id != "" {
+			out["id"] = call.id
+		}
+		if call.typ != "" {
+			out["type"] = call.typ
+		}
+		calls = append(calls, out)
+	}
+	if len(calls) > 0 {
+		message["tool_calls"] = calls
+	}
+	finish := c.finishReason
+	if finish == "" {
+		finish = "stop"
+	}
+	return map[string]any{"index": index, "message": message, "finish_reason": finish}
+}
+
+// Aggregate 读取完整 SSE 流，保留每个 choice 的正文、工具与终态。
 // 分片/多行 SSE 由 readSSE 处理；只有合法结束才返回成功，异常流返回 *StreamError。
 // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
 func Aggregate(r io.Reader) (map[string]any, error) {
 	var (
-		id, model    string
-		created      float64
-		content      strings.Builder
-		reasoning    strings.Builder
-		refusal      strings.Builder
-		role         = "assistant"
-		finishReason = "stop"
-		usage        map[string]any
-		toolCalls    = map[int]map[string]any{}
-		toolOrder    []int
-		functionCall map[string]any
+		id, model string
+		created   float64
+		usage     map[string]any
 	)
 	state := &streamState{}
 	err := readSSE(r, func(ev sseEvent) (bool, error) {
@@ -475,47 +542,6 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		if value, ok := chunk["usage"].(map[string]any); ok {
 			usage = value
 		}
-		choices, _ := chunk["choices"].([]any)
-		for _, item := range choices {
-			choice, _ := item.(map[string]any)
-			if reason, _ := choice["finish_reason"].(string); reason != "" {
-				finishReason = reason
-			}
-			delta, _ := choice["delta"].(map[string]any)
-			if value, _ := delta["role"].(string); value != "" {
-				role = value
-			}
-			if value, ok := delta["content"].(string); ok {
-				content.WriteString(value)
-			}
-			if value, ok := delta["reasoning_content"].(string); ok {
-				reasoning.WriteString(value)
-			}
-			if value, ok := delta["refusal"].(string); ok {
-				refusal.WriteString(value)
-			}
-			calls, _ := delta["tool_calls"].([]any)
-			for _, item := range calls {
-				call, _ := item.(map[string]any)
-				idx := 0
-				if value, ok := call["index"].(float64); ok {
-					idx = int(value)
-				}
-				merged, seen := toolCalls[idx]
-				if !seen {
-					merged = map[string]any{"index": idx}
-					toolCalls[idx] = merged
-					toolOrder = append(toolOrder, idx)
-				}
-				mergeToolCallDelta(merged, call)
-			}
-			if fn, ok := delta["function_call"].(map[string]any); ok {
-				if functionCall == nil {
-					functionCall = map[string]any{}
-				}
-				mergeFunctionDelta(functionCall, fn)
-			}
-		}
 		return false, nil
 	}, nil)
 	if err != nil {
@@ -530,51 +556,21 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 	if created == 0 {
 		created = float64(time.Now().Unix())
 	}
-	message := map[string]any{
-		"role":    role,
-		"content": content.String(),
+	indexes := make([]int, 0, len(state.choices))
+	for index := range state.choices {
+		indexes = append(indexes, index)
 	}
-	if reasoning.Len() > 0 {
-		message["reasoning_content"] = reasoning.String()
-	}
-	if refusal.Len() > 0 {
-		message["refusal"] = refusal.String()
-	}
-	if len(functionCall) > 0 {
-		args, present := functionCall["arguments"].(string)
-		incomplete := finishReason == "length" || finishReason == "content_filter"
-		if !incomplete || (present && !isTruncatedArguments(args)) {
-			message["function_call"] = functionCall
-		}
-	}
-	if len(toolOrder) > 0 {
-		sort.Ints(toolOrder)
-		calls := make([]map[string]any, 0, len(toolOrder))
-		for _, idx := range toolOrder {
-			calls = append(calls, toolCalls[idx])
-		}
-		// P1b：finish_reason==length 且 tool_call 的 arguments 是残缺 JSON（解析失败）
-		// 时不把脏参数交给客户端——残留分片会被客户端解析成非法 JSON 卡死会话。
-		// 完整参数原样保留（正例零改动）；空参数（无参工具）不是截断，同样保留。
-		if finishReason == "length" || finishReason == "content_filter" {
-			calls = dropTruncatedToolCalls(calls)
-		}
-		if len(calls) > 0 {
-			message["tool_calls"] = calls
-		}
+	sort.Ints(indexes)
+	choices := make([]any, 0, len(indexes))
+	for _, index := range indexes {
+		choices = append(choices, state.choices[index].aggregate(index))
 	}
 	resp := map[string]any{
 		"id":      id,
 		"object":  "chat.completion",
 		"created": int64(created),
 		"model":   model,
-		"choices": []any{
-			map[string]any{
-				"index":         0,
-				"message":       message,
-				"finish_reason": finishReason,
-			},
-		},
+		"choices": choices,
 	}
 	if usage != nil {
 		resp["usage"] = usage
@@ -653,12 +649,16 @@ func mergeOutputDelta(merged, delta map[string]any) {
 //
 // seen 记录每个 index 是否已实际发过非空 name；仅收到 id/arguments 不能挡住后补的 name。
 // 只动 function.name 键，id/type/arguments 原样透传。
-func stripToolCallNames(obj map[string]any, seen map[int]bool) {
+func stripToolCallNames(obj map[string]any, seen map[[2]int]bool) {
 	choices, _ := obj["choices"].([]any)
 	for _, ci := range choices {
 		c, _ := ci.(map[string]any)
 		if c == nil {
 			continue
+		}
+		choiceIndex := 0
+		if value, ok := c["index"].(float64); ok {
+			choiceIndex = int(value)
 		}
 		delta, _ := c["delta"].(map[string]any)
 		if delta == nil {
@@ -674,7 +674,8 @@ func stripToolCallNames(obj map[string]any, seen map[int]bool) {
 			if v, ok := tc["index"].(float64); ok {
 				idx = int(v)
 			}
-			if seen[idx] {
+			key := [2]int{choiceIndex, idx}
+			if seen[key] {
 				// 已发过首片：删除本分片的 name 键（存在即删，幂等）。
 				if fn, _ := tc["function"].(map[string]any); fn != nil {
 					delete(fn, "name")
@@ -683,7 +684,7 @@ func stripToolCallNames(obj map[string]any, seen map[int]bool) {
 			}
 			if fn, _ := tc["function"].(map[string]any); fn != nil {
 				if name, _ := fn["name"].(string); name != "" {
-					seen[idx] = true
+					seen[key] = true
 				} else {
 					delete(fn, "name")
 				}
@@ -790,7 +791,7 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 
 	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
-	toolCallSeen := map[int]bool{}
+	toolCallSeen := map[[2]int]bool{}
 
 	// firstID 透传流的消息级 id 基准：缓存首个非空上游 id，后续帧缺失/空串时复用
 	// （issue #35：同一条 SSE 消息所有帧共用一个真实 id，后台按 id 归并；此前中间帧

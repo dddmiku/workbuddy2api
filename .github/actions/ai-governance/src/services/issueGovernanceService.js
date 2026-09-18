@@ -1,3 +1,5 @@
+// ═══ 更新日志 ═══
+// 2026-09-18：归并目标必须命中当前 canonical 索引且不是原工单，模型猜测或自指时降级放行。
 const core = require('@actions/core');
 const { logMessage } = require('../utils/helpers');
 const { callAI, callAIStructured } = require('./ai');
@@ -129,7 +131,13 @@ class IssueGovernanceService {
     const match = (raw || '').trim();
     const dup = match.match(DUPLICATE_PATTERN);
     if (dup) {
-      return { decision: GOVERNANCE_DECISIONS.DUPLICATE, canonicalNumber: parseInt(dup[1], 10) };
+      const canonicalNumber = Number(dup[1]);
+      if (!Number.isSafeInteger(canonicalNumber) || canonicalNumber <= 0 ||
+          canonicalNumber === Number(issue.number) ||
+          !canonicalList.some(candidate => Number(candidate.number) === canonicalNumber)) {
+        return { decision: GOVERNANCE_DECISIONS.UNCERTAIN };
+      }
+      return { decision: GOVERNANCE_DECISIONS.DUPLICATE, canonicalNumber };
     }
     if (/^NEW_TOPIC/.test(match)) {
       return { decision: GOVERNANCE_DECISIONS.NEW_TOPIC };

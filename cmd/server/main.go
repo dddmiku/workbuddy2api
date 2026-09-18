@@ -1,3 +1,6 @@
+// ═══ 更新日志 ═══
+// 2026-09-18：请求、排程结束后再统一关闭用量/账号池/Redis；热更新退出同样等待最终落盘。
+// 2026-09-18：热更新退出前显式等待会话 GC 停止，避免 os.Exit 绕过 defer 后继续提交过期删除。
 // main.go workbuddy2api 入口：加载配置、构建 pool、起调度器与 HTTP 服务。
 package main
 
@@ -227,6 +230,8 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	backgroundCtx, stopBackground := context.WithCancel(ctx)
+	defer stopBackground()
 
 	// 监听套接字：热更新后的新实例从环境变量继承 FD，其余情况正常监听。
 	// 用 listener 而不是 ListenAndServe，才能把套接字交给新实例。
@@ -312,13 +317,20 @@ func main() {
 	// adminServer 由后台 goroutine 赋值、由停机路径读取，用锁保护。
 	var adminMu sync.Mutex
 	var adminServer *http.Server
+	var connections sync.WaitGroup
+	connectionState := trackConnections(&connections)
 	serveAdmin := func(listener net.Listener) {
 		mux := http.NewServeMux()
 		mux.Handle("/keys", keyStore.AdminHandler())
 		mux.Handle("/keys/", keyStore.AdminHandler())
 		mux.Handle("/", h.InternalHandler())
-		server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
+		server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second, ConnState: connectionState}
 		adminMu.Lock()
+		if backgroundCtx.Err() != nil {
+			adminMu.Unlock()
+			_ = listener.Close()
+			return
+		}
 		adminServer = server
 		adminMu.Unlock()
 		go func() {
@@ -328,13 +340,14 @@ func main() {
 		}()
 		log.Printf("API key management enabled (%d keys)", len(keyStore.List()))
 	}
-	shutdownAdmin := func(ctx context.Context) {
+	shutdownAdmin := func(ctx context.Context) error {
 		adminMu.Lock()
 		server := adminServer
 		adminMu.Unlock()
 		if server != nil {
-			_ = server.Shutdown(ctx)
+			return shutdownHTTPServer(ctx, server)
 		}
+		return nil
 	}
 	if adminLn != nil {
 		serveAdmin(adminLn)
@@ -349,11 +362,16 @@ func main() {
 			serveAdmin(listener)
 		}()
 	}
-	go sch.Run(ctx)
+	backgroundDone := make(chan struct{})
+	go func() {
+		defer close(backgroundDone)
+		sch.Run(backgroundCtx)
+	}()
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           h,
+		ConnState:         connectionState,
 		ReadHeaderTimeout: 30 * time.Second,
 		// ReadTimeout 覆盖整个请求读取（含 body）：防慢速 body 拖死连接。
 		// 取值大于 MaxBodyMB 在常规带宽下的上传耗时；聊天请求体上限默认 8MB。
@@ -378,26 +396,33 @@ func main() {
 			// 正在进行的对话。
 			log.Printf("[update] draining in-flight requests before exit (%s)", reason)
 		}
-		p.Flush() // 信号触发：先落盘再做优雅停机
-		// Flush 已把最后一笔状态快照提交给 Redis（fire-and-forget）；store.Close
-		// 等 Upstash 在途/排队写排空再关连接——最后一笔镜像必须写完才退出（发现 4）。
-		// Noop 的 Close 是空操作；单写上限 5s × 上限 8，Close 内部另有超时兜底。
-		if cErr := store.Close(); cErr != nil {
-			log.Printf("WARN: [server] redisstore close: %v", cErr)
-		}
 		wait := 5 * time.Second
 		if reason != "signal" {
 			wait = hotupdate.ShutdownTimeout()
 		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), wait)
 		defer cancel()
-		shutdownAdmin(shutdownCtx)
-		// 用量账本必须在在途请求跑完之后再收：它记的是请求完成那一刻的 token，
-		// 提前 Close 会让交接时正在流式输出的那条请求直接不计入统计。
-		// （上面的 store.Close 是账号池镜像，不是用量账本；Store 的 Close 可重复调用。）
-		_ = srv.Shutdown(shutdownCtx)
-		if usageStore != nil {
-			_ = usageStore.Close()
+		if err := drainRuntime(shutdownCtx, runtimeShutdown{
+			stopBackground: stopBackground, backgroundDone: backgroundDone,
+			waitConnections: connections.Wait,
+			stopSessions: func() {
+				if sessRouter != nil {
+					sessRouter.StopGC()
+				}
+			},
+			closePool: p.Close, closeStore: store.Close,
+			shutdownAdmin: shutdownAdmin,
+			shutdownHTTP: func(ctx context.Context) error {
+				return shutdownHTTPServer(ctx, srv)
+			},
+			closeUsage: func() error {
+				if usageStore != nil {
+					return usageStore.Close()
+				}
+				return nil
+			},
+		}); err != nil {
+			log.Printf("WARN: [server] shutdown: %v", err)
 		}
 		if reason != "signal" {
 			// 约定退出码：容器 PID 1 看到它就不再拉起新实例（套接字已在别人手里），

@@ -12,6 +12,11 @@
 # 2026-09-17：密钥管理支持模型绑定字段，并新增供前端选择模型的 /api/models。
 # 2026-09-17：新增用量统计通道 /api/usage；容器日志解析成结构化请求行供日志页表格展示。
 # 2026-09-17：新增热更新通道：/api/update 读状态，/api/update/apply 触发版本切换。
+# 2026-09-18：统一管理写请求的来源、格式和大小校验；修复退出时续期、撤销丢失、根路径登录和损坏凭证被覆盖。
+# 2026-09-18：严格验证开关与标识，日志同时保留 stdout/stderr，避免错误输入触发操作或隐藏诊断。
+# 2026-09-18：账号凭据先安全落盘再清理旧文件，启停冲突保留双方，回收文件使用唯一名称。
+# 2026-09-18：重启等待覆盖容器停止宽限，并用真实健康响应确认成功，超时不再报已加载账号。
+# 2026-09-18：滑动续期保留会话标识，退出撤销同一会话的旧副本，防止续期前令牌复活。
 
 """workbuddy2api 账号管理面板 —— 后端
 
@@ -30,6 +35,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import key_management
@@ -108,7 +114,7 @@ _lock = threading.Lock()
 # ═══════════════════════════════════════════════════════════════════════
 
 ITOA64 = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-_cred_lock = threading.Lock()
+_cred_lock = threading.RLock()
 _fails = {}          # ip -> [timestamp, ...]
 _revoked = set()     # 已签出但被主动作废的 nonce
 
@@ -233,27 +239,44 @@ def _new_credentials():
 
 
 def _save_credentials(doc):
-    tmp = CRED_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(doc, fh, indent=2, ensure_ascii=False)
-        fh.write("\n")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, CRED_PATH)
+    directory = os.path.dirname(os.path.abspath(CRED_PATH))
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    descriptor, tmp = tempfile.mkstemp(prefix=".credentials-", dir=directory)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=2, ensure_ascii=False)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, CRED_PATH)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def load_credentials():
     """读凭证；文件不存在时从 nginx 的 .htpasswd 继承用户名与 apr1 哈希。"""
     with _cred_lock:
+        missing = False
         try:
             with open(CRED_PATH, "r", encoding="utf-8") as fh:
                 doc = json.load(fh)
-            if doc.get("username") and doc.get("password"):
-                if not doc.get("sessionKey"):
-                    doc["sessionKey"] = secrets.token_hex(32)
-                    _save_credentials(doc)
-                return doc
-        except (OSError, ValueError):
-            pass
+        except FileNotFoundError:
+            doc = None
+            missing = True
+        if not missing:
+            if not isinstance(doc, dict) or not all(isinstance(doc.get(name), str) and doc[name]
+                                                    for name in ("username", "password")):
+                raise ValueError("登录凭证文件无效，请恢复已有备份")
+            if not doc.get("sessionKey"):
+                doc["sessionKey"] = secrets.token_hex(32)
+                _save_credentials(doc)
+            if not isinstance(doc["sessionKey"], str) or not re.fullmatch(r"[0-9a-fA-F]{64}", doc["sessionKey"]):
+                raise ValueError("登录凭证的会话密钥无效，请恢复已有备份")
+            if not isinstance(doc.get("revokedSessions", {}), dict):
+                raise ValueError("登录会话撤销记录无效，请恢复已有备份")
+            return doc
 
         name, digest = parse_htpasswd(HTPASSWD_PATH)
         if name and digest:
@@ -282,10 +305,10 @@ def _unb64u(text):
     return base64.urlsafe_b64decode(text + pad)
 
 
-def issue_session(username, ttl=SESSION_TTL):
+def issue_session(username, ttl=SESSION_TTL, nonce=None):
     """签名会话令牌：payload.nonce + HMAC。key 落盘，面板重启后仍有效。"""
     doc = load_credentials()
-    nonce = secrets.token_hex(12)
+    nonce = nonce or secrets.token_hex(12)
     payload = {"u": username, "e": int(time.time()) + ttl, "n": nonce}
     body = _b64u(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     key = bytes.fromhex(doc["sessionKey"])
@@ -307,9 +330,14 @@ def read_session(token):
         payload = json.loads(_unb64u(body).decode("utf-8"))
     except Exception:
         return None
-    if payload.get("n") in _revoked:
+    if not isinstance(payload, dict):
         return None
-    if int(payload.get("e") or 0) < time.time():
+    if not isinstance(payload.get("n"), str) or not re.fullmatch(r"[0-9a-f]{24}", payload["n"]):
+        return None
+    if payload.get("n") in _revoked or payload.get("n") in doc.get("revokedSessions", {}):
+        return None
+    expires = payload.get("e")
+    if isinstance(expires, bool) or not isinstance(expires, (int, float)) or expires < time.time():
         return None
     if payload.get("u") != doc.get("username"):
         return None
@@ -566,14 +594,19 @@ def write_auth_file(poll_result):
     os.makedirs(AUTHS_DIR, exist_ok=True)
     final_path = os.path.join(AUTHS_DIR, "workbuddy-%s.json" % uid)
     stale = final_path + ".disabled"
-    if os.path.exists(stale):
-        os.remove(stale)
-
-    tmp = final_path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(doc, f, indent=1)
-    os.replace(tmp, final_path)
-    chown_app(final_path)
+    descriptor, tmp = tempfile.mkstemp(prefix=".workbuddy-", dir=AUTHS_DIR)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as f:
+            json.dump(doc, f, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, final_path)
+        chown_app(final_path)
+        if os.path.exists(stale):
+            os.remove(stale)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
     return {
         "uid": uid,
@@ -594,16 +627,20 @@ def find_entry(uid):
 
 
 def restart_container():
-    t0 = time.time()
-    rc, out, err = docker(["restart", CONTAINER], timeout=120)
+    t0 = time.monotonic()
+    rc, out, err = docker(["restart", CONTAINER], timeout=210)
     if rc != 0:
         return False, "重启失败: %s" % (err or out), 0.0
-    for _ in range(40):
+    deadline = time.monotonic() + 45
+    while time.monotonic() < deadline:
         time.sleep(1)
-        h = gateway_get("/healthz", timeout=8)
-        if h is not None:
-            return True, "已重启并加载账号", round(time.time() - t0, 1)
-    return True, "已重启(健康检查未及时响应，可稍后刷新)", round(time.time() - t0, 1)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        h = gateway_get("/healthz", timeout=min(5, remaining))
+        if isinstance(h, dict) and h.get("service") == "workbuddy2api" and "error" not in h:
+            return True, "已重启并加载账号", round(time.monotonic() - t0, 1)
+    return False, "容器重启已执行，但网关健康检查未通过，请查看日志后刷新", round(time.monotonic() - t0, 1)
 
 
 def get_credits(force=False):
@@ -701,11 +738,16 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "same-origin")
-        for name, value in list(extra or []) + list(getattr(self, "_pending", []) or []):
+        pending = list(getattr(self, "_pending", []) or [])
+        self._pending = []
+        for name, value in list(extra or []) + pending:
             self.send_header(name, value)
         self.end_headers()
         if self.command != "HEAD":
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (ConnectionError, TimeoutError):
+                self.close_connection = True
 
     def _json(self, code, payload, extra=None):
         self._send(code, json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -718,17 +760,33 @@ class Handler(BaseHTTPRequestHandler):
         self._send(302, b"", "text/plain; charset=utf-8",
                    [("Location", target)])
 
-    def _body(self):
-        n = int(self.headers.get("Content-Length") or 0)
-        if not n:
-            return {}
+    def _body(self, limit=65536):
+        if self.headers.get("Transfer-Encoding"):
+            raise RequestBodyError(400, "不支持此请求传输方式")
+        if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+            raise RequestBodyError(415, "请使用 JSON 格式提交")
+        lengths = self.headers.get_all("Content-Length", [])
+        if len(lengths) != 1 or not lengths[0].isdigit():
+            raise RequestBodyError(400, "请求长度无效")
+        n = int(lengths[0])
+        if n <= 0:
+            raise RequestBodyError(400, "请求体不能为空")
+        if n > limit:
+            raise RequestBodyError(413, "请求体超过大小限制")
         try:
-            return json.loads(self.rfile.read(n).decode("utf-8"))
-        except Exception:
-            return {}
+            self.connection.settimeout(10)
+            raw = self.rfile.read(n)
+            if len(raw) != n:
+                raise ValueError("incomplete request")
+            body = json.loads(raw.decode("utf-8"))
+        except (OSError, ValueError) as error:
+            raise RequestBodyError(400, "请求体不是完整的 JSON") from error
+        if not isinstance(body, dict):
+            raise RequestBodyError(400, "请求体必须是 JSON 对象")
+        return body
 
     # ── 会话 ───────────────────────────────────────────────────────────
-    def _session(self):
+    def _session(self, renew=True):
         """从 Cookie 里取会话；顺带把临近过期的会话续期（滑动过期）。"""
         raw = self.headers.get("Cookie") or ""
         if not raw:
@@ -745,8 +803,8 @@ class Handler(BaseHTTPRequestHandler):
         if not payload:
             return None
         remaining = int(payload.get("e") or 0) - time.time()
-        if remaining < SESSION_TTL / 3.0:
-            token, _ = issue_session(payload["u"])
+        if renew and remaining < SESSION_TTL / 3.0:
+            token, _ = issue_session(payload["u"], nonce=payload["n"])
             self._pending = self._cookie_headers(token, SESSION_TTL)
         return payload
 
@@ -757,14 +815,15 @@ class Handler(BaseHTTPRequestHandler):
         return payload
 
     def _cookie_headers(self, token, max_age):
-        value = ("%s=%s; Path=/admin/; HttpOnly; SameSite=Lax; Max-Age=%d"
+        value = ("%s=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=%d"
                  % (COOKIE_NAME, token, max_age))
-        return [("Set-Cookie", value)]
+        if self.headers.get("X-Forwarded-Proto", "").lower() == "https":
+            value += "; Secure"
+        return [("Set-Cookie", value), ("Set-Cookie", "%s=; Path=/admin/; HttpOnly; SameSite=Lax; Max-Age=0" % COOKIE_NAME)]
 
     def _clear_cookie(self):
-        return [("Set-Cookie",
-                 "%s=; Path=/admin/; HttpOnly; SameSite=Lax; Max-Age=0"
-                 % COOKIE_NAME)]
+        return [("Set-Cookie", "%s=; Path=%s; HttpOnly; SameSite=Lax; Max-Age=0" % (COOKIE_NAME, path))
+                for path in ("/", "/admin/")]
 
     def do_GET(self):
         path = self.path.split("?")[0]
@@ -863,7 +922,7 @@ class Handler(BaseHTTPRequestHandler):
             if m:
                 lines = min(int(m.group(1)), 1000)
             rc, out, err = docker(["logs", "--tail", str(lines), CONTAINER], timeout=40)
-            raw = out or err
+            raw = "\n".join(part for part in (out, err) if part)
             rows, other = parse_request_log(raw)
             return self._json(200, {"ok": rc == 0, "logs": raw, "rows": rows, "other": other,
                                     "count": len(rows), "rc": rc})
@@ -874,8 +933,12 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path in ("/api/keys", "/api/keys/update", "/api/keys/delete"):
             return self.keys_post(path)
-        body = self._body()
         try:
+            if not self._origin_ok() or self.headers.get("X-Admin-Request") != "1":
+                self.close_connection = True
+                return self._json(403, {"ok": False, "message": "请求来源无效，请从管理页面重新操作"})
+            body = self._body(8192 if path.startswith("/api/update/") else 65536)
+            self._validate_action_body(path, body)
             if path == "/api/auth/login":
                 return self.auth_login(body)
             if path == "/api/auth/logout":
@@ -906,9 +969,36 @@ class Handler(BaseHTTPRequestHandler):
                 return self.update_post(path, body)
             if path == "/api/credit":
                 return self._json(200, {"credit": get_credits(force=True)})
+        except RequestBodyError as ex:
+            self.close_connection = True
+            return self._json(ex.status, {"ok": False, "message": str(ex)})
         except Exception as ex:
             return self._json(500, {"ok": False, "message": str(ex)})
         return self._json(404, {"error": "not found"})
+
+    def _validate_action_body(self, path, body):
+        shapes = {
+            "/api/auth/login": {"username", "password"},
+            "/api/auth/logout": set(),
+            "/api/auth/password": {"current", "username", "password", "confirm"},
+            "/api/login/start": {"realm"}, "/api/login/poll": {"realm"},
+            "/api/account/toggle": {"uid", "disabled"}, "/api/account/delete": {"uid"},
+            "/api/task/run": {"key"}, "/api/task/toggle": {"key", "enabled"},
+            "/api/service/restart": set(), "/api/credit": set(),
+        }
+        allowed = shapes.get(path)
+        if allowed is not None and set(body) - allowed:
+            raise RequestBodyError(400, "包含不支持的字段")
+        for field, value in body.items():
+            if field in {"username", "password", "current", "confirm", "realm", "uid", "key"} and not isinstance(value, str):
+                raise RequestBodyError(400, "字段格式不正确：" + field)
+        for route, field in (("/api/account/toggle", "disabled"), ("/api/task/toggle", "enabled")):
+            if path == route and type(body.get(field)) is not bool:
+                raise RequestBodyError(400, "开关值必须明确指定为 true 或 false")
+        if path.startswith("/api/account/") and not UID_RE.fullmatch(body.get("uid", "")):
+            raise RequestBodyError(400, "账号标识不正确")
+        if path in ("/api/task/run", "/api/task/toggle") and body.get("key") not in TASK_ENABLE_KEY:
+            raise RequestBodyError(400, "任务标识不正确")
 
     def keys_request(self, method, endpoint, body=None):
         try:
@@ -961,24 +1051,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def keys_post(self, path):
         if not self._session():
+            self.close_connection = True
             return self._json(401, {"ok": False, "message": "请先登录管理面板"})
         if not self._origin_ok() or self.headers.get("X-Admin-Request") != "1":
+            self.close_connection = True
             return self._json(403, {"ok": False, "message": "请求来源无效，请从管理页面重新操作"})
-        if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
-            return self._json(415, {"ok": False, "message": "请使用 JSON 格式提交"})
         try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = 0
-        if not 0 < length <= 8192:
-            return self._json(413, {"ok": False, "message": "请求体需在 1—8192 字节内"})
-        try:
-            self.connection.settimeout(10)
-            body = json.loads(self.rfile.read(length).decode("utf-8"))
-        except (OSError, ValueError):
-            return self._json(400, {"ok": False, "message": "密钥信息格式不正确"})
-        if not isinstance(body, dict):
-            return self._json(400, {"ok": False, "message": "密钥信息必须是 JSON 对象"})
+            body = self._body(8192)
+        except RequestBodyError as error:
+            self.close_connection = True
+            return self._json(error.status, {"ok": False, "message": str(error)})
         if path == "/api/keys":
             if set(body) - {"name", "note", "models"}:
                 return self._json(400, {"ok": False, "message": "包含不支持的字段"})
@@ -1036,12 +1118,22 @@ class Handler(BaseHTTPRequestHandler):
                           extra=self._cookie_headers(token, SESSION_TTL))
 
     def auth_logout(self):
-        payload = self._session()
+        payload = self._session(renew=False)
+        self._pending = []
         if payload and payload.get("n"):
             with _cred_lock:
-                _revoked.add(payload["n"])
-                if len(_revoked) > 4096:
-                    _revoked.clear()
+                doc = load_credentials()
+                now = time.time()
+                revoked = {nonce: expiry for nonce, expiry in doc.get("revokedSessions", {}).items()
+                           if isinstance(expiry, (int, float)) and expiry > now}
+                revoked[payload["n"]] = max(payload["e"], now + SESSION_TTL)
+                if len(revoked) > 4096:
+                    doc["sessionKey"] = secrets.token_hex(32)
+                    revoked = {}
+                doc["revokedSessions"] = revoked
+                _save_credentials(doc)
+                _revoked.clear()
+                _revoked.update(revoked)
         return self._json(200, {"ok": True, "message": "已退出登录"},
                           extra=self._clear_cookie())
 
@@ -1140,7 +1232,7 @@ class Handler(BaseHTTPRequestHandler):
             src = entry["path"]
             dst = src + ".disabled" if want_disabled else src[:-len(".disabled")]
             if os.path.exists(dst):
-                os.remove(dst)
+                return {"ok": False, "message": "存在同名的启用与禁用凭据，已保留两份文件，请先核对重复账号"}
             os.rename(src, dst)
             chown_app(dst)
             ok, msg, secs = restart_container()
@@ -1154,9 +1246,9 @@ class Handler(BaseHTTPRequestHandler):
             entry = find_entry(uid)
             if not entry:
                 return {"ok": False, "message": "找不到账号 %s" % uid}
-            os.makedirs(TRASH_DIR, exist_ok=True)
+            os.makedirs(TRASH_DIR, mode=0o700, exist_ok=True)
             stamp = time.strftime("%Y%m%d-%H%M%S")
-            dst = os.path.join(TRASH_DIR, "%s.%s" % (entry["file"], stamp))
+            dst = os.path.join(TRASH_DIR, "%s.%s.%s" % (entry["file"], stamp, secrets.token_hex(6)))
             shutil.move(entry["path"], dst)
             ok, msg, secs = restart_container()
         return {"ok": ok, "restart": secs if ok else None,
@@ -1191,6 +1283,12 @@ class Handler(BaseHTTPRequestHandler):
         with _lock:
             ok, msg, secs = restart_container()
         return {"ok": ok, "restart": secs if ok else None, "message": msg}
+
+
+class RequestBodyError(ValueError):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
 
 
 def main():

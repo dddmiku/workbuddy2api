@@ -13,11 +13,13 @@
 //
 // 2026-09-18：新增缓存命中输入维度（CachedTokens）。思考模式下每轮重发整段上下文，
 // 输入里绝大部分是缓存命中；不单列出来，看总数会误以为「用了很多却只记了这么点」。
+// 2026-09-18：文件锁覆盖整个读改写，隔离快照与在途增量，串行关闭/清零，拒绝覆盖损坏账本并支持合法大账本。
 package usage
 
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -30,6 +32,8 @@ import (
 
 // Version 账本文件格式版本。
 const Version = 1
+
+const maxLedgerBytes = 64 << 20
 
 // defaultFlushInterval 落盘间隔：
 // 账本是累计计数，进程崩溃最多丢一个窗口的数据，换来的是写盘次数与请求量解耦。
@@ -143,10 +147,13 @@ type document struct {
 
 // Store 用量账本。零值不可用，必须经 Open 构造。
 type Store struct {
-	mu       sync.Mutex
-	path     string
-	interval time.Duration
-	doc      document
+	mu        sync.Mutex
+	flushMu   sync.Mutex
+	closeOnce sync.Once
+	closeErr  error
+	path      string
+	interval  time.Duration
+	doc       document
 	// written 本进程上一次提交的累计值。落盘时用「当前 - written」算出本方新增量，
 	// 热更新期间新旧进程各自只往盘上加自己那部分，既不覆盖对方也不重复计数。
 	written document
@@ -182,31 +189,13 @@ func Open(path string, interval time.Duration) (*Store, error) {
 
 // load 读取已有账本；文件不存在时保持空账本并落一次盘，保证目录里有可见文件。
 func (s *Store) load() error {
-	f, err := os.Open(s.path)
+	doc, err := readLedger(s.path)
 	if errors.Is(err, os.ErrNotExist) {
 		s.dirty = true
 		return s.Flush()
 	}
 	if err != nil {
 		return err
-	}
-	defer f.Close()
-	raw, err := io.ReadAll(io.LimitReader(f, (1<<20)+1))
-	if err != nil {
-		return err
-	}
-	if len(raw) > 1<<20 {
-		return errors.New("usage file exceeds size limit")
-	}
-	if len(raw) == 0 {
-		return nil
-	}
-	var doc document
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		return err
-	}
-	if doc.Keys == nil {
-		doc.Keys = map[string]*keyRecord{}
 	}
 	if doc.Since.IsZero() {
 		doc.Since = time.Now().UTC()
@@ -320,6 +309,8 @@ func (s *Store) Snapshot() Snapshot {
 	if s == nil {
 		return Snapshot{}
 	}
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
 	s.mu.Lock()
 	mine := cloneDocument(s.doc)
 	written := cloneDocument(s.written)
@@ -333,6 +324,9 @@ func (s *Store) Snapshot() Snapshot {
 	out := Snapshot{Since: view.Since, UpdatedAt: view.UpdatedAt, Totals: view.Totals}
 	out.Keys = make([]KeyUsage, 0, len(view.Keys))
 	for id, record := range view.Keys {
+		if record == nil {
+			continue
+		}
 		entry := KeyUsage{
 			KeyID:       id,
 			Name:        record.Name,
@@ -344,6 +338,9 @@ func (s *Store) Snapshot() Snapshot {
 		}
 		models := make([]ModelUsage, 0, len(record.Models))
 		for model, totals := range record.Models {
+			if totals == nil {
+				continue
+			}
 			models = append(models, ModelUsage{Model: model, Totals: *totals})
 		}
 		sort.Slice(models, func(i, j int) bool {
@@ -394,12 +391,14 @@ func (s *Store) Flush() error {
 	if s == nil {
 		return nil
 	}
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
 	s.mu.Lock()
 	if !s.dirty {
 		s.mu.Unlock()
 		return nil
 	}
-	snapshot := s.doc
+	snapshot := cloneDocument(s.doc)
 	s.dirty = false
 	s.mu.Unlock()
 
@@ -428,27 +427,57 @@ func (s *Store) writeDirect(doc document) error {
 }
 
 func (s *Store) persistDocument(doc document, merge bool) error {
-	if merge {
-		doc = s.mergeDelta(doc)
-	}
 	if dir := filepath.Dir(s.path); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return err
 		}
+	}
+	unlock, err := lockLedger(s.path)
+	if err != nil {
+		return fmt.Errorf("lock usage ledger: %w", err)
+	}
+	defer unlock()
+	snapshot := doc
+	if merge {
+		base, err := readLedger(s.path)
+		if errors.Is(err, os.ErrNotExist) {
+			base = s.writtenSnapshot()
+		} else if err != nil {
+			return fmt.Errorf("read usage ledger before merge: %w", err)
+		}
+		doc = addDocument(base, deltaDocument(snapshot, s.writtenSnapshot()))
 	}
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return err
 	}
 	raw = append(raw, '\n')
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	if len(raw) > maxLedgerBytes {
+		return errors.New("usage file exceeds size limit")
+	}
+	file, err := os.CreateTemp(filepath.Dir(s.path), ".usage-*.tmp")
+	if err != nil {
 		return err
+	}
+	tmp := file.Name()
+	defer os.Remove(tmp)
+	if err = file.Chmod(0600); err == nil {
+		_, err = file.Write(raw)
+	}
+	if err == nil {
+		err = file.Sync()
+	}
+	closeErr := file.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
 	}
 	if err := os.Rename(tmp, s.path); err != nil {
 		return err
 	}
-	s.commit(doc, merge)
+	s.commit(doc, snapshot, merge)
 	return nil
 }
 
@@ -462,40 +491,38 @@ func (s *Store) persistDocument(doc document, merge bool) error {
 // 5 笔 → 仍是 100 笔）。改成"基线 + 本方增量"后，两边记录的都会累加，且由于增量
 // 是本方累计值减去本方上次已提交的累计值，重复落盘也不会重复计数。
 //
-// 读-改-写整段用文件锁保护，避免两个进程在同一瞬间落盘。读盘失败（文件缺失、被
-// 写坏、超限）时按空账本处理，只保证自己这份数据落盘，不阻断写入。
-func (s *Store) mergeDelta(mine document) document {
-	unlock, err := lockLedger(s.path)
-	if err != nil {
-		log.Printf("WARN: [usage] ledger lock: %v", err)
-	} else {
-		defer unlock()
-	}
-	base, ok := s.readDisk()
-	if !ok {
-		// 读不到盘上账本就退回"只写本方增量"，避免把别人的数据当成不存在。
-		base = document{Version: Version, Keys: map[string]*keyRecord{}}
-	}
-	mine.Version = Version
-	merged := addDocument(base, deltaDocument(mine, s.writtenSnapshot()))
-	return merged
-}
-
-// readDisk 读回盘上账本；缺失或损坏时返回空账本（不阻断落盘）。
-func (s *Store) readDisk() (document, bool) {
+// persistDocument 在持有文件锁时完成全部读改写，读取失败保留原文件与待写增量。
+func readLedger(path string) (document, error) {
 	empty := document{Version: Version, Keys: map[string]*keyRecord{}}
-	raw, err := os.ReadFile(s.path)
-	if err != nil || len(raw) == 0 || len(raw) > 1<<20 {
-		return empty, false
+	file, err := os.Open(path)
+	if err != nil {
+		return empty, err
+	}
+	defer file.Close()
+	raw, err := io.ReadAll(io.LimitReader(file, maxLedgerBytes+1))
+	if err != nil {
+		return empty, err
+	}
+	if len(raw) > maxLedgerBytes {
+		return empty, errors.New("usage file exceeds size limit")
 	}
 	var disk document
-	if json.Unmarshal(raw, &disk) != nil {
-		return empty, false
+	if err := json.Unmarshal(raw, &disk); err != nil {
+		return empty, err
+	}
+	if disk.Version != Version {
+		return empty, errors.New("unsupported usage file version")
 	}
 	if disk.Keys == nil {
 		disk.Keys = map[string]*keyRecord{}
 	}
-	return disk, true
+	return disk, nil
+}
+
+// readDisk 用于只读视图；读盘失败时 Snapshot 保留内存中的已知记录。
+func (s *Store) readDisk() (document, bool) {
+	doc, err := readLedger(s.path)
+	return doc, err == nil
 }
 
 // writtenSnapshot 本进程上次提交的累计值（深拷贝，防止后续写入改到它）。
@@ -510,15 +537,17 @@ func (s *Store) writtenSnapshot() document {
 // adoptDisk 为真（增量合并路径）说明盘上可能还有别的进程的贡献：把这些贡献加进内存视图，
 // 面板才能立刻看到合并后的真实数字；同时把基线提到合并结果，下一次的新增量只算本方
 // 新记录，不会重复计入别人的部分。
-func (s *Store) commit(mine document, adoptDisk bool) {
+func (s *Store) commit(mine, snapshot document, adoptDisk bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !adoptDisk {
 		s.written = cloneDocument(mine)
 		return
 	}
-	extra := deltaDocument(mine, s.doc)
-	s.doc = addDocument(s.doc, extra)
+	// Records accepted after the flush snapshot were not persisted by this
+	// write. Carry them forward separately from other processes' contributions.
+	pending := deltaDocument(s.doc, snapshot)
+	s.doc = addDocument(cloneDocument(mine), pending)
 	s.written = cloneDocument(mine)
 }
 
@@ -611,10 +640,10 @@ func addDocument(base, delta document) document {
 			continue
 		}
 		current.Totals = addTotals(current.Totals, add.Totals)
-		if current.Name == "" {
+		if add.Name != "" && (current.Name == "" || !add.LastUsedAt.Before(current.LastUsedAt)) {
 			current.Name = add.Name
 		}
-		if current.MaskedKey == "" {
+		if add.MaskedKey != "" && (current.MaskedKey == "" || !add.LastUsedAt.Before(current.LastUsedAt)) {
 			current.MaskedKey = add.MaskedKey
 		}
 		if !add.FirstUsedAt.IsZero() && (current.FirstUsedAt.IsZero() || add.FirstUsedAt.Before(current.FirstUsedAt)) {
@@ -763,20 +792,27 @@ func (s *Store) loop() {
 		case <-s.stop:
 			return
 		case <-ticker.C:
-			_ = s.Flush()
+			if err := s.Flush(); err != nil {
+				log.Printf("WARN: [usage] ledger flush failed: %v", err)
+			}
 		}
 	}
 }
 
 // Close 停后台落盘并做最后一次落盘。
 func (s *Store) Close() error {
-	if s == nil || s.closed {
+	if s == nil {
 		return nil
 	}
-	s.closed = true
-	close(s.stop)
-	<-s.done
-	return s.Flush()
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		close(s.stop)
+		s.mu.Unlock()
+		<-s.done
+		s.closeErr = s.Flush()
+	})
+	return s.closeErr
 }
 
 // Reset 清空账本（管理台「清零」入口；保留文件与 Since 之外的结构）。
@@ -787,16 +823,28 @@ func (s *Store) Reset(at time.Time) error {
 	if at.IsZero() {
 		at = time.Now().UTC()
 	}
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		return nil
 	}
+	previous, written, dirty := s.doc, s.written, s.dirty
 	s.doc = document{Version: Version, Since: at.UTC(), Keys: map[string]*keyRecord{}}
+	s.written = cloneDocument(s.doc)
 	s.dirty = false
-	snapshot := s.doc
+	snapshot := cloneDocument(s.doc)
 	s.mu.Unlock()
 	// 清零必须直接覆盖：走增量合并的话，盘上旧数据会被当成"别人的贡献"保留下来。
 	// 清零之后各进程的新增量照旧累加（它们只减自己上次提交的基线）。
-	return s.writeDirect(snapshot)
+	if err := s.writeDirect(snapshot); err != nil {
+		s.mu.Lock()
+		s.doc = addDocument(previous, s.doc)
+		s.written = written
+		s.dirty = dirty || s.dirty
+		s.mu.Unlock()
+		return err
+	}
+	return nil
 }
