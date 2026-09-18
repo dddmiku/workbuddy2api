@@ -47,6 +47,13 @@ type Config struct {
 	// MaxBodyBytes 聊天请求体大小上限；<=0 兜底 8<<20（8MB）。
 	// 超限直接 413 request_body_too_large（不再静默截断喂给上游，issue #41）。
 	MaxBodyBytes int64
+	// InputTokenScale 上报给客户端的输入 token 换算系数（<=1 = 原样，默认 1）。
+	//
+	// 上游用量与它自己的 1,048,576 上限是两套分词器：同一段中文用量按 0.57 token/字符、
+	// 上限按 0.76 判（实测 ×1.33）。客户端（Codex）的自动压缩只看上报用量，不换算就会
+	// 一路发到上游 400 context_length_exceeded 才停。乘以该系数后，客户端按自己的窗口
+	// 阈值就能在撞墙前压缩。只影响回给客户端的 usage，不影响账本与 in= 日志列。
+	InputTokenScale float64
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -116,6 +123,9 @@ func NewHandler(cfg Config) *Handler {
 	}
 	if cfg.MaxBodyBytes <= 0 {
 		cfg.MaxBodyBytes = 8 << 20 // 请求体上限兜底 8MB
+	}
+	if cfg.InputTokenScale <= 1 {
+		cfg.InputTokenScale = 1 // 默认不换算
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))

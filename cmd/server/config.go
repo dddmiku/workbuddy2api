@@ -42,6 +42,17 @@ type Config struct {
 		// 超预算时从最旧的图片开始替换为文本占位（见 upstream/image_budget.go）。
 		// 0 或负数 = 关闭裁剪（不推荐）。
 		OutboundImageBudgetMB int `json:"outbound_image_budget_mb"`
+		// InputTokenScale 上报给客户端的输入 token 换算系数（默认 1 = 原样透传）。
+		//
+		// 上游的用量计数器与它自己的 1,048,576 上限用的是两套分词器：实测同一段中文，
+		// 用量按 0.57 token/字符计、上限按 0.76 判（×1.33）；用户/助手/工具/系统消息、
+		// 工具声明、图片都正常计入，只有 reasoning_content 两边都不算。
+		// 客户端（Codex）的自动压缩只看上报用量，于是它算出来的「还有多少余量」永远偏乐观，
+		// 一路发到上游 400 context_length_exceeded 才停。
+		//
+		// 置为 >1 时，网关把回给客户端的 usage 输入侧乘上该系数，换算到上限口径；
+		// 账本、日志 in= 列、上游计费口径都不受影响。取值需落在 [1, 5]，缺省 1。
+		InputTokenScale float64 `json:"input_token_scale"`
 	} `json:"server"`
 
 	Cooldown struct {
@@ -190,6 +201,9 @@ func Default() *Config {
 	c.Server.MaxBodyMB = 8 // 请求体上限默认 8MB
 	// 出站预算默认 7MB：留在网关 8MB 入站边界之内；调整入站上限时须同步复核本值。
 	c.Server.OutboundImageBudgetMB = 7
+	// 输入 token 换算默认关闭（1）：本项只是替客户端把上限口径补齐，
+	// 纯 CN 部署没有实测差额就不要开。
+	c.Server.InputTokenScale = 1
 	// 排程段默认值由 internal/config 集中维护（cmd/server 与 cmd/activity 共用，
 	// 消除 issue #49 的默认值漂移）。
 	c.Schedule = config.DefaultSchedule()
@@ -279,6 +293,11 @@ func applyEnv(c *Config) {
 			c.Server.OutboundImageBudgetMB = n
 		}
 	}
+	if v := os.Getenv("WB2A_INPUT_TOKEN_SCALE"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			c.Server.InputTokenScale = f
+		}
+	}
 	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {
 		c.Cooldown.SoftRate = v
 	}
@@ -345,6 +364,12 @@ func (c *Config) normalize() error {
 	// 大请求又被静默 413——不如 fail fast 提示显式配大上限。
 	if c.Server.MaxBodyMB <= 0 {
 		return fmt.Errorf("server.max_body_mb: %d 非法（需为正整数，单位 MB）", c.Server.MaxBodyMB)
+	}
+	// input_token_scale 只在 [1,5] 内合法：<1 是把上报值改小（等于让客户端更晚压缩，
+	// 没有任何场景需要），>5 会把上下文余量报得面目全非。1 = 关闭换算。
+	if c.Server.InputTokenScale < 1 || c.Server.InputTokenScale > 5 {
+		return fmt.Errorf("server.input_token_scale: %v 非法（需落在 [1,5]，1 = 不换算）",
+			c.Server.InputTokenScale)
 	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)

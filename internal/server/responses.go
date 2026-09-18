@@ -34,6 +34,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -1060,6 +1061,7 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	sub.ContentLength = int64(len(chatBody))
 
 	rw := newResponsesWriter(w, req)
+	rw.scale = h.cfg.InputTokenScale
 	h.chatCompletions(rw, sub)
 	rw.finish()
 }
@@ -1141,6 +1143,10 @@ type responsesWriter struct {
 	writeErr       error
 	terminalStatus string
 	sawDone        bool
+
+	// scale 上报给客户端的输入 token 换算系数（见 server.Config.InputTokenScale）。
+	// 只作用于回给客户端的 usage，不参与用量账本与日志里的 in= 列。
+	scale float64
 }
 
 func newResponsesWriter(w http.ResponseWriter, req *responsesRequest) *responsesWriter {
@@ -1240,6 +1246,9 @@ func (rw *responsesWriter) finishJSON() {
 		return
 	}
 	result := chatToResponses(chat, rw.resolvedModel(), rw.req)
+	if usage, ok := result["usage"].(map[string]any); ok {
+		scaleContextUsage(usage, rw.scale)
+	}
 	if rw.req != nil {
 		rw.req.applyEcho(result)
 		if err := rw.validateJSONCompletion(chat, result); err != nil {
@@ -1990,12 +1999,55 @@ func (rw *responsesWriter) usageObject() map[string]any {
 	if total == 0 {
 		total = in + out
 	}
-	return map[string]any{
+	usage := map[string]any{
 		"input_tokens":          in,
 		"output_tokens":         out,
 		"total_tokens":          total,
 		"input_tokens_details":  map[string]any{"cached_tokens": cached},
 		"output_tokens_details": map[string]any{"reasoning_tokens": reason},
+	}
+	scaleContextUsage(usage, rw.scale)
+	return usage
+}
+
+// scaleContextUsage 把 usage 的输入侧换算到「上游判上限用的那套口径」。
+//
+// 背景（实测，2026-09-19）：上游的用量计数器与它自己的 1,048,576 上限不是同一套分词器。
+// 同一段中文文本，用量按 0.57 token/字符计、上限按 0.76 token/字符判（×1.33）；
+// 各角色消息（user/assistant/tool/system）、工具声明、图片都正常计入，只有
+// reasoning_content 两边都不算。于是客户端拿到的 input_tokens 系统性地小于
+// 真正参与上限判断的数字，客户端按自己的窗口阈值压缩就会一路等到上游 400
+// context_length_exceeded 才停。
+//
+// 换算只动输入侧：上游对输出只有一个口径；total_tokens 随输入重算，
+// cached_tokens 同乘并夹到 input 以内，保证 input + output == total 与
+// cached ≤ input 两条不变式在换算后仍然成立。
+//
+// scale <= 1 时不改动任何字段（1 = 关闭换算）。
+func scaleContextUsage(usage map[string]any, scale float64) {
+	if usage == nil || scale <= 1 {
+		return
+	}
+	in := intOf(usage["input_tokens"])
+	if in <= 0 {
+		return
+	}
+	out := intOf(usage["output_tokens"])
+	scaled := int(math.Round(float64(in) * scale))
+	if scaled <= in {
+		scaled = in + 1
+	}
+	usage["input_tokens"] = scaled
+	usage["total_tokens"] = scaled + out
+	if details, ok := usage["input_tokens_details"].(map[string]any); ok {
+		cached := intOf(details["cached_tokens"])
+		if cached > 0 {
+			scaledCached := int(math.Round(float64(cached) * scale))
+			if scaledCached > scaled {
+				scaledCached = scaled
+			}
+			details["cached_tokens"] = scaledCached
+		}
 	}
 }
 

@@ -15,6 +15,7 @@
 | `state_file` | `./data/state.json` | 账号池状态文件 |
 | `server.max_body_mb` | `8` | 入站请求体上限，必须大于 0 |
 | `server.outbound_image_budget_mb` | `7` | 出站图片字节预算；非正数关闭裁剪 |
+| `server.input_token_scale` | `1` | 回给客户端的输入 token 换算系数，取值 `[1,5]`；`1` = 原样透传。上游用量与它自己的上下文上限不是同一套分词器时（见 [Codex 接入 → 长会话](codex.md#长会话的上限口径)），用它把上报值换算到上限口径，客户端的自动压缩才会在撞墙前触发。只改回给客户端的 usage，账本仍记上游口径 |
 | `prompt.mode` | `passthrough` | 保留客户端指令；`custom` 才执行显式替换 |
 | `prompt.file` | 空 | `custom` 模式使用的提示词文件 |
 | `prompt.act_note` | 内置运行约定 | 追加到「带工具的 Responses 请求」第一条 system 末尾，强调待执行动作必须同次返回工具调用；`off` 关闭，也可写自定义文本 |

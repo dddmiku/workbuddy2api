@@ -294,20 +294,21 @@ func main() {
 	})
 
 	h := server.NewHandler(server.Config{
-		Pool:          p,
-		Upstream:      up,
-		APIKey:        cfg.APIKey,
-		APIKeys:       keyStore,
-		Session:       sessRouter,
-		StickyCount:   sessCount,
-		RedisMode:     redisMode,
-		SoftCooldown:  cfg.SoftRateDur,
-		PromptMode:    cfg.Prompt.Mode,
-		PromptText:    cfg.PromptText,
-		PromptActNote: server.ActNoteFor(cfg.Prompt.ActNote),
-		Update:        updateManager,
-		MaxBodyBytes:  int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
-		Tasks:         sch,                               // /tasks 端点：排程自省 + 手动触发
+		Pool:            p,
+		Upstream:        up,
+		APIKey:          cfg.APIKey,
+		APIKeys:         keyStore,
+		Session:         sessRouter,
+		StickyCount:     sessCount,
+		RedisMode:       redisMode,
+		SoftCooldown:    cfg.SoftRateDur,
+		PromptMode:      cfg.Prompt.Mode,
+		PromptText:      cfg.PromptText,
+		PromptActNote:   server.ActNoteFor(cfg.Prompt.ActNote),
+		Update:          updateManager,
+		MaxBodyBytes:    int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
+		InputTokenScale: cfg.Server.InputTokenScale,        // 上报用量换算到上游上限口径（1 = 关闭）
+		Tasks:           sch,                               // /tasks 端点：排程自省 + 手动触发
 		// global realm 开关（handler 侧第三道闸：modelList 据此决定是否列 global 名单）。
 		GlobalEnabled: cfg.Global.Enabled,
 		Usage:         usageStore,
