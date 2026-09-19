@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-19：不再向 HTTP handler 传入旧输入倍率，用量始终使用上游原值。
 // 2026-09-18：请求、排程结束后再统一关闭用量/账号池/Redis；热更新退出同样等待最终落盘。
 // 2026-09-18：热更新退出前显式等待会话 GC 停止，避免 os.Exit 绕过 defer 后继续提交过期删除。
 // main.go workbuddy2api 入口：加载配置、构建 pool、起调度器与 HTTP 服务。
@@ -294,21 +295,20 @@ func main() {
 	})
 
 	h := server.NewHandler(server.Config{
-		Pool:            p,
-		Upstream:        up,
-		APIKey:          cfg.APIKey,
-		APIKeys:         keyStore,
-		Session:         sessRouter,
-		StickyCount:     sessCount,
-		RedisMode:       redisMode,
-		SoftCooldown:    cfg.SoftRateDur,
-		PromptMode:      cfg.Prompt.Mode,
-		PromptText:      cfg.PromptText,
-		PromptActNote:   server.ActNoteFor(cfg.Prompt.ActNote),
-		Update:          updateManager,
-		MaxBodyBytes:    int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
-		InputTokenScale: cfg.Server.InputTokenScale,        // 客户端上下文的经验性输入估算（1 = 关闭）
-		Tasks:           sch,                               // /tasks 端点：排程自省 + 手动触发
+		Pool:          p,
+		Upstream:      up,
+		APIKey:        cfg.APIKey,
+		APIKeys:       keyStore,
+		Session:       sessRouter,
+		StickyCount:   sessCount,
+		RedisMode:     redisMode,
+		SoftCooldown:  cfg.SoftRateDur,
+		PromptMode:    cfg.Prompt.Mode,
+		PromptText:    cfg.PromptText,
+		PromptActNote: server.ActNoteFor(cfg.Prompt.ActNote),
+		Update:        updateManager,
+		MaxBodyBytes:  int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
+		Tasks:         sch,                               // /tasks 端点：排程自省 + 手动触发
 		// global realm 开关（handler 侧第三道闸：modelList 据此决定是否列 global 名单）。
 		GlobalEnabled: cfg.Global.Enabled,
 		Usage:         usageStore,

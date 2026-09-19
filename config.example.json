@@ -8,8 +8,7 @@
   "state_file": "./data/state.json",
   "server": {
     "max_body_mb": 8,
-    "outbound_image_budget_mb": 7,
-    "input_token_scale": 1
+    "outbound_image_budget_mb": 7
   },
   "cooldown": {
     "soft_rate": "600s",

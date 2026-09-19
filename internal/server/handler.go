@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-19：移除输入倍率依赖，HTTP 出口保留上游原始用量。
 // 2026-09-17：合并模型级避让与完整响应校验，仅在确认成功后解除模型负缓存。
 // 2026-09-17：密钥可绑定模型白名单，超出范围的请求在选号前拒绝。
 // 2026-09-16：保留调用者指令，停止全局自动降级；校验输入并按真实流结果记录成功。
@@ -48,11 +49,6 @@ type Config struct {
 	// MaxBodyBytes 聊天请求体大小上限；<=0 兜底 8<<20（8MB）。
 	// 超限直接 413 request_body_too_large（不再静默截断喂给上游，issue #41）。
 	MaxBodyBytes int64
-	// InputTokenScale is an optional Responses client-context estimate (1 = off).
-	// Calibrate it against samples from the specific model and route; it is not an
-	// exact upstream tokenizer or a guarantee of compaction before a context limit.
-	// Chat Completions, the usage ledger and in= logs retain upstream measurements.
-	InputTokenScale float64
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -122,9 +118,6 @@ func NewHandler(cfg Config) *Handler {
 	}
 	if cfg.MaxBodyBytes <= 0 {
 		cfg.MaxBodyBytes = 8 << 20 // 请求体上限兜底 8MB
-	}
-	if cfg.InputTokenScale <= 1 {
-		cfg.InputTokenScale = 1 // 默认不换算
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))

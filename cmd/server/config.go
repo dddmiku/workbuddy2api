@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-19：退役输入倍率配置，合法旧值仅告警并忽略，Responses 恢复上游原始用量。
 // 2026-09-19：校验输入估计倍率的格式与有限范围，防止非法环境变量静默关闭估计或产生负用量。
 // 2026-09-18：更新目录优先采用监督进程显式传入的值，避免下载位置与容器重启指针分离。
 // 2026-09-16：废弃正文清洗并保留配置兼容，避免默认设置篡改业务数据。
@@ -8,6 +9,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"os"
 	"path/filepath"
@@ -44,11 +46,8 @@ type Config struct {
 		// 超预算时从最旧的图片开始替换为文本占位（见 upstream/image_budget.go）。
 		// 0 或负数 = 关闭裁剪（不推荐）。
 		OutboundImageBudgetMB int `json:"outbound_image_budget_mb"`
-		// InputTokenScale Responses 客户端输入 token 的估计倍率（默认 1 = 原样透传）。
-		// 某些模型/路由的 usage 与上下文限制可能存在偏差，可依据实际请求校准保守估计。
-		// 常数倍率不证明上游的分词器实现，也不能保证所有内容都会在达到上限前压缩。
-		// 只改 Responses 返回的输入侧用量；Chat、账本及日志 in= 保留上游原值。
-		// 此服务级配置适用于所有 Responses 请求，必须是 [1, 5] 内的有限数字。
+		// InputTokenScale 已退役，仅用于兼容和校验旧配置，不再传入 HTTP handler。
+		// 合法旧值 [1,5] 会被忽略并告警；所有 usage 始终保留上游原值。
 		InputTokenScale float64 `json:"input_token_scale"`
 	} `json:"server"`
 
@@ -198,7 +197,7 @@ func Default() *Config {
 	c.Server.MaxBodyMB = 8 // 请求体上限默认 8MB
 	// 出站预算默认 7MB：留在网关 8MB 入站边界之内；调整入站上限时须同步复核本值。
 	c.Server.OutboundImageBudgetMB = 7
-	// 未按实际模型/路由校准时保持原样透传。
+	// 仅供已退役字段的兼容校验，不参与运行时用量处理。
 	c.Server.InputTokenScale = 1
 	// 排程段默认值由 internal/config 集中维护（cmd/server 与 cmd/activity 共用，
 	// 消除 issue #49 的默认值漂移）。
@@ -250,6 +249,7 @@ func updateDir(c *Config) string {
 // Load 从文件读，再用 WB2A_* env 覆盖。
 func Load(path string) (*Config, error) {
 	c := Default()
+	legacyScaleConfigured := os.Getenv("WB2A_INPUT_TOKEN_SCALE") != ""
 	if path != "" {
 		raw, err := os.ReadFile(path)
 		if err != nil {
@@ -258,12 +258,27 @@ func Load(path string) (*Config, error) {
 		if err := json.Unmarshal(raw, c); err != nil {
 			return nil, fmt.Errorf("parse config: %w", err)
 		}
+		var retired struct {
+			Server struct {
+				InputTokenScale json.RawMessage `json:"input_token_scale"`
+			} `json:"server"`
+		}
+		if err := json.Unmarshal(raw, &retired); err != nil {
+			return nil, fmt.Errorf("parse retired config: %w", err)
+		}
+		if strings.TrimSpace(string(retired.Server.InputTokenScale)) == "null" {
+			return nil, fmt.Errorf("server.input_token_scale: null 非法（已退役兼容值仍需为 [1,5] 内的有限数字）")
+		}
+		legacyScaleConfigured = legacyScaleConfigured || retired.Server.InputTokenScale != nil
 	}
 	if err := applyEnv(c); err != nil {
 		return nil, err
 	}
 	if err := c.normalize(); err != nil {
 		return nil, err
+	}
+	if legacyScaleConfigured {
+		log.Printf("WARN: [config] server.input_token_scale / WB2A_INPUT_TOKEN_SCALE 已退役并被忽略；Responses usage 保留上游原值，请移除旧配置。")
 	}
 	return c, nil
 }
@@ -369,7 +384,7 @@ func (c *Config) normalize() error {
 	// 显式拒绝 NaN：它与上下界的大小比较均为 false。
 	if math.IsNaN(c.Server.InputTokenScale) || math.IsInf(c.Server.InputTokenScale, 0) ||
 		c.Server.InputTokenScale < 1 || c.Server.InputTokenScale > 5 {
-		return fmt.Errorf("server.input_token_scale: %v 非法（需为 [1,5] 内的有限数字，1 = 不换算）",
+		return fmt.Errorf("server.input_token_scale: %v 非法（已退役兼容值仍需为 [1,5] 内的有限数字）",
 			c.Server.InputTokenScale)
 	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {

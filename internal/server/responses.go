@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-19：删除输入/缓存倍率计算，流式与非流式 Responses 均返回上游原始用量。
 // 2026-09-15: 新增。NarraFork / Codex 等客户端走 OpenAI Responses API（POST /v1/responses），
 //   网关此前只实现 /v1/chat/completions，客户端拿到 Go 默认的 "404 page not found"。
 //   本文件把 Responses 请求翻译成 chat completions 后复用 chatCompletions（轮转、租约、
@@ -35,7 +36,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -1063,7 +1063,6 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	sub.ContentLength = int64(len(chatBody))
 
 	rw := newResponsesWriter(w, req)
-	rw.scale = h.cfg.InputTokenScale
 	h.chatCompletions(rw, sub)
 	rw.finish()
 }
@@ -1145,10 +1144,6 @@ type responsesWriter struct {
 	writeErr       error
 	terminalStatus string
 	sawDone        bool
-
-	// scale 上报给客户端的输入 token 换算系数（见 server.Config.InputTokenScale）。
-	// 只作用于回给客户端的 usage，不参与用量账本与日志里的 in= 列。
-	scale float64
 }
 
 func newResponsesWriter(w http.ResponseWriter, req *responsesRequest) *responsesWriter {
@@ -1249,9 +1244,6 @@ func (rw *responsesWriter) finishJSON() {
 		return
 	}
 	result := chatToResponses(chat, rw.resolvedModel(), rw.req)
-	if usage, ok := result["usage"].(map[string]any); ok {
-		scaleContextUsage(usage, rw.scale)
-	}
 	if rw.req != nil {
 		rw.req.applyEcho(result)
 		if err := rw.validateJSONCompletion(chat, result); err != nil {
@@ -2003,55 +1995,13 @@ func (rw *responsesWriter) usageObject() map[string]any {
 	if total == 0 {
 		total = in + out
 	}
-	usage := map[string]any{
+	return map[string]any{
 		"input_tokens":          in,
 		"output_tokens":         out,
 		"total_tokens":          total,
 		"input_tokens_details":  map[string]any{"cached_tokens": cached},
 		"output_tokens_details": map[string]any{"reasoning_tokens": reason},
 	}
-	scaleContextUsage(usage, rw.scale)
-	return usage
-}
-
-// scaleContextUsage 为 Responses 客户端提供按配置倍率校准的上下文估计。
-// 只调整返回值的输入侧，输出原值和独立账本保持不变；该估计不代表上游计费或分词器事实。
-// 2026-09-19：在整数转换前检查范围，并为输出预留空间，避免异常值导致负缓存数或 total 溢出。
-func scaleContextUsage(usage map[string]any, scale float64) {
-	if usage == nil || math.IsNaN(scale) || math.IsInf(scale, 0) || scale <= 1 || scale > 5 {
-		return
-	}
-	in := intOf(usage["input_tokens"])
-	if in <= 0 {
-		return
-	}
-	out := intOf(usage["output_tokens"])
-	if out < 0 {
-		return
-	}
-	maxInput := int(^uint(0)>>1) - out
-	scaled := boundedScaledTokens(in, scale, maxInput)
-	if scaled <= in && in < maxInput {
-		scaled = in + 1
-	}
-	usage["input_tokens"] = scaled
-	usage["total_tokens"] = scaled + out
-	if details, ok := usage["input_tokens_details"].(map[string]any); ok {
-		cached := intOf(details["cached_tokens"])
-		details["cached_tokens"] = boundedScaledTokens(cached, scale, scaled)
-	}
-}
-
-func boundedScaledTokens(value int, scale float64, limit int) int {
-	if value <= 0 || limit <= 0 {
-		return 0
-	}
-	rounded := math.Round(float64(value) * scale)
-	// float64(MaxInt) 可能向上舍入为不可表示的整数；必须先比较，再转换。
-	if rounded >= float64(limit) {
-		return limit
-	}
-	return int(rounded)
 }
 
 // chatToResponses 把一次完整的 chat completion 翻成 Responses 对象（非流式路径）。

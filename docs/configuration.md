@@ -15,7 +15,6 @@
 | `state_file` | `./data/state.json` | 账号池状态文件 |
 | `server.max_body_mb` | `8` | 入站请求体上限，必须大于 0 |
 | `server.outbound_image_budget_mb` | `7` | 出站图片字节预算；非正数关闭裁剪 |
-| `server.input_token_scale` | `1` | Responses 客户端的输入 token 估计倍率，必须是 `[1,5]` 内的有限数字；`1` 原样透传。依据实际模型与请求样本校准，为客户端压缩预留余量，不能据此推断上游分词器实现或保证所有请求不超限。作用于所有 `/v1/responses` 模型；`/v1/chat/completions`、账本与日志保留上游原值。可用 `WB2A_INPUT_TOKEN_SCALE` 覆盖，非法值会阻止启动。详见 [长会话](codex.md#长会话的上限口径) |
 | `prompt.mode` | `passthrough` | 保留客户端指令；`custom` 才执行显式替换 |
 | `prompt.file` | 空 | `custom` 模式使用的提示词文件 |
 | `prompt.act_note` | 内置运行约定 | 追加到「带工具的 Responses 请求」第一条 system 末尾，强调待执行动作必须同次返回工具调用；`off` 关闭，也可写自定义文本 |
@@ -28,6 +27,14 @@
 | `global.enabled` | `true` | 是否允许国际版账号路由 |
 
 配置模板中的示例值不等于安全的部署默认值。对外部署前必须设置调用密钥。
+
+## 旧输入倍率配置
+
+`server.input_token_scale` 与环境变量 `WB2A_INPUT_TOKEN_SCALE` 已弃用，不再用于调整输入、缓存或合计用量。Responses、Chat、请求日志与账本都使用上游已观测的原始用量；移除旧倍率配置不会重算历史账本。
+
+为兼容现有部署，历史允许的 `[1,5]` 范围内有限数值仍可读取。显式配置旧字段或环境变量时，即使值为 `1`，启动也只告警一次并忽略；完全未配置时不产生这条告警。旧有效值不会改变响应，也不会阻止升级启动，`null` 等非法值仍按配置校验报错。建议从 `config.json`、Compose 或服务环境中删除遗留字段和环境变量，完整示例已不再包含它们。
+
+提前压缩由客户端配置控制。Codex 使用 `model_context_window` 与 `model_auto_compact_token_limit`；`/v1/models` 的 `context_length` 是模型目录元数据，不会自动下发客户端窗口或压缩阈值。配置位置与验证方式见 [Codex 长会话](codex.md#长会话的上限口径)。
 
 ## 单密钥与多密钥
 
