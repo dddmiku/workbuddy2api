@@ -1,5 +1,6 @@
 // sse.go 处理上游 SSE 流：聚合成单个 OpenAI 响应，或透传给客户端。
 // ═══ 更新日志 ═══
+// 2026-09-19：可选重复推理保护共享流/聚合入口，保留已观察帧并以明确错误终止，真实正文/工具进展重置窗口。
 // 2026-09-16：统一 SSE 事件解析与结束校验，保留上游错误并防止断流和残缺工具参数伪装成功。
 // 2026-09-16：将完整消息快照转成缺失增量并核对已有输出，区分工具参数暂缺、显式空串和类型错误。
 // 2026-09-17：合并 fork 的错误信封透传，保留完整诊断字段与数字字面量，同时维持 typed 失败终态。
@@ -214,11 +215,15 @@ type streamChoice struct {
 	text         map[string]*streamText
 	tools        map[int]*streamToolCall
 	function     *streamFunction
+	progress     uint64
+	loopProgress uint64
+	loopGuard    *reasoningLoopGuard
 }
 
 type streamState struct {
-	choices map[int]*streamChoice
-	done    bool
+	choices          map[int]*streamChoice
+	done             bool
+	loopGuardEnabled bool
 }
 
 func validFinishReason(reason string) bool {
@@ -231,6 +236,7 @@ func validFinishReason(reason string) bool {
 
 func (c *streamChoice) observeOutput(output map[string]any, wholeMessage bool) (map[string]any, error) {
 	normalized := map[string]any{}
+	progress := false
 	if role, _ := output["role"].(string); role != "" {
 		if !wholeMessage || c.role == "" {
 			normalized["role"] = role
@@ -255,6 +261,9 @@ func (c *streamChoice) observeOutput(output map[string]any, wholeMessage bool) (
 				return nil, err
 			}
 			normalized[key] = addition
+			if key != "reasoning_content" && strings.TrimSpace(addition) != "" {
+				progress = true
+			}
 			if value != "" {
 				c.output = true
 			}
@@ -305,16 +314,24 @@ func (c *streamChoice) observeOutput(output map[string]any, wholeMessage bool) (
 					if !wholeMessage || *field.previous == "" {
 						next[field.key] = value
 					}
+					if field.key == "id" && value != *field.previous && strings.TrimSpace(value) != "" {
+						progress = true
+					}
 					*field.previous = value
 				}
 			}
 			if fn, ok := call["function"].(map[string]any); ok {
+				previousName := state.function.name
 				nextFn, err := state.function.observe(fn, wholeMessage)
 				if err != nil {
 					return nil, err
 				}
 				if len(nextFn) > 0 {
 					next["function"] = nextFn
+				}
+				arguments, _ := nextFn["arguments"].(string)
+				if (state.function.name != previousName && strings.TrimSpace(state.function.name) != "") || arguments != "" {
+					progress = true
 				}
 			} else if value, exists := call["function"]; exists && value != nil {
 				return nil, &StreamError{Code: "upstream_parse", Message: "upstream stream contained an invalid tool function"}
@@ -343,6 +360,7 @@ func (c *streamChoice) observeOutput(output map[string]any, wholeMessage bool) (
 				c.function = &streamFunction{}
 			}
 			c.output = true
+			previousName := c.function.name
 			next, err := c.function.observe(fn, wholeMessage)
 			if err != nil {
 				return nil, err
@@ -350,9 +368,16 @@ func (c *streamChoice) observeOutput(output map[string]any, wholeMessage bool) (
 			if len(next) > 0 {
 				normalized["function_call"] = next
 			}
+			arguments, _ := next["arguments"].(string)
+			if (c.function.name != previousName && strings.TrimSpace(c.function.name) != "") || arguments != "" {
+				progress = true
+			}
 		}
 	} else if value, exists := output["function_call"]; exists && value != nil {
 		return nil, &StreamError{Code: "upstream_parse", Message: "upstream stream contained an invalid function call"}
+	}
+	if progress {
+		c.progress++
 	}
 	return normalized, nil
 }
@@ -515,17 +540,20 @@ func (c *streamChoice) aggregate(index int) map[string]any {
 // Aggregate 读取完整 SSE 流，保留每个 choice 的正文、工具与终态。
 // 分片/多行 SSE 由 readSSE 处理；只有合法结束才返回成功，异常流返回 *StreamError。
 // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
-func Aggregate(r io.Reader) (map[string]any, error) {
+func Aggregate(r io.Reader, options ...StreamOptions) (map[string]any, error) {
 	var (
 		id, model string
 		created   float64
 		usage     map[string]any
 	)
-	state := &streamState{}
+	state := newStreamState(options)
 	err := readSSE(r, func(ev sseEvent) (bool, error) {
 		chunk, done, err := decodeSSEEvent(ev)
 		if err != nil || done {
 			state.done = done
+			if done && err == nil {
+				err = state.finishReasoningLoops()
+			}
 			return true, err
 		}
 		if err := state.observe(chunk); err != nil {
@@ -543,8 +571,14 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		if value, ok := chunk["usage"].(map[string]any); ok {
 			usage = MergeUsage(usage, value)
 		}
+		if err := state.observeReasoningLoops(chunk); err != nil {
+			return true, err
+		}
 		return false, nil
 	}, nil)
+	if err == nil {
+		err = state.finishReasoningLoops()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -782,7 +816,7 @@ func normalizeFrame(obj map[string]any) map[string]any {
 // Stream 逐事件规范化并 flush；合法终态写唯一 [DONE]。
 // 上游错误/读错误/截断先发 error 再发 [DONE] 并返回 *StreamError。
 // [DONE] 只关闭传输，不覆盖已有 error；客户端写失败直接返回原始错误。
-func Stream(w http.ResponseWriter, r io.Reader) error {
+func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -811,11 +845,14 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 		return nil
 	}
 
-	state := &streamState{}
+	state := newStreamState(options)
 	err := readSSE(r, func(ev sseEvent) (bool, error) {
 		obj, done, err := decodeSSEEvent(ev)
 		if err != nil || done {
 			state.done = done
+			if done && err == nil {
+				err = state.finishReasoningLoops()
+			}
 			return true, err
 		}
 		if err := state.observe(obj); err != nil {
@@ -824,6 +861,15 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 		if value, ok := obj["usage"].(map[string]any); ok {
 			usage = MergeUsage(usage, value)
 			obj["usage"] = usage
+		}
+		guardErr := state.observeReasoningLoops(obj)
+		if guardErr != nil {
+			// Keep the observed text/usage frame, but do not publish a successful
+			// finish marker immediately before reporting a guard failure.
+			choices, _ := obj["choices"].([]any)
+			for _, raw := range choices {
+				raw.(map[string]any)["finish_reason"] = nil
+			}
 		}
 		stripToolCallNames(obj, toolCallSeen)
 		if firstID == "" {
@@ -837,7 +883,10 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 		if err != nil {
 			return true, &StreamError{Code: "upstream_parse", Message: "upstream frame could not be encoded", Cause: err}
 		}
-		return false, writeRaw(string(raw))
+		if writeErr := writeRaw(string(raw)); writeErr != nil {
+			return true, errors.Join(guardErr, writeErr)
+		}
+		return guardErr != nil, guardErr
 	}, func(line string) error {
 		if _, err := io.WriteString(w, line+"\n\n"); err != nil {
 			return err
@@ -847,6 +896,9 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 		}
 		return nil
 	})
+	if err == nil {
+		err = state.finishReasoningLoops()
+	}
 	if err == nil {
 		err = state.end()
 	}

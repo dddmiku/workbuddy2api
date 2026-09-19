@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ═══ 更新日志 ═══
+# 2026-09-19：合入两张长表格的固定表头和窄屏横向滚动支持。
 # 2026-09-16：加入密钥管理页的样式与行为源码，继续生成可直接部署的单文件控制台。
 # 2026-09-17：加入用量统计页的样式与行为源码。
 # 2026-09-17：加入「版本与热更新」卡片的样式与行为源码（update.css / update.js）。
@@ -42,7 +43,7 @@ def read(name):
 
 def main():
     css = "".join(read(n) for n in ("css_a.css", "css_b.css", "css_c.css", "keys.css",
-                                    "usage.css", "logs.css", "update.css"))
+                                    "usage.css", "logs.css", "update.css", "table_headers.css"))
     body = read("body.html")
     with open(os.path.join(HERE, "app.js"), "r", encoding="utf-8") as fh:
         js = fh.read()
@@ -51,6 +52,8 @@ def main():
     with open(os.path.join(HERE, "usage.js"), "r", encoding="utf-8") as fh:
         js += "\n" + fh.read()
     with open(os.path.join(HERE, "update.js"), "r", encoding="utf-8") as fh:
+        js += "\n" + fh.read()
+    with open(os.path.join(HERE, "table_headers.js"), "r", encoding="utf-8") as fh:
         js += "\n" + fh.read()
     if "/*__APP_JS__*/" not in body:
         sys.stderr.write("body.html 缺少 /*__APP_JS__*/ 占位符\n")

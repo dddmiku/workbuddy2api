@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-19：推理与正文可交错到达，done改为终态时发出，ID/index与最终输出顺序仍需一致。
 // 2026-09-15: 新增。/v1/responses 兼容层单测：请求翻译、工具翻译、非流式对象翻译、
 //   流式事件序列（含推理条目与工具调用）。
 // 2026-09-16: 新增工具输出图片用例——含图保留 part 数组 + detail；纯文本仍退化字符串。
@@ -215,8 +216,8 @@ func TestResponsesWriterStreamWithReasoning(t *testing.T) {
 	want := []string{
 		evCreated, evInProgress,
 		evItemAdded, evRsPartAdded, evRsDelta,
-		evRsDone, evRsPartDone, evItemDone,
 		evItemAdded, evPartAdded, evTextDelta,
+		evRsDone, evRsPartDone, evItemDone,
 		evTextDone, evPartDone, evItemDone,
 		evCompleted,
 	}
@@ -229,8 +230,8 @@ func TestResponsesWriterStreamWithReasoning(t *testing.T) {
 		}
 	}
 	// 推理条目必须排在正文之前：Responses 的 output 顺序即 output_index 顺序。
-	if datas[2]["output_index"] != float64(0) || datas[8]["output_index"] != float64(1) {
-		t.Fatalf("output_index 分配不对: 推理=%v 正文=%v", datas[2]["output_index"], datas[8]["output_index"])
+	if datas[2]["output_index"] != float64(0) || datas[5]["output_index"] != float64(1) {
+		t.Fatalf("output_index 分配不对: 推理=%v 正文=%v", datas[2]["output_index"], datas[5]["output_index"])
 	}
 	final := datas[len(datas)-1]["response"].(map[string]any)
 	if final["status"] != "completed" {

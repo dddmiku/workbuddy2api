@@ -96,6 +96,10 @@ model_instructions_file = "/opt/workbuddy2api/examples/codex-instructions.md"
 
 先在普通测试目录验证读文件、执行一条测试命令和续接对话，再用于自己的项目。需要结构化结果时，可以在 Codex 中提供 `--output-schema`。
 
+### 推理反复重复
+
+指定 DeepSeek 模型持续重复少量短行、没有新的正文或工具进展时，网关默认会尝试中止该次请求，返回 `upstream_reasoning_loop`。看到此错误后可整理上下文再重试；业务本来就需要大量重复短行时，可以关闭这项保护。它可能误报，也不能覆盖所有循环，设置与用量边界见 [重复推理保护](configuration.md#重复推理保护)。
+
 ### 预告文字与回合结束
 
 `response.completed` 表示一次模型响应已经完整返回。响应中有可执行的工具调用时，Codex 执行工具并继续请求；只有文字时，客户端可以结束当前回合。因此“接下来我会运行测试”这样的预告，即使 HTTP 为 200，也不代表测试已经执行。

@@ -106,7 +106,15 @@ custom 的 grammar/CFG 描述仅作为模型提示，不提供原生语法执行
 
 工具条目建立后，增量与最终结果保持同一 item/call 身份；早于名称到达的参数会暂存，不能靠猜测工具身份提前交付。失败或截断不会用成功工具终态掩盖缺失的数据。
 
+Responses 的同一 output item 只发送一次 `response.output_item.added`，增量与收尾引用同一身份，结束后不复用该 item ID。推理与工具或正文交错时，后续推理追加到尚未结束的 reasoning 条目；摘要增量只包含新增文本，不重放此前片段。最终 output 与流内条目的身份和顺序保持一致。
+
 `response.completed` 是一次响应的协议终态，不是整个用户任务的验收结论。工具调用与纯文字均可正常完成；模型只用文字预告下一步时，不能仅凭协议终态判断已完成所有工作。接入约定见 [Codex 接入](codex.md#预告文字与回合结束)。
+
+## 重复推理的失败状态
+
+指定 DeepSeek 模型触发重复短行保护时，错误码为 `upstream_reasoning_loop`，提示「检测到重复推理循环，已停止该次请求；可整理上下文后重试」，可附字符数与重复覆盖计数。非流式 Chat 与 Responses 返回 HTTP 422；已开始的流式请求保留 HTTP 200，Chat 返回错误事件，Responses 以 `response.failed` 结束，不附带成功终态。
+
+网关自身不对此类失败轮换账号、重试或冷却，已有会话绑定保留；客户端是否重试取决于其策略。账本保留已观测的原始用量，并同时增加失败和用量未完整返回计数。保护默认开启且可关闭；它可能误判合法短行重复，也不能检测所有循环，详细范围见 [重复推理保护](configuration.md#重复推理保护)。
 
 ## 思考模式的推理回灌（上游 11155）
 
@@ -123,6 +131,7 @@ Responses 的明文 reasoning 历史会转换为上游的 `reasoning_content`。
 | `request_body_too_large` | 入站请求超过配置上限 |
 | `response_contract_violation` | 模型的成功结果未满足声明的工具或输出约束 |
 | `missing_tool_call` | 工具结束原因缺少实际调用 |
+| `upstream_reasoning_loop` | 重复短行推理触发保护；整理上下文后重试，合法重复场景可关闭保护 |
 | `upstream_invalid_request` | 上游拒绝请求参数 |
 | `upstream_channel_rejected` | 上游拒绝调用渠道 |
 | `upstream_waf_blocked` | 上游入口拦截请求正文 |
@@ -134,6 +143,6 @@ Responses 的明文 reasoning 历史会转换为上游的 `reasoning_content`。
 
 ## 验证范围
 
-公开回归使用合成数据，覆盖工具子集与选择、严格/非严格参数、长名往返、refusal、未知历史项隔离、正文/图片保留、SSE 增量、截断与迟到错误。可检查 [协议回归](../internal/server/protocol_diagnosis_test.go)、[输出完整性回归](../internal/server/responses_output_integrity_test.go) 和 [请求结构校验](../internal/server/request_validation_test.go)。
+公开回归使用合成数据，覆盖工具子集与选择、严格/非严格参数、长名往返、refusal、未知历史项隔离、正文/图片保留、SSE 增量、截断与迟到错误，以及交错推理的条目生命周期和重复推理保护。可检查 [协议回归](../internal/server/protocol_diagnosis_test.go)、[输出完整性回归](../internal/server/responses_output_integrity_test.go)、[请求结构校验](../internal/server/request_validation_test.go)、[推理生命周期回归](../internal/server/responses_reasoning_lifecycle_test.go) 和 [保护及用量回归](../internal/server/reasoning_loop_guard_test.go)。
 
 这些检查不能等同于全部账号、模型、渠道和客户端组合均已实测通过。开源实现的固定提交、采用原则及未照搬的边界见 [协议实现参考](protocol-references.md)。

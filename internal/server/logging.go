@@ -6,6 +6,7 @@
 //	思考模式下每轮都要重发整段上下文，只看 tok= 会让人觉得"用量明明很大却记了这么点"。
 //
 // 2026-09-19：流式与聚合共用原始用量观测，失败仍保留已知数值；按完整事件合并分帧字段，缺失显示 -。
+// 2026-09-19：请求日志保留完整模型名，仅转义控制字符和表格分隔符以保持日志结构。
 // logging.go 请求级表格日志：每个 /v1/chat/completions 请求结束后打印一行到 stdout。
 package server
 
@@ -357,9 +358,7 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status, prom
 		return
 	}
 	seq := chatSeq.Add(1)
-	if len(model) > 11 {
-		model = model[:11]
-	}
+	model = strings.NewReplacer("\r", "\\r", "\n", "\\n", "\t", "\\t", "|", "\\u007c").Replace(model)
 	tokField := "-"
 	tokpsField := "-"
 	if toks >= 0 {

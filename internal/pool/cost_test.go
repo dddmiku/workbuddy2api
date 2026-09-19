@@ -68,8 +68,8 @@ func TestModelCostUnknownBeatsKnownPaid(t *testing.T) {
 	}
 }
 
-// TestModelCostFreeBeatsUnknown 已确认免费的号压过未观测的号。
-func TestModelCostFreeBeatsUnknown(t *testing.T) {
+// TestModelCostFreePrioritized 已确认免费仍优先；第四次的探索由 exploration_test 覆盖。
+func TestModelCostFreePrioritized(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
 	p.SetRandomSource(func(n int64) int64 { return 0 })
@@ -79,7 +79,7 @@ func TestModelCostFreeBeatsUnknown(t *testing.T) {
 	p.SetCredits("unknown", 1_000_000)
 	p.NoteModelCost("knownfree", "hy4-preview", 0, 1000)
 
-	for i := 0; i < 50; i++ {
+	for i := 0; i < 3; i++ {
 		a := p.PickExcludingForRealm(nil, "hy4-preview", "")
 		if a == nil || a.UID != "knownfree" {
 			t.Fatalf("选中 %v, want knownfree（已确认免费 > 未知）", a)

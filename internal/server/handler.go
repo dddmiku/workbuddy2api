@@ -1,4 +1,6 @@
 // ═══ 更新日志 ═══
+// 2026-09-19：会话绑定和上游关联头按已鉴权密钥隔离，避免不同调用方共用或互相解除绑定。
+// 2026-09-19：重复推理保护返回明确非重试错误，停止本次流但保留已知用量和账号/粘性状态。
 // 2026-09-19：移除输入倍率依赖，HTTP 出口保留上游原始用量。
 // 2026-09-17：合并模型级避让与完整响应校验，仅在确认成功后解除模型负缓存。
 // 2026-09-17：密钥可绑定模型白名单，超出范围的请求在选号前拒绝。
@@ -49,6 +51,9 @@ type Config struct {
 	// MaxBodyBytes 聊天请求体大小上限；<=0 兜底 8<<20（8MB）。
 	// 超限直接 413 request_body_too_large（不再静默截断喂给上游，issue #41）。
 	MaxBodyBytes int64
+	// ReasoningLoopGuard nil defaults to enabled; an explicit false disables the
+	// model-scoped, repetition-based guard without changing request model or effort.
+	ReasoningLoopGuard *bool
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -77,7 +82,7 @@ type Config struct {
 	GlobalEnabled bool
 
 	// Usage 按调用密钥累计的 token 账本（可选；nil = /usage 报未启用）。
-	// 只有成功请求参与累计，数据来自上游 usage，缺失即不记 token（缺失≠0）。
+	// 已发起上游的请求独立记账；已知用量保留，失败和未完整上报另作标记。
 	Usage *usage.Store
 
 	// Update 热更新管理器（可选；nil = /update/* 报未启用）。
@@ -179,6 +184,9 @@ type internalAdminContextKey struct{}
 
 // apiKeyContextKey 携带本次请求使用的密钥信息（模型白名单等）。
 type apiKeyContextKey struct{}
+
+// routingSessionKeyContextKey preserves Responses routing hints across translation.
+type routingSessionKeyContextKey struct{}
 
 // requestKeyInfo 返回鉴权命中的密钥信息；单密钥模式或内部管理请求返回零值。
 func requestKeyInfo(r *http.Request) (apikeys.Info, bool) {
@@ -788,7 +796,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 仍可用），必须重分配——否则会被钉在这个号上反复失败。
 	// 提取与下方会话头族的聚合键共用同一结果，故**不受粘性开关影响**：粘性未启用
 	// （Session==nil）时聚合键仍应是会话级，而不是退化成轮级。
-	sessKey := session.ExtractKey(body)
+	sessKey, preserved := r.Context().Value(routingSessionKeyContextKey{}).(string)
+	if !preserved {
+		sessKey = session.ExtractKey(body)
+	}
+	sessKey = session.ScopeKey(st.keyID, sessKey)
 	stickyUID := ""
 	if h.cfg.Session != nil && sessKey != "" {
 		// 传给 ResolveForModel 的是**完整**模型名（peek.Model，含 realm 前缀）。
@@ -809,7 +821,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 必须在下方 prompt.Rewrite / rewriteModel 之前取——改写会动 messages 内容。
 	turnKey := ""
 	if sessKey == "" {
-		turnKey = session.TurnKey(body)
+		turnKey = session.ScopeKey(st.keyID, session.TurnKey(body))
 	}
 
 	// 在途租约：成功选中即占名额；函数出口（含成功 return 与 panic）统一释放。
@@ -857,16 +869,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 循环外**生成一次，循环内每次出站原样复用 → 换号/重试/降级全部同 ID，后台不再
 	// 碎片化（此前网关一个都不发，上游按 HTTP 请求逐条记账，同一对话几十上百个
 	// RequestID）。
-	//   - conversationID：body 提取（透传客户端原值，缺省空串——不伪造，见
-	//     ResolveConversationID；官方后台不校验一致，空会话则不建立聚合键）；
-	//   - conversationRequestID：入站 X-Conversation-Request-ID 透传优先（客户端已
-	//     有自己的对话轮 ID 则以客户端为准），否则按粘性 key 进程内稳定生成（同会话
+	//   - conversationID：body 提取，缺省空串；多密钥模式先按调用方隔离，
+	//     客户端原始正文保持不变，单密钥模式保持原值；
+	//   - conversationRequestID：入站 X-Conversation-Request-ID 优先（同样按调用方
+	//     隔离），否则按粘性 key 进程内稳定生成（同会话
 	//     恒同值）；粘性 key 也为空时走轮级兜底（session.TurnKey/TurnRequestID），
 	//     无 user 消息时退化成本请求级 NewMessageID——轮转内捕获一次即共享；
 	//   - messageID 在 ChatHeaders 内每条消息生成（消息级独立，无需外部可见）。
-	chatMeta := upstream.ChatMeta{ConversationID: session.ResolveConversationID(body)}
+	chatMeta := upstream.ChatMeta{ConversationID: session.ScopeKey(st.keyID, session.ResolveConversationID(body))}
 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
-		chatMeta.ConversationRequestID = v
+		chatMeta.ConversationRequestID = session.ScopeKey(st.keyID, v)
 	} else if sessKey != "" {
 		chatMeta.ConversationRequestID = session.RequestIDForKey(sessKey)
 	} else {
@@ -874,7 +886,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 共享同键，用户发下一条消息自动换键。
 		chatMeta.ConversationRequestID = session.TurnRequestID(turnKey)
 	}
-	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
+	chatMeta.TraceID = session.ScopeKey(st.keyID, r.Header.Get("X-Trace-ID"))
 	chatContext := upstream.WithChatRetryObserver(r.Context(), st.absorbJSONUsage)
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
@@ -1042,16 +1054,34 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
 		stats := newChatStatsReaderSince(rc, st.start)
+		streamOptions := upstream.StreamOptions{
+			Model:              peek.Model,
+			ReasoningLoopGuard: h.cfg.ReasoningLoopGuard == nil || *h.cfg.ReasoningLoopGuard,
+		}
 		if peek.Stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK
-			streamErr := upstream.Stream(w, stats)
+			streamErr := upstream.Stream(w, stats, streamOptions)
 			if checker, ok := w.(interface{ CompletionError() error }); ok && streamErr == nil {
 				streamErr = checker.CompletionError()
 			}
 			st.absorbUsage(stats)
 			if streamErr != nil {
 				rc.Close()
+				if upstream.IsReasoningLoopError(streamErr) {
+					// The stream was stopped before final usage could be established.
+					// Preserve observed counts but do not label them as a complete bill.
+					st.unreported = true
+					st.status = http.StatusUnprocessableEntity
+					if r.Context().Err() != nil {
+						st.status = 499
+					}
+					var loopErr *upstream.StreamError
+					if errors.As(streamErr, &loopErr) {
+						log.Printf("WARN: [server] %s", loopErr.Message)
+					}
+					return
+				}
 				if r.Context().Err() != nil {
 					st.status = 499
 				} else {
@@ -1079,10 +1109,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			rc.Close()
 			return
 		}
-		resp, err := upstream.Aggregate(stats)
+		resp, err := upstream.Aggregate(stats, streamOptions)
 		st.absorbUsage(stats)
 		rc.Close()
 		if err != nil {
+			if upstream.IsReasoningLoopError(err) {
+				st.unreported = true
+				st.status = http.StatusUnprocessableEntity
+				writeOpenAIError(w, st.status, upstream.ReasoningLoopErrorCode, err.Error())
+				return
+			}
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway

@@ -1,5 +1,6 @@
 // 选号：Pick 簇（healthy 三因子加权 Top5 短名单 + 加权随机 + 全冷却兜底 + 在途占满过滤）。
 // ═══ 更新日志 ═══
+// 2026-09-19：免费优先保留，每四次普通分配给未知可用账号一次轮询机会；粘性和跨模型流量不干扰探索。
 // 2026-09-18：全冷却兜底仍遵守请求模型的独立冷却，避免重复选择已明确限额或不可用的模型。
 package pool
 
@@ -85,14 +86,14 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	// （存入 ws.tier/ws.cost1k）——sort 比较器与 pickWeighted 都只读缓存字段，
 	// 不再现算。比较器内现算会翻成 O(n log n) 次冗余浮点/map 查找（46 账号约
 	// 500 次比较），旧实现在此翻过车。
-	// 成本分层：reqModel 非空时，按该模型的实测扣费把候选分层，只保留最优层。
+	// 成本分层：按该模型实测扣费优先最优层；免费与未知同时存在时，
+	// 每四次普通分配探索一个未知号，防止第一个免费观测永久排除其他账号。
 	//   0 = 已实测免费（限免期/夜间免费的号，最强偏好）
 	//   1 = 无观测（含观测过期）
 	//   2 = 已实测收费
 	// 为什么"无观测"排在"已实测收费"之前：新号的限免状态只能靠实测发现，
 	// 若已知收费的号恒压过未知号，那台免费的号永远轮不到，也就永远学不到。
-	// 为什么用硬过滤而非仅排序：pickWeighted 会在候选内加权随机，只排序的话
-	// 收费号仍有机会抽中，达不到"优先免费"的语义。
+	// 已知收费号不参与免费层探索，避免仅为打散流量而产生额外已知费用。
 	costTier := func(e *entry) (int, float64) {
 		mc, ok := e.modelCostOf(reqModel, now)
 		if !ok {
@@ -104,16 +105,31 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		return 2, mc.CostPer1k
 	}
 	bestTier := 2
+	all := make([]weighted, 0, len(cands))
+	var unknown []*entry
 	for _, e := range cands {
-		if ti, _ := costTier(e); ti < bestTier {
+		ti, ci := costTier(e)
+		all = append(all, weighted{e: e, tier: ti, cost1k: ci})
+		if ti == 1 {
+			unknown = append(unknown, e)
+		}
+		if ti < bestTier {
 			bestTier = ti
 		}
 	}
+	if bestTier == 0 && len(unknown) > 0 {
+		if e := p.exploreUnknownLocked(unknown, reqModel, realm); e != nil {
+			e.lastUsed = now
+			p.pickSeq++
+			e.usedSeq = p.pickSeq
+			return e.a
+		}
+	}
 	ws := make([]weighted, 0, len(cands))
-	for _, e := range cands {
-		ti, ci := costTier(e)
-		if ti == bestTier {
-			ws = append(ws, weighted{e: e, w: p.weightOf(e, maxCredits, now), tier: ti, cost1k: ci})
+	for _, candidate := range all {
+		if candidate.tier == bestTier {
+			candidate.w = p.weightOf(candidate.e, maxCredits, now)
+			ws = append(ws, candidate)
 		}
 	}
 	// 等权重洗牌：仅当存在权重并列（epsilon 比较，防浮点微差让洗牌静默失效）且

@@ -1,4 +1,6 @@
 // ═══ 更新日志 ═══
+// 2026-09-19：在请求上下文保留原始会话键供隔离路由使用，client_metadata 不再因转换而丢失线程亲和。
+// 2026-09-19：推理条目跨正文和工具增量保持打开，在最终状态确定后收尾，避免重复added、重用ID和旧摘要重放。
 // 2026-09-19：删除输入/缓存倍率计算，流式与非流式 Responses 均返回上游原始用量。
 // 2026-09-15: 新增。NarraFork / Codex 等客户端走 OpenAI Responses API（POST /v1/responses），
 //   网关此前只实现 /v1/chat/completions，客户端拿到 Go 默认的 "404 page not found"。
@@ -30,6 +32,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -43,6 +46,7 @@ import (
 	"unicode/utf8"
 	"workbuddy2api/internal/jsonutil"
 	"workbuddy2api/internal/prompt"
+	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -1057,8 +1061,10 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	// 运行约定：只在带工具的请求上追加，抑制「一句话一个命令」的叙述式输出。
 	chatBody = applyActNote(chatBody, h.cfg.PromptActNote, len(req.Tools) > 0)
 
-	// 让 chatCompletions 从翻译后的 body 读；header/context/方法保持不变。
-	sub := r.Clone(withReasoningStats(r.Context(), req.reasoning))
+	// Extract routing identity before conversion strips client-only metadata.
+	// It stays in request context; upstream does not need client_metadata fields.
+	ctx := context.WithValue(r.Context(), routingSessionKeyContextKey{}, session.ExtractKey(body))
+	sub := r.Clone(withReasoningStats(ctx, req.reasoning))
 	sub.Body = io.NopCloser(bytes.NewReader(chatBody))
 	sub.ContentLength = int64(len(chatBody))
 
@@ -1463,7 +1469,7 @@ func (rw *responsesWriter) openMessage() {
 	if rw.msgOpen {
 		return
 	}
-	rw.closeReasoning()
+	// 推理仍可能继续到达；与正文共享响应生命周期，直到终态才发 done。
 	rw.msgOutIdx = rw.nextIdx
 	rw.nextIdx++
 	rw.emit(evItemAdded, map[string]any{
@@ -1592,7 +1598,6 @@ func (rw *responsesWriter) toolCallDelta(tcs []any) {
 		}
 		call := rw.calls[index]
 		if call == nil {
-			rw.closeReasoning()
 			call = &respToolCall{outIdx: rw.nextIdx}
 			rw.nextIdx++
 			rw.calls[index] = call

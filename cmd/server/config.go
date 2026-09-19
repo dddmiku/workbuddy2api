@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-19：重复推理保护默认开启，可由features.reasoning_loop_guard显式关闭；不修改模型或思考档位。
 // 2026-09-19：退役输入倍率配置，合法旧值仅告警并忽略，Responses 恢复上游原始用量。
 // 2026-09-19：校验输入估计倍率的格式与有限范围，防止非法环境变量静默关闭估计或产生负用量。
 // 2026-09-18：更新目录优先采用监督进程显式传入的值，避免下载位置与容器重启指针分离。
@@ -117,6 +118,7 @@ type Config struct {
 	Features struct {
 		// SanitizeBlacklistFingerprints 兼容旧配置；已废弃，不再改写任何业务内容。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+		ReasoningLoopGuard            bool `json:"reasoning_loop_guard"`
 	} `json:"features"`
 
 	Prompt struct {
@@ -199,6 +201,7 @@ func Default() *Config {
 	c.Server.OutboundImageBudgetMB = 7
 	// 仅供已退役字段的兼容校验，不参与运行时用量处理。
 	c.Server.InputTokenScale = 1
+	c.Features.ReasoningLoopGuard = true
 	// 排程段默认值由 internal/config 集中维护（cmd/server 与 cmd/activity 共用，
 	// 消除 issue #49 的默认值漂移）。
 	c.Schedule = config.DefaultSchedule()
@@ -262,12 +265,18 @@ func Load(path string) (*Config, error) {
 			Server struct {
 				InputTokenScale json.RawMessage `json:"input_token_scale"`
 			} `json:"server"`
+			Features struct {
+				ReasoningLoopGuard json.RawMessage `json:"reasoning_loop_guard"`
+			} `json:"features"`
 		}
 		if err := json.Unmarshal(raw, &retired); err != nil {
 			return nil, fmt.Errorf("parse retired config: %w", err)
 		}
 		if strings.TrimSpace(string(retired.Server.InputTokenScale)) == "null" {
 			return nil, fmt.Errorf("server.input_token_scale: null 非法（已退役兼容值仍需为 [1,5] 内的有限数字）")
+		}
+		if strings.TrimSpace(string(retired.Features.ReasoningLoopGuard)) == "null" {
+			return nil, fmt.Errorf("features.reasoning_loop_guard must be true or false")
 		}
 		legacyScaleConfigured = legacyScaleConfigured || retired.Server.InputTokenScale != nil
 	}

@@ -1,3 +1,5 @@
+// ═══ 更新日志 ═══
+// 2026-09-19：按已鉴权调用密钥隔离绑定键和关联 ID，保留同一调用方的稳定性。
 // ids.go 会话头族 ID 的解析与生成（issue #35 后台聚合）。
 //
 // 官方 CodeBuddy CLI 出站头族（X-Conversation-ID / X-Conversation-Request-ID /
@@ -16,6 +18,18 @@ import (
 	"math/rand/v2"
 	"strings"
 )
+
+// ScopeKey namespaces client-controlled identities with the authenticated key ID
+// (never the API secret). Length framing avoids ambiguous caller/key pairs.
+// Deterministic across restarts for persisted binds; legacy single-key mode keeps
+// its original identities. Missing session/trace IDs remain missing.
+func ScopeKey(callerID, key string) string {
+	if callerID == "" || key == "" {
+		return key
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("wb2api-caller-v1:%d:%s%s", len(callerID), callerID, key)))
+	return hex.EncodeToString(sum[:16])
+}
 
 // ResolveConversationID 从请求体提取会话头族的 conversationId（snake/camel 双形态，
 // 复用 ExtractKey 的识别顺序：metadata 优先、snake 优先于 camel）。

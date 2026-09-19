@@ -1,6 +1,7 @@
 // Pool 账号池核心：结构定义、构造（New/Set* 注入）、在途租约（Acquire/Release）
 // 与账号增删（Add/SyncToDir/upsertLocked）。选号/冷却/状态/持久化见同包其他文件。
 // ═══ 更新日志 ═══
+// 2026-09-19：按模型和区域保存有界探索游标，避免免费观测让其他可用账号永久饿死。
 // 2026-09-18：记录后台落盘退出信号，确保 Close 返回后不会再有旧进程的后台写入。
 // 2026-09-18：显式 Add 观察当前删除代次，既阻止陈旧创建意图，也允许删除后的合法重新添加。
 package pool
@@ -49,6 +50,9 @@ type Pool struct {
 	// pickSeq 选号单调序号源：仅 pick 在持 p.mu 写锁时自增并赋给 entry.usedSeq，
 	// 无需 atomic。见 entry.usedSeq 注释（解决 Windows 时钟精度导致的 LRU 失效）。
 	pickSeq uint64
+	// costExploration only advances on ordinary selection with both free and
+	// unknown candidates. Sticky requests and other models do not consume it.
+	costExploration map[[32]byte]*explorationState
 	// stopCh 关闭信号：Close 关闭它使 startFlusher 的后台 goroutine 退出。
 	// nil = 未启动 flusher（stateFp 为空时 New 不起 flusher）。
 	stopCh      chan struct{}

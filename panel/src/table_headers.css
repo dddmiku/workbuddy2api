@@ -1,0 +1,17 @@
+/* 2026-09-19：滚动时保留表头，窄屏继续按列显示并允许表格横向滚动。 */
+.table-head-float{position:fixed;top:0;z-index:30;overflow:hidden;pointer-events:none;
+  background:var(--surface);box-shadow:0 2px 5px rgba(0,0,0,.1)}
+.table-head-float[hidden]{display:none}
+.table-head-float .tbl{margin:0;table-layout:fixed}
+.table-head-float .tbl thead{display:table-header-group}
+.table-head-float th{box-sizing:border-box;background:var(--surface)}
+@media (max-width:900px){
+  .tblwrap.table-scroll{overflow-x:auto}
+  .table-scroll .tbl{min-width:980px}
+  .table-scroll .tbl thead{display:table-header-group}
+  .table-scroll .tbl tbody tr{display:table-row;margin:0;padding:0;border:0;background:transparent}
+  .table-scroll .tbl tbody tr:hover{background:var(--surface-2)}
+  .table-scroll .tbl td{display:table-cell;padding:11px 14px;border-bottom:1px solid var(--line)}
+  .table-scroll .tbl tbody tr:last-child td{border-bottom:0}
+  .table-scroll .tbl td::before{display:none}
+}

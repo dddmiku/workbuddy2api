@@ -132,7 +132,7 @@ func TestExtractKeyPriority(t *testing.T) {
 		{`{"client_metadata":{"session_id":"s1"},"prompt_cache_key":"p1"}`, "s1"},
 		{`{"client_metadata":{"thread_id":"t1"},"metadata":{"user_id":"mu"}}`, "t1"}, // thread 优先于 user_id
 		{`{"client_metadata":{"thread_id":123},"prompt_cache_key":"p1"}`, "p1"},      // 非字符串 thread → 退到 cache key
-		{`{"prompt_cache_key":"p1","conversation_id":"top"}`, "p1"},                  // cache key 优先于顶层会话键
+		{`{"prompt_cache_key":"p1","conversation_id":"top"}`, "top"},                 // 显式会话优先于共享 cache key
 		{`{"metadata":{"user_id":"mu"},"prompt_cache_key":""}`, "mu"},                // 空 cache key 不影响 user_id 兜底
 	}
 	for _, c := range cases {

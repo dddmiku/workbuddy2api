@@ -411,6 +411,23 @@ pre.term{margin:0;padding:12px 14px;background:var(--sunken);color:var(--ink-2);
 .upd-tag::before{ content:''; width:6px; height:6px; border-radius:50%; background:currentColor }
 .upd-tag.w{ background:var(--warn-soft); color:var(--warn) }
 .upd-tag.e{ background:var(--err-soft); color:var(--err) }
+/* 2026-09-19：滚动时保留表头，窄屏继续按列显示并允许表格横向滚动。 */
+.table-head-float{position:fixed;top:0;z-index:30;overflow:hidden;pointer-events:none;
+  background:var(--surface);box-shadow:0 2px 5px rgba(0,0,0,.1)}
+.table-head-float[hidden]{display:none}
+.table-head-float .tbl{margin:0;table-layout:fixed}
+.table-head-float .tbl thead{display:table-header-group}
+.table-head-float th{box-sizing:border-box;background:var(--surface)}
+@media (max-width:900px){
+  .tblwrap.table-scroll{overflow-x:auto}
+  .table-scroll .tbl{min-width:980px}
+  .table-scroll .tbl thead{display:table-header-group}
+  .table-scroll .tbl tbody tr{display:table-row;margin:0;padding:0;border:0;background:transparent}
+  .table-scroll .tbl tbody tr:hover{background:var(--surface-2)}
+  .table-scroll .tbl td{display:table-cell;padding:11px 14px;border-bottom:1px solid var(--line)}
+  .table-scroll .tbl tbody tr:last-child td{border-bottom:0}
+  .table-scroll .tbl td::before{display:none}
+}
 </style>
 </head>
 <body>
@@ -641,8 +658,8 @@ pre.term{margin:0;padding:12px 14px;background:var(--sunken);color:var(--ink-2);
             <span class="sp"></span>
             <span class="sub" id="usageSince"></span>
           </div>
-          <div class="tblwrap">
-            <table class="tbl usage-table">
+          <div class="tblwrap table-scroll">
+            <table class="tbl usage-table" data-sticky-head="usage">
               <thead><tr>
                 <th>密钥</th><th class="r">请求</th><th class="r">输入 tokens</th>
                 <th class="r">缓存命中</th><th class="r">输出 tokens</th><th class="r">合计 tokens</th>
@@ -692,8 +709,8 @@ pre.term{margin:0;padding:12px 14px;background:var(--sunken);color:var(--ink-2);
             <span class="sp"></span>
             <span class="sub" id="logUpdated">—</span>
           </div>
-          <div class="tblwrap">
-            <table class="tbl log-table">
+          <div class="tblwrap table-scroll">
+            <table class="tbl log-table" data-sticky-head="logs">
               <thead><tr>
                 <th>#</th><th>时间</th><th>模型</th><th>模式</th><th>状态</th><th>调用密钥</th>
                 <th>账号</th><th class="r">TTFB</th><th class="r">输入</th><th class="r">缓存命中</th>
@@ -2508,6 +2525,79 @@ document.addEventListener('click', function(e){
   if (e.target.closest('#btnUpdCheck')){ actUpdateCheck(); return; }
   if (e.target.closest('#btnUpdApply')){ actUpdateApply(); }
 });
+
+// ═══ 更新日志 ═══
+// 2026-09-19：固定长表格表头，跟随原表格列宽和水平位置；保留页面自然纵向滚动。
+(function(){
+  function initTableHeaders(){
+    var pending = false;
+    var tables = [];
+    function schedule(){
+      if (pending) return;
+      pending = true;
+      requestAnimationFrame(function(){
+        pending = false;
+        tables.forEach(sync);
+      });
+    }
+    function sync(state){
+      var table = state.table, wrap = state.wrap, floating = state.floating;
+      if (!table.getClientRects().length){ floating.hidden = true; return; }
+      var head = table.tHead, headBox = head.getBoundingClientRect();
+      var tableBox = table.getBoundingClientRect(), wrapBox = wrap.getBoundingClientRect();
+      if (headBox.top >= 0 || tableBox.bottom <= 0 || !wrap.clientWidth){
+        floating.hidden = true;
+        return;
+      }
+      // The original overflow-x wrapper traps CSS sticky positioning. A visual
+      // copy outside it follows the source; the original header stays accessible.
+      if (state.markup !== head.innerHTML){
+        state.markup = head.innerHTML;
+        state.clone.replaceChildren(head.cloneNode(true));
+        state.clone.querySelectorAll('[id]').forEach(function(node){ node.removeAttribute('id'); });
+      }
+      var sourceCells = head.rows[0].cells;
+      var copiedCells = state.clone.tHead.rows[0].cells;
+      Array.prototype.forEach.call(sourceCells, function(cell, index){
+        copiedCells[index].style.width = cell.getBoundingClientRect().width + 'px';
+      });
+      state.clone.style.width = tableBox.width + 'px';
+      state.clone.style.transform = 'translateX(' + (-wrap.scrollLeft) + 'px)';
+      floating.style.left = wrapBox.left + 'px';
+      floating.style.width = wrap.clientWidth + 'px';
+      floating.style.height = headBox.height + 'px';
+      floating.style.top = Math.min(0, tableBox.bottom - headBox.height) + 'px';
+      floating.hidden = false;
+    }
+    document.querySelectorAll('table[data-sticky-head]').forEach(function(table){
+      var wrap = table.closest('.tblwrap');
+      var floating = document.createElement('div');
+      floating.className = 'table-head-float';
+      floating.dataset.tableHeadFor = table.dataset.stickyHead;
+      floating.hidden = true;
+      floating.setAttribute('aria-hidden', 'true');
+      floating.setAttribute('inert', '');
+      var clone = document.createElement('table');
+      clone.className = table.className;
+      floating.appendChild(clone);
+      document.body.appendChild(floating);
+      tables.push({table:table, wrap:wrap, floating:floating, clone:clone, markup:null});
+      new ResizeObserver(schedule).observe(table);
+      new ResizeObserver(schedule).observe(wrap);
+      new MutationObserver(schedule).observe(table, {childList:true, subtree:true, characterData:true});
+      new MutationObserver(schedule).observe(table.closest('.view'), {attributes:true, attributeFilter:['class']});
+    });
+    window.addEventListener('scroll', schedule, {capture:true, passive:true});
+    window.addEventListener('resize', schedule, {passive:true});
+    if (document.fonts) document.fonts.ready.then(schedule);
+    schedule();
+  }
+  if (document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', initTableHeaders);
+  } else {
+    initTableHeaders();
+  }
+})();
 
 </script>
 </body>

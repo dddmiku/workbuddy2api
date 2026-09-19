@@ -9,6 +9,7 @@
 //   - 每次绑定变更 fire-and-forget 镜像到 redisstore（防重启丢粘性）。
 //
 // ═══ 更新日志 ═══
+// 2026-09-19：显式会话标识优先于共享缓存键，避免不同会话被缓存提示合并。
 // 2026-09-18：GC 捕获本轮停止信号并等待退出，避免停止/重启后旧协程继续清理会话。
 package session
 
@@ -293,12 +294,9 @@ func hashIndex(key string, n int) int {
 	return int(h % uint32(n))
 }
 
-// ExtractKey 从请求体提取会话键；按下列顺序依次尝试，找不到返回空串（绝不失败）。
-//  1. metadata.conversation_id
-//  2. metadata.conversationId
-//  3. conversation_id
-//  4. conversationId
-//  5. metadata.user_id
+// ExtractKey 依次读取 metadata 会话 ID、顶层会话 ID、client_metadata 线程/会话 ID、
+// prompt_cache_key、metadata.user_id。显式会话优先于缓存/用户提示。
+// 调用方必须用已鉴权的调用密钥 ID 经 ScopeKey 隔离后再交给共享 Router。
 //
 // issue #35：客户端实际发 camelCase 的 conversationId，此前只识别 snake_case，
 // 导致粘性路由不命中、同对话轮转不同账号、上游上下文缓存 miss。现两种命名均识别，
@@ -320,7 +318,13 @@ func ExtractKey(body []byte) string {
 			return v
 		}
 	}
-	// 2. Codex 客户端：client_metadata 里带 thread_id / session_id（实测 codex-cli 0.155
+	// 2. 顶层显式会话键不能被共享缓存键覆盖。
+	for _, key := range []string{"conversation_id", "conversationId"} {
+		if v := strOrEmpty(obj[key]); v != "" {
+			return v
+		}
+	}
+	// 3. Codex 客户端：client_metadata 里带 thread_id / session_id（实测 codex-cli 0.155
 	//    与桌面端都会发）。漏掉这一层的话 Codex 会话完全没有粘性，同一对话会逐轮换号，
 	//    上游 prompt 缓存每轮失效。
 	if meta, ok := obj["client_metadata"].(map[string]any); ok {
@@ -331,15 +335,8 @@ func ExtractKey(body []byte) string {
 			}
 		}
 	}
-	// 3. prompt_cache_key：Codex 的线程级缓存键（实测与 client_metadata.thread_id 同源）。
+	// 4. prompt_cache_key：只在没有显式会话/线程时作为粘性提示。
 	if v := strOrEmpty(obj["prompt_cache_key"]); v != "" {
-		return v
-	}
-	// 4. 顶层会话键。
-	if v := strOrEmpty(obj["conversation_id"]); v != "" {
-		return v
-	}
-	if v := strOrEmpty(obj["conversationId"]); v != "" {
 		return v
 	}
 	// 5. 最后才退到 user_id：粒度最粗（一个用户的所有对话会共用一个号）。
