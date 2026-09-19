@@ -3,6 +3,7 @@
 # ═══ 更新日志 ═══
 # 2026-09-18：运行真实用量页函数核对日期筛选口径，防止按比例虚构模型明细或把历史总量显示成当日数据。
 # 2026-09-18：显式按 UTF-8 读取 Node 输出，保证 Windows 默认中文代码页下也能执行回归。
+# 2026-09-19：核对失败与未完整用量的日期汇总和可见说明，避免把未知消耗显示为已确认零值。
 
 import json
 from pathlib import Path
@@ -17,7 +18,8 @@ class UsageIntegrityTests(unittest.TestCase):
         source = Path(__file__).with_name("usage.js")
         program = """
 const vm = require('vm'); const fs = require('fs');
-const nodes = {usageFilter:{innerHTML:''}};
+const nodes = {usageFilter:{innerHTML:''},usageTiles:{innerHTML:''},
+  usageCoverage:{textContent:'',classList:{toggle(){}}}};
 const context = {document:{addEventListener(){}}, Date, console,
   $:s=>nodes[s.slice(1)] || null, esc:x=>String(x), exactTokens:x=>String(x)};
 vm.createContext(context); vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), context);
@@ -47,6 +49,31 @@ models:[{model:'a',totals:{total_tokens:100}},{model:'b',totals:{total_tokens:10
         result = self.run_usage("""var item={totals:{requests:200},days:[{day:'2026-09-17',totals:{requests:3}},{day:'2026-09-18',totals:{requests:5}}]};
 US.from='2026-09-17';US.to='2026-09-17';var a=usageTotalsFor(item).requests;US.from='';US.to='';[a,usageTotalsFor(item).requests]""")
         self.assertEqual(result, [3, 200])
+
+    def test_date_filter_preserves_failed_and_unreported_counts(self):
+        result = self.run_usage("""US.from='2026-09-19';US.to='2026-09-19';
+usageTotalsForScope({days:[{day:'2026-09-18',totals:{requests:9,failed_requests:8,unreported_requests:7}},
+{day:'2026-09-19',totals:{requests:3,failed_requests:2,unreported_requests:1}}]})""")
+        self.assertEqual(result.get("requests"), 3)
+        self.assertEqual(result.get("failed_requests"), 2)
+        self.assertEqual(result.get("unreported_requests"), 1)
+
+    def test_unknown_usage_is_visible_without_inventing_tokens(self):
+        result = self.run_usage("""renderUsageTiles({requests:2,failed_requests:1,unreported_requests:1,
+prompt_tokens:5000,cached_tokens:4096,completion_tokens:120,total_tokens:5120});
+({html:$('#usageTiles').innerHTML,note:$('#usageCoverage').textContent})""")
+        self.assertIn("失败或中断", result["html"])
+        self.assertIn("用量未完整返回", result["html"])
+        self.assertIn("5,120 tokens", result["html"])
+        self.assertIn("1 次", result["note"])
+        self.assertNotIn("成功完成的调用", result["html"])
+
+    def test_complete_usage_clears_an_earlier_incomplete_notice(self):
+        result = self.run_usage("""renderUsageTiles({requests:1,unreported_requests:1});
+var previous=$('#usageCoverage').textContent;renderUsageTiles({requests:1,unreported_requests:0});
+({previous:previous,current:$('#usageCoverage').textContent})""")
+        self.assertTrue(result["previous"])
+        self.assertEqual(result["current"], "")
 
 
 if __name__ == "__main__":

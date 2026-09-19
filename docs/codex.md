@@ -39,8 +39,6 @@ model = "cn:deepseek-v4.1-flash"
 model_provider = "workbuddy2api"
 model_reasoning_effort = "low"
 model_reasoning_summary = "concise"
-model_context_window = 1000000
-model_auto_compact_token_limit = 700000
 
 [model_providers.workbuddy2api]
 name = "workbuddy2api"
@@ -60,17 +58,19 @@ stream_idle_timeout_ms = 90000
 
 ### 长会话的上限口径
 
-上游用来计费的用量和它用来判 `1,048,576` 上限的不是同一套分词器：同一段中文，用量按 0.57 token/字符计，上限按 0.76 判（×1.33）。各角色消息、工具声明和图片两边都正常计入，只有 `reasoning_content` 两边都不算。于是 Codex 拿到的 `input_tokens` 系统性地低于真正参与上限判断的数字，它按自己的窗口阈值算出来的余量永远偏乐观，一路发到上游返回 400 `context_length_exceeded` 才停。
+第三方模型返回的输入用量，未必能精确预测下一次请求距离上下文上限还有多少空间。新消息、工具结果、图片以及上游处理方式都可能影响实际限制。某条路由的中文重复文本样本存在计数差额，也不足以证明上游使用了两套分词器，或给所有模型确定同一个换算比例。
 
-网关侧用 `server.input_token_scale` 把回给客户端的输入侧换算到上限口径：
+`server.input_token_scale` 提供可选的客户端上下文估计倍率。部署者可以根据实际模型、路由和请求样本调高估计值，为客户端压缩留出余量。例如，已完成相应校准的部署可使用：
 
 ```json
-{ "server": { "input_token_scale": 1.4 } }
+{ "server": { "input_token_scale": 1.5 } }
 ```
 
-换算只作用于 `/v1/responses` 回给客户端的 usage；`/v1/chat/completions`、账本与日志里的 `in=` 列仍是上游口径，不影响对账。开启后客户端按窗口比例设置的阈值（例如 `model_auto_compact_token_limit = 700000`）就能在撞墙前触发压缩；已经在跑的会话要重启 Codex（或让 cc switch 重新写入 `config.toml`）才会用上新阈值。
+倍率必须是 `[1,5]` 内的有限数字，默认 `1` 表示原样透传。它只调整 `/v1/responses` 返回的 `usage.input_tokens` 及缓存输入明细，并据此重算 `total_tokens`；输出用量、`/v1/chat/completions`、账本与日志里的 `in=` 列保留上游原值。因此启用后客户端的上下文估计会高于管理台记账值，不能把两者的差额当成漏记或计费增量。
 
-没有实测出差额的部署保持默认 `1`（原样透传）。
+这是服务级设置，会作用于所有模型和账号区域的 Responses 请求。混用模型、改变内容类型或上游升级后，需要重新核对；没有校准依据的部署保持 `1`。
+
+Codex 的 `model_context_window` 和 `model_auto_compact_token_limit` 应根据所用模型与路由的实际限制设置，并为后续消息与工具结果预留空间。倍率只改变已返回的估计值，无法保证下一次大请求一定不超限，也不能替代真实的压缩与续接验证。修改客户端阈值后应重新启动客户端，确认它已加载新配置。
 
 ### 可选：用中性说明覆盖系统提示词
 

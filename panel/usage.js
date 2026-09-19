@@ -1,5 +1,6 @@
 "use strict";
 // ═══ 更新日志 ═══
+// 2026-09-19：展示失败和未完整用量的请求，日期汇总保留状态计数，说明实际累计与客户端上下文估算的区别。
 // 2026-09-18：日期筛选使用实际天桶，停止按占比虚构模型明细；全部按钮显示完整历史次数。
 // 2026-09-17：新增用量统计页：总量卡片 + 按密钥明细 + 单密钥模型拆分，
 //             数据经本机管理通道读取网关记账（/usage）。
@@ -43,19 +44,29 @@ function renderUsageTiles(totals){
     promptNote += '（缓存命中 ' + Math.round(cached / prompt * 100) + '%）';
   }
   var tiles = [
-    {k: '请求数', v: exactTokens(t.requests), s: '成功完成的调用', i: 'pulse'},
+    {k: '请求数', v: exactTokens(t.requests), s: '已结束的调用，含失败与中断', i: 'pulse'},
     {k: '合计 tokens', v: compactTokens(t.total_tokens), s: exactTokens(t.total_tokens) + ' tokens', i: 'sum'},
     {k: '输入 tokens', v: compactTokens(t.prompt_tokens), s: promptNote, i: 'in'},
     {k: '输出 tokens', v: compactTokens(t.completion_tokens), s: exactTokens(t.completion_tokens) + ' tokens（含思考）', i: 'out'}
   ];
   if (cached > 0) tiles.push({k: '缓存命中输入', v: compactTokens(cached), s: exactTokens(cached) + ' tokens', i: 'zap'});
   if (t.credit) tiles.push({k: '上游计费', v: Number(t.credit).toFixed(2), s: 'usage.credit 累计', i: 'coins'});
+  if (Number(t.failed_requests) > 0) tiles.push({k: '失败或中断', v: exactTokens(t.failed_requests), s: '已包含在请求数中', i: 'pulse'});
+  if (Number(t.unreported_requests) > 0) tiles.push({k: '用量未完整返回', v: exactTokens(t.unreported_requests), s: '仅累计已返回的部分', i: 'clock'});
   $('#usageTiles').innerHTML = tiles.map(function(tile){
     return '<div class="usage-tile">' +
       '<div class="k"><span class="uz-ico">' + usageIcon(tile.i) + '</span>' + esc(tile.k) + '</div>' +
       '<div class="v">' + esc(tile.v) + '</div>' +
       '<div class="s">' + esc(tile.s) + '</div></div>';
   }).join('');
+  var coverage = $('#usageCoverage');
+  if (coverage){
+    var unreported = Number(t.unreported_requests) || 0;
+    coverage.textContent = unreported > 0
+      ? '当前范围有 ' + exactTokens(unreported) + ' 次请求未返回完整用量；上方仅累计已确认的部分。'
+      : '';
+    coverage.classList.toggle('hide', unreported === 0);
+  }
 }
 
 // usageIcon：卡片与筛选器用的线条图标（与侧栏同一套描边风格）。
@@ -123,10 +134,12 @@ function selectedDays(days){
 
 // sumTotals 把若干天桶相加（字段与网关 Totals 一一对应）。
 function sumTotals(days){
-  var out = {requests:0, prompt_tokens:0, cached_tokens:0, completion_tokens:0, total_tokens:0, credit:0};
+  var out = {requests:0, failed_requests:0, unreported_requests:0, prompt_tokens:0, cached_tokens:0, completion_tokens:0, total_tokens:0, credit:0};
   (days || []).forEach(function(day){
     var t = (day && day.totals) || {};
     out.requests += Number(t.requests) || 0;
+    out.failed_requests += Number(t.failed_requests) || 0;
+    out.unreported_requests += Number(t.unreported_requests) || 0;
     out.prompt_tokens += Number(t.prompt_tokens) || 0;
     out.cached_tokens += Number(t.cached_tokens) || 0;
     out.completion_tokens += Number(t.completion_tokens) || 0;
@@ -146,7 +159,7 @@ function filtered(){
 function usageTotalsFor(item){
   if (!filtered()) return item.totals || {};
   var days = item.days || [];
-  if (!days.length) return {requests:0, prompt_tokens:0, cached_tokens:0, completion_tokens:0, total_tokens:0, credit:0};
+  if (!days.length) return sumTotals([]);
   return sumTotals(selectedDays(days));
 }
 

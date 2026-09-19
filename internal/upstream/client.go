@@ -5,6 +5,7 @@
 // 2026-09-16：请求全程使用同一凭据快照，同账号刷新合并并由 Auth 原子提交，消除刷新与聊天/模型/计费的竞争。
 // 2026-09-16：把明确的未批准渠道错误与内容策略拦截分开，避免伪造违禁词原因。
 // 2026-09-17：合并较新模型目录、限流及传输修复，并保留请求快照与刷新合并以防回归。
+// 2026-09-19：内部路径回落和同号重试在丢弃响应前反馈观测，避免已上报用量或未知状态被吞掉。
 package upstream
 
 import (
@@ -1004,6 +1005,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 					}
 					if wafLevel > 0 && !bytes.Equal(prepared, lastSent) {
 						lastSent = prepared
+						observeChatRetry(ctx, raw)
 						continue retry
 					}
 				}
@@ -1017,11 +1019,13 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 						channelNeutralized = true
 						lastSent = prepared
 						log.Printf("WARN: [upstream] channel trigger neutralized for retry uid=%s path=%s", logfmt.UID8(a.UID), path)
+						observeChatRetry(ctx, raw)
 						continue retry
 					}
 				}
 				// global 首次路径 404/405 → 换 fallback 路径重试；其余状态码直接返回。
 				if attempt < pathCount-1 && chatFallbackHTTPStatus(resp.StatusCode) {
+					observeChatRetry(ctx, raw)
 					break retry
 				}
 				return nil, resp.StatusCode, raw, nil

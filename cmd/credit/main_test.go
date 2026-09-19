@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"workbuddy2api/internal/auth"
@@ -77,9 +78,12 @@ func TestCollectGlobalAccountGoesToGlobalBase(t *testing.T) {
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 
-	var requests []string // "auth: host+path"
+	var requests []string     // "auth: host+path"
+	var requestsMu sync.Mutex // collect 的账号查询并发执行，测试记录器也需要同步。
 	up := fakeUpstreamCredit(t, func(r *http.Request) (*http.Response, error) {
+		requestsMu.Lock()
 		requests = append(requests, r.Header.Get("Authorization")+"|"+r.Host+r.URL.Path)
+		requestsMu.Unlock()
 		return creditResp(`{"code":0,"data":{"Response":{"Data":{"Accounts":[
 			{"PackageName":"p","CycleCapacitySize":100,"CycleCapacityRemain":80,"CycleCapacityUsed":20}
 		]}}}}`), nil

@@ -17,6 +17,7 @@
 # 2026-09-18：账号凭据先安全落盘再清理旧文件，启停冲突保留双方，回收文件使用唯一名称。
 # 2026-09-18：重启等待覆盖容器停止宽限，并用真实健康响应确认成功，超时不再报已加载账号。
 # 2026-09-18：滑动续期保留会话标识，退出撤销同一会话的旧副本，防止续期前令牌复活。
+# 2026-09-19：积分刷新共享同一次查询，失败保留旧余额并显示错误、延迟重试，避免永久等待和旧查询覆盖新结果。
 
 """workbuddy2api 账号管理面板 —— 后端
 
@@ -104,13 +105,11 @@ REALMS = ("cn", "global")
 UID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 AUTH_FILE_RE = re.compile(r"^workbuddy-(?P<uid>.+?)\.json(?P<disabled>\.disabled)?$")
 
-# 积分摘要缓存。
-# 2026-09-19：`./credit` 要逐个账号查上游，一次冷跑约 8 秒；此前 /api/state 同步等它，
-# 于是"刷新网页很久才出数据"。现在页面请求一律不等它：有缓存就先给（哪怕是旧的），
-# 刷新在后台线程里做；只有用户显式点刷新才同步取一次。
+# 首屏读取缓存，手动刷新等待同一次后台查询；失败不丢弃最后一次成功结果。
 CREDIT_TTL = 60.0
-_credit_cache = {"ts": 0.0, "data": None}
-_credit_refreshing = False
+CREDIT_RETRY_INTERVAL = 30.0
+_credit_cache = {"ts": 0.0, "data": None, "error": None, "retry_at": 0.0}
+_credit_refreshing = None
 _lock = threading.Lock()
 
 
@@ -649,49 +648,71 @@ def restart_container():
 
 
 def get_credits(force=False):
-    """取积分摘要。
-
-    force=True（用户显式刷新）同步查一次；force=False 一律"先返回、后刷新"：
-    有缓存立刻返回（过期也先给旧值），同时起后台线程更新；没有缓存则返回
-    pending 占位并起后台线程，页面立刻渲染，前端稍后自动重取一次。
-
-    这样 /api/state 的响应时间不再受 `./credit` 影响（实测冷跑 8.3 秒）。
-    """
+    """普通读取不等待；强制刷新等待共享查询，失败后自动读取遵守重试间隔。"""
     with _lock:
-        now = time.time()
-        cached = _credit_cache["data"]
-        fresh = cached and now - _credit_cache["ts"] < CREDIT_TTL
-        if not force and fresh:
-            return cached
+        now = time.monotonic()
+        if _credit_cache["error"]:
+            due = now >= _credit_cache["retry_at"]
+        else:
+            due = _credit_cache["data"] is None or now - _credit_cache["ts"] >= CREDIT_TTL
+        refresh = _credit_refreshing
+        if force or due:
+            refresh = _start_credit_refresh_locked()
         if not force:
-            _start_credit_refresh_locked()
-            # 有旧值就给旧值（页面上数字不会跳空），否则给 pending 占位。
-            return cached if cached else {"pending": True, "accounts": []}
-    return _query_credits()
+            return _credit_snapshot_locked()
+    # 等待期间不占缓存锁；结果属于这一次查询，不会读到随后另一次查询的状态。
+    refresh["done"].wait()
+    return dict(refresh["result"])
+
+
+def _credit_snapshot_locked():
+    result = dict(_credit_cache["data"] or {"accounts": []})
+    result["pending"] = _credit_refreshing is not None
+    if _credit_cache["error"]:
+        result["error"] = _credit_cache["error"]
+    return result
+
+
+def _finish_credit_refresh_locked(refresh, data):
+    global _credit_refreshing
+    if _credit_refreshing is refresh:
+        now = time.monotonic()
+        if data.get("error"):
+            _credit_cache["error"] = data["error"]
+            _credit_cache["retry_at"] = now + CREDIT_RETRY_INTERVAL
+        else:
+            _credit_cache.update(ts=now, data=data, error=None, retry_at=0.0)
+        _credit_refreshing = None
+    refresh["result"] = _credit_snapshot_locked()
+    refresh["result"]["pending"] = False
+    refresh["done"].set()
 
 
 def _start_credit_refresh_locked():
-    """调用方必须已持有 _lock；起一个后台线程更新缓存，同一时刻只允许一个。"""
+    """调用方持有 _lock；普通读取和手动刷新共用查询及完成结果。"""
     global _credit_refreshing
-    if _credit_refreshing:
-        return
-    _credit_refreshing = True
+    if _credit_refreshing is not None:
+        return _credit_refreshing
+    refresh = {"done": threading.Event(), "result": None}
+    _credit_refreshing = refresh
 
     def worker():
-        global _credit_refreshing
         try:
-            _query_credits()
-        except Exception as ex:  # noqa: BLE001 - 后台线程异常不能让 _credit_refreshing 卡死
-            sys.stderr.write("[credit] background refresh failed: %s\n" % ex)
-        finally:
-            with _lock:
-                _credit_refreshing = False
+            data = _query_credits()
+        except Exception as ex:  # noqa: BLE001 - 异常也要结束等待并回传查询错误
+            data = {"error": "积分查询失败：%s" % ex}
+        with _lock:
+            _finish_credit_refresh_locked(refresh, data)
 
-    threading.Thread(target=worker, name="credit-refresh", daemon=True).start()
+    try:
+        threading.Thread(target=worker, name="credit-refresh", daemon=True).start()
+    except Exception as ex:  # noqa: BLE001 - 未能启动线程时不得保留永久 pending
+        _finish_credit_refresh_locked(refresh, {"error": "积分查询无法启动：%s" % ex})
+    return refresh
 
 
 def _query_credits():
-    """真正执行一次积分查询并写缓存；失败时返回带 error 的字典（不抛异常）。"""
+    """只执行及校验查询；缓存统一由刷新协调器提交，错误不覆盖成功数据。"""
     if not container_running():
         return {"error": "容器未运行"}
     rc, out, err = docker(["exec", CONTAINER, "./credit"], timeout=90)
@@ -701,9 +722,9 @@ def _query_credits():
         data = json.loads(out)
     except ValueError:
         return {"error": "credit 输出无法解析", "raw": out[:400]}
-    with _lock:
-        _credit_cache["ts"] = time.time()
-        _credit_cache["data"] = data
+    if (not isinstance(data, dict) or not isinstance(data.get("accounts"), list)
+            or any(not isinstance(account, dict) for account in data["accounts"])):
+        return {"error": "credit 输出格式无效"}
     return data
 
 

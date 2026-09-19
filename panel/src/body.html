@@ -216,6 +216,8 @@
           </label>
         </div>
         <div class="usage-tiles" id="usageTiles"></div>
+        <p class="sub usage-note hide" id="usageCoverage" role="status"></p>
+        <p class="sub usage-note">按服务返回的原始用量累计，失败或中断也保留已返回的数据。缓存命中已包含在输入中；客户端的上下文估算倍率不影响这里。</p>
         <div id="usageError" class="note err hide" role="alert"></div>
         <div class="panel">
           <div class="ph">
@@ -234,7 +236,7 @@
             </table>
           </div>
         </div>
-        <p class="sub usage-note">按日期筛选使用已有的每日记录；按模型明细请切换到“全部”。</p>
+        <p class="sub usage-note">按日期筛选使用已有的每日记录；按模型明细请切换到“全部”。失败与用量缺失状态从新版开始记录，旧版未保存的信息无法自动补算。</p>
         <p class="sub usage-note" id="usageFile"></p>
       </section>
 

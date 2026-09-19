@@ -5,6 +5,7 @@
 // 2026-09-17：合并 fork 的错误信封透传，保留完整诊断字段与数字字面量，同时维持 typed 失败终态。
 // 2026-09-18：拒绝错误形状的工具列表，并在流结束时校验工具终态确有调用，避免预告正文静默收尾。
 // 2026-09-18：逐 choice 隔离工具名称与聚合输出，拒绝被静默忽略的非法正文、delta 和 choices 形状。
+// 2026-09-19：累计用量按已出现字段合并，末尾 credit-only 或详细字段不再抹掉前帧 token。
 package upstream
 
 import (
@@ -540,7 +541,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 			created = value
 		}
 		if value, ok := chunk["usage"].(map[string]any); ok {
-			usage = value
+			usage = MergeUsage(usage, value)
 		}
 		return false, nil
 	}, nil)
@@ -797,6 +798,7 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 	// （issue #35：同一条 SSE 消息所有帧共用一个真实 id，后台按 id 归并；此前中间帧
 	// 一律补 chatcmpl-wb2api 哨兵，造成同流 id 分裂）。全流无真实 id → 才出现哨兵。
 	firstID := ""
+	var usage map[string]any
 
 	// 正常帧和错误帧共享一个写出口，任何客户端断开均向上传递。
 	writeRaw := func(payload string) error {
@@ -818,6 +820,10 @@ func Stream(w http.ResponseWriter, r io.Reader) error {
 		}
 		if err := state.observe(obj); err != nil {
 			return true, err
+		}
+		if value, ok := obj["usage"].(map[string]any); ok {
+			usage = MergeUsage(usage, value)
+			obj["usage"] = usage
 		}
 		stripToolCallNames(obj, toolCallSeen)
 		if firstID == "" {

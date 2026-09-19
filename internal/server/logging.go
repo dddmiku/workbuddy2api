@@ -5,6 +5,7 @@
 //
 //	思考模式下每轮都要重发整段上下文，只看 tok= 会让人觉得"用量明明很大却记了这么点"。
 //
+// 2026-09-19：流式与聚合共用原始用量观测，失败仍保留已知数值；按完整事件合并分帧字段，缺失显示 -。
 // logging.go 请求级表格日志：每个 /v1/chat/completions 请求结束后打印一行到 stdout。
 package server
 
@@ -17,6 +18,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"workbuddy2api/internal/upstream"
 )
 
 // chatSeq 进程级请求序号。
@@ -37,14 +40,17 @@ type chatStat struct {
 	status int
 
 	// 调用方密钥身份（鉴权命中时填，单密钥模式留空 → 显示 "-"）。
-	keyID    string
-	keyName  string
-	keyMask  string
-	prompt   int
-	cached   int // 输入里命中提示缓存的 token 数（<0 表示未知）
-	hasUsage bool
-	credit   float64
-	hasCred  bool
+	keyID           string
+	keyName         string
+	keyMask         string
+	prompt          int
+	cached          int // 输入里命中提示缓存的 token 数（<0 表示未知）
+	hasUsage        bool
+	credit          float64
+	hasCred         bool
+	upstreamStarted bool
+	failed          bool
+	unreported      bool
 
 	logged bool
 }
@@ -70,7 +76,45 @@ func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
 		mode = "stream"
 	}
 	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1,
-		prompt: -1, cached: -1}
+		prompt: -1, cached: -1, failed: true}
+}
+
+// absorbUsage is called once for each upstream attempt. The request itself is
+// recorded once, while known consumption from distinct attempts is preserved.
+func (s *chatStat) absorbUsage(observation *chatStatsReader) {
+	if observation == nil {
+		s.unreported = true
+		return
+	}
+	addKnown := func(current *int, value int) {
+		if value < 0 {
+			return
+		}
+		if *current < 0 {
+			*current = 0
+		}
+		*current += value
+	}
+	addKnown(&s.prompt, observation.PromptTokens())
+	if tokens, ok := observation.Tokens(); ok {
+		addKnown(&s.toks, tokens)
+	}
+	addKnown(&s.cached, observation.CachedTokens())
+	if credit, ok := observation.Credit(); ok {
+		s.credit += credit
+		s.hasCred = true
+	}
+	s.hasUsage = s.hasUsage || observation.hasUsage
+	s.unreported = s.unreported || !observation.CompleteUsage()
+	if s.mode == "stream" && s.ttfb == 0 {
+		s.ttfb = observation.TTFB()
+	}
+}
+
+func (s *chatStat) absorbJSONUsage(body []byte) {
+	observation := newChatStatsReaderSince(strings.NewReader(""), s.start)
+	observation.observeJSON(string(body))
+	s.absorbUsage(observation)
 }
 
 // done 幂等落一行表格日志。
@@ -104,16 +148,21 @@ type chatStatsReader struct {
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
 func newChatStatsReaderSince(r io.Reader, since time.Time) *chatStatsReader {
-	return &chatStatsReader{br: bufio.NewReaderSize(r, 64*1024), start: since}
+	return &chatStatsReader{br: bufio.NewReaderSize(r, 64*1024), start: since, tokens: -1, prompt: -1, cached: -1}
 }
 
 // TTFB 返回首个 data 帧到达耗时；无帧时为 0。
 func (s *chatStatsReader) TTFB() time.Duration { return s.ttfb }
 
 // Tokens 返回末帧 usage.completion_tokens 与是否缺失；无 usage 时 ok=false。
-func (s *chatStatsReader) Tokens() (int, bool) { return s.tokens, s.hasUsage }
+func (s *chatStatsReader) Tokens() (int, bool) {
+	if s.tokens < 0 {
+		return 0, false
+	}
+	return s.tokens, true
+}
 
-// PromptTokens 返回末帧 usage.prompt_tokens（缺失为 0，与 completion 一起供用量账本累计）。
+// PromptTokens 返回已观测的 usage.prompt_tokens，缺失为 -1。
 func (s *chatStatsReader) PromptTokens() int { return s.prompt }
 
 // CachedTokens 返回末帧 usage 里「输入缓存命中」的 token 数。
@@ -132,53 +181,60 @@ func (s *chatStatsReader) CachedTokens() int {
 func (s *chatStatsReader) Credit() (float64, bool) { return s.credit, s.hasUsage && s.hasCredit }
 
 // TotalTokens 返回本次请求总 token 数（prompt + completion），供成本单价折算。
-func (s *chatStatsReader) TotalTokens() int { return s.prompt + s.tokens }
+func (s *chatStatsReader) TotalTokens() int { return max(0, s.prompt) + max(0, s.tokens) }
+
+func (s *chatStatsReader) CompleteUsage() bool { return s.prompt >= 0 && s.tokens >= 0 }
 
 // parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens。
 func (s *chatStatsReader) parseSSELine(line string) {
 	line = strings.TrimRight(line, "\r\n")
 	if line == "" {
-		s.dataParts = nil
+		s.observePendingEvent()
 		return
 	}
 	if !strings.HasPrefix(line, "data:") {
 		return
 	}
 	payload := strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " ")
-	if payload == "[DONE]" {
-		return
-	}
-	if !s.seen {
+	if !s.seen && payload != "[DONE]" {
 		s.seen = true
 		s.ttfb = time.Since(s.start)
 	}
 	s.dataParts = append(s.dataParts, payload)
-	payload = strings.Join(s.dataParts, "\n")
-	var chunk struct {
-		Usage *struct {
-			CompletionTokens int      `json:"completion_tokens"`
-			PromptTokens     int      `json:"prompt_tokens"`
-			Credit           *float64 `json:"credit"` // 指针区分「缺失」与「显式 0」
-			CacheHitTokens   *int     `json:"prompt_cache_hit_tokens"`
-			PromptDetails    *struct {
-				CachedTokens *int `json:"cached_tokens"`
-			} `json:"prompt_tokens_details"`
-		} `json:"usage"`
+}
+
+func (s *chatStatsReader) observePendingEvent() {
+	if len(s.dataParts) > 0 {
+		s.observeJSON(strings.Join(s.dataParts, "\n"))
 	}
-	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
+	s.dataParts = nil
+}
+
+func (s *chatStatsReader) observeJSON(payload string) {
+	var chunk struct {
+		Usage map[string]any `json:"usage"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(payload))
+	decoder.UseNumber()
+	if decoder.Decode(&chunk) != nil || chunk.Usage == nil {
+		return
+	}
+	if decoder.Decode(new(any)) != io.EOF {
 		return
 	}
 	s.hasUsage = true
-	s.tokens = chunk.Usage.CompletionTokens
-	s.prompt = chunk.Usage.PromptTokens
-	if chunk.Usage.CacheHitTokens != nil {
-		s.cached = *chunk.Usage.CacheHitTokens
-	} else if chunk.Usage.PromptDetails != nil && chunk.Usage.PromptDetails.CachedTokens != nil {
-		s.cached = *chunk.Usage.PromptDetails.CachedTokens
+	if value, ok := upstream.UsageCount(chunk.Usage["completion_tokens"]); ok {
+		s.tokens = value
 	}
-	if chunk.Usage.Credit != nil {
+	if value, ok := upstream.UsageCount(chunk.Usage["prompt_tokens"]); ok {
+		s.prompt = value
+	}
+	if value, ok := upstream.CachedInputTokens(chunk.Usage); ok {
+		s.cached = value
+	}
+	if value, ok := upstream.UsageCredit(chunk.Usage["credit"]); ok {
 		s.hasCredit = true
-		s.credit = *chunk.Usage.Credit
+		s.credit = value
 	}
 }
 
@@ -201,10 +257,16 @@ func (s *chatStatsReader) Read(p []byte) (int, error) {
 	if line != "" {
 		s.readErr = err
 		s.parseSSELine(line)
+		if err == io.EOF {
+			s.observePendingEvent()
+		}
 		s.pend = []byte(line)
 		n := copy(p, s.pend)
 		s.pend = s.pend[n:]
 		return n, nil
+	}
+	if err == io.EOF {
+		s.observePendingEvent()
 	}
 	return 0, err
 }
@@ -226,11 +288,11 @@ func completionTokens(resp map[string]any) int {
 	if !ok {
 		return -1
 	}
-	v, ok := u["completion_tokens"].(float64)
+	v, ok := upstream.UsageCount(u["completion_tokens"])
 	if !ok {
 		return -1
 	}
-	return int(v)
+	return v
 }
 
 // promptTokens 从聚合响应提取 usage.prompt_tokens；缺失返回 -1（缺失≠0）。
@@ -239,11 +301,11 @@ func promptTokens(resp map[string]any) int {
 	if !ok {
 		return -1
 	}
-	v, ok := u["prompt_tokens"].(float64)
+	v, ok := upstream.UsageCount(u["prompt_tokens"])
 	if !ok {
 		return -1
 	}
-	return int(v)
+	return v
 }
 
 // cachedTokens 从聚合响应提取输入缓存命中数：优先上游的 prompt_cache_hit_tokens，
@@ -253,13 +315,8 @@ func cachedTokens(resp map[string]any) int {
 	if !ok {
 		return -1
 	}
-	if v, ok := u["prompt_cache_hit_tokens"].(float64); ok {
-		return int(v)
-	}
-	if details, ok := u["prompt_tokens_details"].(map[string]any); ok {
-		if v, ok := details["cached_tokens"].(float64); ok {
-			return int(v)
-		}
+	if value, ok := upstream.CachedInputTokens(u); ok {
+		return value
 	}
 	return -1
 }
@@ -271,13 +328,13 @@ func usageCreditTotal(resp map[string]any) (credit float64, total int, ok bool) 
 	if !isMap {
 		return 0, 0, false
 	}
-	c, hasCredit := u["credit"].(float64)
-	pt, hasPrompt := u["prompt_tokens"].(float64)
-	ct, hasCompletion := u["completion_tokens"].(float64)
-	if !hasCredit || (!hasPrompt && !hasCompletion) {
+	c, hasCredit := upstream.UsageCredit(u["credit"])
+	pt, hasPrompt := upstream.UsageCount(u["prompt_tokens"])
+	ct, hasCompletion := upstream.UsageCount(u["completion_tokens"])
+	if !hasCredit || !hasPrompt || !hasCompletion {
 		return 0, 0, false
 	}
-	return c, int(pt) + int(ct), true
+	return c, pt + ct, true
 }
 
 // uidPrefix 只显示 uid 前 8 位；空 uid 显示 "-"。

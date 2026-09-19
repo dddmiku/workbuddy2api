@@ -632,6 +632,8 @@ pre.term{margin:0;padding:12px 14px;background:var(--sunken);color:var(--ink-2);
           </label>
         </div>
         <div class="usage-tiles" id="usageTiles"></div>
+        <p class="sub usage-note hide" id="usageCoverage" role="status"></p>
+        <p class="sub usage-note">按服务返回的原始用量累计，失败或中断也保留已返回的数据。缓存命中已包含在输入中；客户端的上下文估算倍率不影响这里。</p>
         <div id="usageError" class="note err hide" role="alert"></div>
         <div class="panel">
           <div class="ph">
@@ -650,7 +652,7 @@ pre.term{margin:0;padding:12px 14px;background:var(--sunken);color:var(--ink-2);
             </table>
           </div>
         </div>
-        <p class="sub usage-note">按日期筛选使用已有的每日记录；按模型明细请切换到“全部”。</p>
+        <p class="sub usage-note">按日期筛选使用已有的每日记录；按模型明细请切换到“全部”。失败与用量缺失状态从新版开始记录，旧版未保存的信息无法自动补算。</p>
         <p class="sub usage-note" id="usageFile"></p>
       </section>
 
@@ -855,6 +857,7 @@ pre.term{margin:0;padding:12px 14px;background:var(--sunken);color:var(--ink-2);
 "use strict";
 "use strict";
 // ═══ 更新日志 ═══
+// 2026-09-19：积分查询失败时显示错误和缓存状态，避免把尚未取到的余额显示为零。
 // 2026-09-18：所有管理写请求携带同源标记，覆盖账号、任务、会话和服务操作。
 // 2026-09-18：退出失败时保留页面并显示错误，不再跳转伪装成功；重启提示与后台收尾行为保持一致。
 // 2026-09-16：接入密钥管理导航与本页刷新，侧栏不再下发或复制完整配置密钥。
@@ -1231,6 +1234,12 @@ function renderCredit(){
       mrow('取到积分', '0 / ' + a.length);
     return;
   }
+  if (d.creditError && !have.length){
+    $('#creditPanel').innerHTML =
+      '<div class="big"><span class="v">—</span><span class="u">查询失败</span></div>' +
+      mrow('原因', d.creditError);
+    return;
+  }
   var remain = have.reduce(function(s, x){ return s + x.credits.remain; }, 0);
   var size = have.reduce(function(s, x){
     return s + (typeof x.credits.size === 'number' ? x.credits.size : x.credits.remain); }, 0);
@@ -1244,6 +1253,8 @@ function renderCredit(){
     mrow('已用', num(used)) +
     mrow('总额度', num(size)) +
     mrow('取到积分', have.length + ' / ' + a.length);
+  if (d.creditError) html += mrow('状态', '更新失败，显示上次结果');
+  else if (d.creditPending) html += mrow('状态', '正在更新，显示上次结果');
   $('#creditPanel').innerHTML = html;
 }
 
@@ -1997,6 +2008,7 @@ $('#keyRows').addEventListener('click', function(event){
 
 "use strict";
 // ═══ 更新日志 ═══
+// 2026-09-19：展示失败和未完整用量的请求，日期汇总保留状态计数，说明实际累计与客户端上下文估算的区别。
 // 2026-09-18：日期筛选使用实际天桶，停止按占比虚构模型明细；全部按钮显示完整历史次数。
 // 2026-09-17：新增用量统计页：总量卡片 + 按密钥明细 + 单密钥模型拆分，
 //             数据经本机管理通道读取网关记账（/usage）。
@@ -2040,19 +2052,29 @@ function renderUsageTiles(totals){
     promptNote += '（缓存命中 ' + Math.round(cached / prompt * 100) + '%）';
   }
   var tiles = [
-    {k: '请求数', v: exactTokens(t.requests), s: '成功完成的调用', i: 'pulse'},
+    {k: '请求数', v: exactTokens(t.requests), s: '已结束的调用，含失败与中断', i: 'pulse'},
     {k: '合计 tokens', v: compactTokens(t.total_tokens), s: exactTokens(t.total_tokens) + ' tokens', i: 'sum'},
     {k: '输入 tokens', v: compactTokens(t.prompt_tokens), s: promptNote, i: 'in'},
     {k: '输出 tokens', v: compactTokens(t.completion_tokens), s: exactTokens(t.completion_tokens) + ' tokens（含思考）', i: 'out'}
   ];
   if (cached > 0) tiles.push({k: '缓存命中输入', v: compactTokens(cached), s: exactTokens(cached) + ' tokens', i: 'zap'});
   if (t.credit) tiles.push({k: '上游计费', v: Number(t.credit).toFixed(2), s: 'usage.credit 累计', i: 'coins'});
+  if (Number(t.failed_requests) > 0) tiles.push({k: '失败或中断', v: exactTokens(t.failed_requests), s: '已包含在请求数中', i: 'pulse'});
+  if (Number(t.unreported_requests) > 0) tiles.push({k: '用量未完整返回', v: exactTokens(t.unreported_requests), s: '仅累计已返回的部分', i: 'clock'});
   $('#usageTiles').innerHTML = tiles.map(function(tile){
     return '<div class="usage-tile">' +
       '<div class="k"><span class="uz-ico">' + usageIcon(tile.i) + '</span>' + esc(tile.k) + '</div>' +
       '<div class="v">' + esc(tile.v) + '</div>' +
       '<div class="s">' + esc(tile.s) + '</div></div>';
   }).join('');
+  var coverage = $('#usageCoverage');
+  if (coverage){
+    var unreported = Number(t.unreported_requests) || 0;
+    coverage.textContent = unreported > 0
+      ? '当前范围有 ' + exactTokens(unreported) + ' 次请求未返回完整用量；上方仅累计已确认的部分。'
+      : '';
+    coverage.classList.toggle('hide', unreported === 0);
+  }
 }
 
 // usageIcon：卡片与筛选器用的线条图标（与侧栏同一套描边风格）。
@@ -2120,10 +2142,12 @@ function selectedDays(days){
 
 // sumTotals 把若干天桶相加（字段与网关 Totals 一一对应）。
 function sumTotals(days){
-  var out = {requests:0, prompt_tokens:0, cached_tokens:0, completion_tokens:0, total_tokens:0, credit:0};
+  var out = {requests:0, failed_requests:0, unreported_requests:0, prompt_tokens:0, cached_tokens:0, completion_tokens:0, total_tokens:0, credit:0};
   (days || []).forEach(function(day){
     var t = (day && day.totals) || {};
     out.requests += Number(t.requests) || 0;
+    out.failed_requests += Number(t.failed_requests) || 0;
+    out.unreported_requests += Number(t.unreported_requests) || 0;
     out.prompt_tokens += Number(t.prompt_tokens) || 0;
     out.cached_tokens += Number(t.cached_tokens) || 0;
     out.completion_tokens += Number(t.completion_tokens) || 0;
@@ -2143,7 +2167,7 @@ function filtered(){
 function usageTotalsFor(item){
   if (!filtered()) return item.totals || {};
   var days = item.days || [];
-  if (!days.length) return {requests:0, prompt_tokens:0, cached_tokens:0, completion_tokens:0, total_tokens:0, credit:0};
+  if (!days.length) return sumTotals([]);
   return sumTotals(selectedDays(days));
 }
 

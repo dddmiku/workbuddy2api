@@ -1,4 +1,5 @@
 // ═══ 更新日志 ═══
+// 2026-09-19：校验输入估计倍率的格式与有限范围，防止非法环境变量静默关闭估计或产生负用量。
 // 2026-09-18：更新目录优先采用监督进程显式传入的值，避免下载位置与容器重启指针分离。
 // 2026-09-16：废弃正文清洗并保留配置兼容，避免默认设置篡改业务数据。
 // config.go 加载 JSON 配置 + 环境变量覆盖。
@@ -7,6 +8,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -42,16 +44,11 @@ type Config struct {
 		// 超预算时从最旧的图片开始替换为文本占位（见 upstream/image_budget.go）。
 		// 0 或负数 = 关闭裁剪（不推荐）。
 		OutboundImageBudgetMB int `json:"outbound_image_budget_mb"`
-		// InputTokenScale 上报给客户端的输入 token 换算系数（默认 1 = 原样透传）。
-		//
-		// 上游的用量计数器与它自己的 1,048,576 上限用的是两套分词器：实测同一段中文，
-		// 用量按 0.57 token/字符计、上限按 0.76 判（×1.33）；用户/助手/工具/系统消息、
-		// 工具声明、图片都正常计入，只有 reasoning_content 两边都不算。
-		// 客户端（Codex）的自动压缩只看上报用量，于是它算出来的「还有多少余量」永远偏乐观，
-		// 一路发到上游 400 context_length_exceeded 才停。
-		//
-		// 置为 >1 时，网关把回给客户端的 usage 输入侧乘上该系数，换算到上限口径；
-		// 账本、日志 in= 列、上游计费口径都不受影响。取值需落在 [1, 5]，缺省 1。
+		// InputTokenScale Responses 客户端输入 token 的估计倍率（默认 1 = 原样透传）。
+		// 某些模型/路由的 usage 与上下文限制可能存在偏差，可依据实际请求校准保守估计。
+		// 常数倍率不证明上游的分词器实现，也不能保证所有内容都会在达到上限前压缩。
+		// 只改 Responses 返回的输入侧用量；Chat、账本及日志 in= 保留上游原值。
+		// 此服务级配置适用于所有 Responses 请求，必须是 [1, 5] 内的有限数字。
 		InputTokenScale float64 `json:"input_token_scale"`
 	} `json:"server"`
 
@@ -201,8 +198,7 @@ func Default() *Config {
 	c.Server.MaxBodyMB = 8 // 请求体上限默认 8MB
 	// 出站预算默认 7MB：留在网关 8MB 入站边界之内；调整入站上限时须同步复核本值。
 	c.Server.OutboundImageBudgetMB = 7
-	// 输入 token 换算默认关闭（1）：本项只是替客户端把上限口径补齐，
-	// 纯 CN 部署没有实测差额就不要开。
+	// 未按实际模型/路由校准时保持原样透传。
 	c.Server.InputTokenScale = 1
 	// 排程段默认值由 internal/config 集中维护（cmd/server 与 cmd/activity 共用，
 	// 消除 issue #49 的默认值漂移）。
@@ -263,14 +259,16 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("parse config: %w", err)
 		}
 	}
-	applyEnv(c)
+	if err := applyEnv(c); err != nil {
+		return nil, err
+	}
 	if err := c.normalize(); err != nil {
 		return nil, err
 	}
 	return c, nil
 }
 
-func applyEnv(c *Config) {
+func applyEnv(c *Config) error {
 	if v := os.Getenv("WB2A_LISTEN"); v != "" {
 		c.Listen = v
 	}
@@ -294,9 +292,11 @@ func applyEnv(c *Config) {
 		}
 	}
 	if v := os.Getenv("WB2A_INPUT_TOKEN_SCALE"); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			c.Server.InputTokenScale = f
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return fmt.Errorf("WB2A_INPUT_TOKEN_SCALE: %q 非法（需为 [1,5] 内的有限数字）", v)
 		}
+		c.Server.InputTokenScale = f
 	}
 	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {
 		c.Cooldown.SoftRate = v
@@ -356,6 +356,7 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_EXPIRING_SOON"); v != "" {
 		c.Pool.ExpiringSoon = v
 	}
+	return nil
 }
 
 func (c *Config) normalize() error {
@@ -365,10 +366,10 @@ func (c *Config) normalize() error {
 	if c.Server.MaxBodyMB <= 0 {
 		return fmt.Errorf("server.max_body_mb: %d 非法（需为正整数，单位 MB）", c.Server.MaxBodyMB)
 	}
-	// input_token_scale 只在 [1,5] 内合法：<1 是把上报值改小（等于让客户端更晚压缩，
-	// 没有任何场景需要），>5 会把上下文余量报得面目全非。1 = 关闭换算。
-	if c.Server.InputTokenScale < 1 || c.Server.InputTokenScale > 5 {
-		return fmt.Errorf("server.input_token_scale: %v 非法（需落在 [1,5]，1 = 不换算）",
+	// 显式拒绝 NaN：它与上下界的大小比较均为 false。
+	if math.IsNaN(c.Server.InputTokenScale) || math.IsInf(c.Server.InputTokenScale, 0) ||
+		c.Server.InputTokenScale < 1 || c.Server.InputTokenScale > 5 {
+		return fmt.Errorf("server.input_token_scale: %v 非法（需为 [1,5] 内的有限数字，1 = 不换算）",
 			c.Server.InputTokenScale)
 	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {

@@ -7,6 +7,7 @@
 // 2026-09-18：直接 Chat 的工具选择与结构化输出复用严格契约，在校验通过前不发布成功终态。
 // 2026-09-18：直接 Chat 与 Responses 一致过滤未实现的内置声明，保持无工具请求的上游兼容性。
 // 2026-09-18：Chat别名只用于上游传输，验证后恢复公开工具名再交付客户端。
+// 2026-09-19：已发起上游的请求统一收尾记账，保留失败/取消用量并标记未完整上报，终态写失败不再漏计。
 package server
 
 import (
@@ -47,12 +48,10 @@ type Config struct {
 	// MaxBodyBytes 聊天请求体大小上限；<=0 兜底 8<<20（8MB）。
 	// 超限直接 413 request_body_too_large（不再静默截断喂给上游，issue #41）。
 	MaxBodyBytes int64
-	// InputTokenScale 上报给客户端的输入 token 换算系数（<=1 = 原样，默认 1）。
-	//
-	// 上游用量与它自己的 1,048,576 上限是两套分词器：同一段中文用量按 0.57 token/字符、
-	// 上限按 0.76 判（实测 ×1.33）。客户端（Codex）的自动压缩只看上报用量，不换算就会
-	// 一路发到上游 400 context_length_exceeded 才停。乘以该系数后，客户端按自己的窗口
-	// 阈值就能在撞墙前压缩。只影响回给客户端的 usage，不影响账本与 in= 日志列。
+	// InputTokenScale is an optional Responses client-context estimate (1 = off).
+	// Calibrate it against samples from the specific model and route; it is not an
+	// exact upstream tokenizer or a guarantee of compaction before a context limit.
+	// Chat Completions, the usage ledger and in= logs retain upstream measurements.
 	InputTokenScale float64
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
@@ -257,14 +256,14 @@ func (h *Handler) usageStats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// recordUsage 把一次成功请求的用量写进密钥账本。
-// st.toks 为 -1（上游没给 usage）时只累计请求数，不臆造 token。
+// recordUsage records one finished client request, independently of its final
+// success status. Unknown fields are marked rather than estimated.
 func (h *Handler) recordUsage(st *chatStat, model string) {
 	if h.cfg.Usage == nil || st == nil {
 		return
 	}
-	h.cfg.Usage.Record(st.keyID, st.keyName, st.keyMask, model, st.prompt, st.toks, st.cached,
-		st.credit, st.hasCred, time.Now())
+	h.cfg.Usage.RecordOutcome(st.keyID, st.keyName, st.keyMask, model, st.prompt, st.toks, st.cached,
+		st.credit, st.hasCred, usage.Outcome{Failed: st.failed, Unreported: st.unreported}, time.Now())
 }
 
 // updateStatus 返回热更新状态（当前版本、远端最新版本、最近错误）。
@@ -755,6 +754,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
 	defer st.done()
+	defer func() {
+		// Responses emits its final client-facing frame after Chat returns. Finish
+		// it before accounting so a disconnect on that last write remains visible.
+		if response, ok := w.(*responsesWriter); ok {
+			response.finish()
+			if response.writeErr != nil || response.streamErr != nil || response.status >= 400 {
+				st.failed = true
+				if st.status < 400 {
+					st.status = http.StatusBadGateway
+				}
+			}
+		}
+		if r.Context().Err() != nil {
+			st.failed = true
+			st.status = 499
+		}
+		if st.upstreamStarted {
+			h.recordUsage(st, peek.Model)
+		}
+	}()
 	// 调用方密钥身份：请求行 key= 列与用量账本都按它归属（单密钥模式没有 Info）。
 	if info, ok := requestKeyInfo(r); ok {
 		st.keyID, st.keyName, st.keyMask = info.ID, info.Name, info.MaskedKey
@@ -863,6 +882,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		chatMeta.ConversationRequestID = session.TurnRequestID(turnKey)
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
+	chatContext := upstream.WithChatRetryObserver(r.Context(), st.absorbJSONUsage)
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		if r.Context().Err() != nil {
@@ -931,8 +951,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		// 传 r.Context()：客户端断连/请求取消立即中断在途上游调用并释放租约，
 		// 不再让"幽灵请求"占满账号在途名额直到 IdleTimeout。
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, chatMeta)
+		st.upstreamStarted = true
+		rc, status, respBody, terr := h.cfg.Upstream.ChatStreamContext(chatContext, acct, body, clientIP, chatMeta)
 		if terr != nil {
+			st.absorbUsage(nil)
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 			// 上游 client 已打 transport error 日志。
 			st.status = http.StatusServiceUnavailable
@@ -941,6 +963,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if status >= 400 {
+			st.absorbJSONUsage(respBody)
 			st.status = status
 			kind := upstream.Classify(status, string(respBody))
 			if kind == upstream.ErrChannelRejected {
@@ -1025,18 +1048,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
+		stats := newChatStatsReaderSince(rc, st.start)
 		if peek.Stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 			st.status = http.StatusOK
-			stats := newChatStatsReaderSince(rc, st.start)
 			streamErr := upstream.Stream(w, stats)
 			if checker, ok := w.(interface{ CompletionError() error }); ok && streamErr == nil {
 				streamErr = checker.CompletionError()
 			}
-			st.ttfb = stats.TTFB()
-			st.toks, _ = stats.Tokens()
-			st.prompt = stats.PromptTokens()
-			st.cached = stats.CachedTokens()
+			st.absorbUsage(stats)
 			if streamErr != nil {
 				rc.Close()
 				if r.Context().Err() != nil {
@@ -1055,19 +1075,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			// 成本账本：末帧 usage 带 credit 与 token 总数时记录实测单价，
 			// 供下次选号把免费/便宜的号排在前面。
-			if credit, ok := stats.Credit(); ok {
+			if credit, ok := stats.Credit(); ok && stats.CompleteUsage() {
 				h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, stats.TotalTokens())
-				st.credit, st.hasCred = credit, true
-			} else if _, hasUsage := stats.Tokens(); hasUsage {
+			} else if _, hasCredit := stats.Credit(); !hasCredit && stats.hasUsage {
 				// R9(c) 防护观测：usage 存在但 credit 缺失（如 global SSE 末帧未带 credit）。
 				// 不算合法成本观测（缺失≠0），仅记一条 WARN 协助排障，绝不写入账本。
 				log.Printf("WARN: [server] stream usage without credit uid=%s model=%s (no cost observation)", logfmt.UID8(acct.UID), bareModel)
 			}
-			h.recordUsage(st, peek.Model)
+			st.failed = false
 			rc.Close()
 			return
 		}
-		resp, err := upstream.Aggregate(rc)
+		resp, err := upstream.Aggregate(stats)
+		st.absorbUsage(stats)
 		rc.Close()
 		if err != nil {
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
@@ -1090,17 +1110,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if sessKey != "" && h.cfg.Session != nil {
 			h.cfg.Session.Bind(sessKey, acct.UID)
 		}
-		writeJSON(w, http.StatusOK, resp)
+		if err := writeJSON(w, http.StatusOK, resp); err != nil {
+			st.status = http.StatusBadGateway
+			return
+		}
 		st.status = http.StatusOK
-		st.toks = completionTokens(resp)
-		st.prompt = promptTokens(resp)
-		st.cached = cachedTokens(resp)
+		st.failed = false
 		// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
 		if credit, total, ok := usageCreditTotal(resp); ok {
 			h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
-			st.credit, st.hasCred = credit, true
 		}
-		h.recordUsage(st, peek.Model)
 		return
 	}
 	// 末端错误透传（error-passthrough）：上游返回的错误原样透传，不再规范化成固定文案。
@@ -1235,11 +1254,15 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 // helpers
 // ---------------------------------------------------------------------------
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	raw, _ := json.Marshal(v)
+func writeJSON(w http.ResponseWriter, status int, v any) error {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_, _ = w.Write(raw)
+	_, err = w.Write(raw)
+	return err
 }
 
 func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {

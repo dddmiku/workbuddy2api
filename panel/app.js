@@ -1,5 +1,6 @@
 "use strict";
 // ═══ 更新日志 ═══
+// 2026-09-19：积分查询失败时显示错误和缓存状态，避免把尚未取到的余额显示为零。
 // 2026-09-18：所有管理写请求携带同源标记，覆盖账号、任务、会话和服务操作。
 // 2026-09-18：退出失败时保留页面并显示错误，不再跳转伪装成功；重启提示与后台收尾行为保持一致。
 // 2026-09-16：接入密钥管理导航与本页刷新，侧栏不再下发或复制完整配置密钥。
@@ -376,6 +377,12 @@ function renderCredit(){
       mrow('取到积分', '0 / ' + a.length);
     return;
   }
+  if (d.creditError && !have.length){
+    $('#creditPanel').innerHTML =
+      '<div class="big"><span class="v">—</span><span class="u">查询失败</span></div>' +
+      mrow('原因', d.creditError);
+    return;
+  }
   var remain = have.reduce(function(s, x){ return s + x.credits.remain; }, 0);
   var size = have.reduce(function(s, x){
     return s + (typeof x.credits.size === 'number' ? x.credits.size : x.credits.remain); }, 0);
@@ -389,6 +396,8 @@ function renderCredit(){
     mrow('已用', num(used)) +
     mrow('总额度', num(size)) +
     mrow('取到积分', have.length + ' / ' + a.length);
+  if (d.creditError) html += mrow('状态', '更新失败，显示上次结果');
+  else if (d.creditPending) html += mrow('状态', '正在更新，显示上次结果');
   $('#creditPanel').innerHTML = html;
 }
 

@@ -14,6 +14,7 @@
 // 2026-09-18：新增缓存命中输入维度（CachedTokens）。思考模式下每轮重发整段上下文，
 // 输入里绝大部分是缓存命中；不单列出来，看总数会误以为「用了很多却只记了这么点」。
 // 2026-09-18：文件锁覆盖整个读改写，隔离快照与在途增量，串行关闭/清零，拒绝覆盖损坏账本并支持合法大账本。
+// 2026-09-19：已调用上游的失败与取消请求保留已知用量，累计失败/未完整上报计数并穿过全部持久化维度。
 package usage
 
 import (
@@ -59,16 +60,32 @@ func dayKeyOf(at time.Time) string {
 // Totals 一个维度的累计量。Credit 只在上游 usage 显式带 credit 时累加
 // （缺失 ≠ 0，见 upstream 侧 Credit() 注释）。
 type Totals struct {
-	Requests         int64   `json:"requests"`
-	PromptTokens     int64   `json:"prompt_tokens"`
-	CachedTokens     int64   `json:"cached_tokens"`
-	CompletionTokens int64   `json:"completion_tokens"`
-	TotalTokens      int64   `json:"total_tokens"`
-	Credit           float64 `json:"credit"`
+	Requests           int64   `json:"requests"`
+	FailedRequests     int64   `json:"failed_requests"`
+	UnreportedRequests int64   `json:"unreported_requests"`
+	PromptTokens       int64   `json:"prompt_tokens"`
+	CachedTokens       int64   `json:"cached_tokens"`
+	CompletionTokens   int64   `json:"completion_tokens"`
+	TotalTokens        int64   `json:"total_tokens"`
+	Credit             float64 `json:"credit"`
+}
+
+// Outcome describes the final client-request result independently of usage.
+// Unreported also covers a failed retry whose consumption was not observed;
+// a later successful attempt cannot establish that earlier attempt cost zero.
+type Outcome struct {
+	Failed     bool
+	Unreported bool
 }
 
 // add 把一次请求计入累计量。prompt/completion/cached 为负表示上游没有该项观测（缺失≠0）。
-func (t *Totals) add(prompt, completion, cached int, credit float64, hasCredit bool) {
+func (t *Totals) add(prompt, completion, cached int, credit float64, hasCredit bool, outcome Outcome) {
+	if outcome.Failed {
+		t.FailedRequests++
+	}
+	if outcome.Unreported || prompt < 0 || completion < 0 {
+		t.UnreportedRequests++
+	}
 	if prompt < 0 {
 		prompt = 0
 	}
@@ -82,7 +99,7 @@ func (t *Totals) add(prompt, completion, cached int, credit float64, hasCredit b
 	t.PromptTokens += int64(prompt)
 	t.CachedTokens += int64(cached)
 	t.CompletionTokens += int64(completion)
-	t.TotalTokens += int64(prompt + completion)
+	t.TotalTokens += int64(prompt) + int64(completion)
 	if hasCredit {
 		t.Credit += credit
 	}
@@ -206,9 +223,16 @@ func (s *Store) load() error {
 	return nil
 }
 
-// Record 记一次成功请求的用量。keyID 为空时归到 "legacy"（单密钥模式/内置密钥）。
+// Record 保留已有成功请求调用接口；新增失败/取消记账使用 RecordOutcome。
 // model 为空时只计入密钥与总量维度。
 func (s *Store) Record(keyID, name, maskedKey, model string, prompt, completion, cached int, credit float64, hasCredit bool, at time.Time) {
+	s.RecordOutcome(keyID, name, maskedKey, model, prompt, completion, cached, credit, hasCredit, Outcome{}, at)
+}
+
+// RecordOutcome records one finished client request that reached the upstream.
+// Known values are retained even when it failed; absent fields remain unknown.
+// keyID 为空时归到 "legacy"（单密钥模式/内置密钥）。
+func (s *Store) RecordOutcome(keyID, name, maskedKey, model string, prompt, completion, cached int, credit float64, hasCredit bool, outcome Outcome, at time.Time) {
 	if s == nil {
 		return
 	}
@@ -245,28 +269,28 @@ func (s *Store) Record(keyID, name, maskedKey, model string, prompt, completion,
 		record.FirstUsedAt = at
 	}
 	record.LastUsedAt = at
-	record.Totals.add(prompt, completion, cached, credit, hasCredit)
-	s.doc.Totals.add(prompt, completion, cached, credit, hasCredit)
+	record.Totals.add(prompt, completion, cached, credit, hasCredit, outcome)
+	s.doc.Totals.add(prompt, completion, cached, credit, hasCredit, outcome)
 	s.doc.UpdatedAt = at
 	// 天桶：总量与按密钥各记一份（面板按密钥筛选日期时要能对上）。
 	if s.doc.Days == nil {
 		s.doc.Days = map[string]*Totals{}
 	}
 	if dayTotals := s.doc.Days[day]; dayTotals != nil {
-		dayTotals.add(prompt, completion, cached, credit, hasCredit)
+		dayTotals.add(prompt, completion, cached, credit, hasCredit, outcome)
 	} else {
 		created := &Totals{}
-		created.add(prompt, completion, cached, credit, hasCredit)
+		created.add(prompt, completion, cached, credit, hasCredit, outcome)
 		s.doc.Days[day] = created
 	}
 	if record.Days == nil {
 		record.Days = map[string]*Totals{}
 	}
 	if keyDay := record.Days[day]; keyDay != nil {
-		keyDay.add(prompt, completion, cached, credit, hasCredit)
+		keyDay.add(prompt, completion, cached, credit, hasCredit, outcome)
 	} else {
 		created := &Totals{}
-		created.add(prompt, completion, cached, credit, hasCredit)
+		created.add(prompt, completion, cached, credit, hasCredit, outcome)
 		record.Days[day] = created
 	}
 	trimDayBuckets(s.doc.Days)
@@ -280,7 +304,7 @@ func (s *Store) Record(keyID, name, maskedKey, model string, prompt, completion,
 			counter = &Totals{}
 			record.Models[model] = counter
 		}
-		counter.add(prompt, completion, cached, credit, hasCredit)
+		counter.add(prompt, completion, cached, credit, hasCredit, outcome)
 	}
 	s.dirty = true
 }
@@ -731,24 +755,28 @@ func cloneDocument(doc document) document {
 // deltaTotals 逐字段算增量，负数（清零或跨进程读到的更大值）按 0 处理。
 func deltaTotals(now, prev Totals) Totals {
 	return Totals{
-		Requests:         positive(now.Requests - prev.Requests),
-		PromptTokens:     positive(now.PromptTokens - prev.PromptTokens),
-		CachedTokens:     positive(now.CachedTokens - prev.CachedTokens),
-		CompletionTokens: positive(now.CompletionTokens - prev.CompletionTokens),
-		TotalTokens:      positive(now.TotalTokens - prev.TotalTokens),
-		Credit:           positiveFloat(now.Credit - prev.Credit),
+		Requests:           positive(now.Requests - prev.Requests),
+		FailedRequests:     positive(now.FailedRequests - prev.FailedRequests),
+		UnreportedRequests: positive(now.UnreportedRequests - prev.UnreportedRequests),
+		PromptTokens:       positive(now.PromptTokens - prev.PromptTokens),
+		CachedTokens:       positive(now.CachedTokens - prev.CachedTokens),
+		CompletionTokens:   positive(now.CompletionTokens - prev.CompletionTokens),
+		TotalTokens:        positive(now.TotalTokens - prev.TotalTokens),
+		Credit:             positiveFloat(now.Credit - prev.Credit),
 	}
 }
 
 // addTotals 逐字段相加。
 func addTotals(base, delta Totals) Totals {
 	return Totals{
-		Requests:         base.Requests + delta.Requests,
-		PromptTokens:     base.PromptTokens + delta.PromptTokens,
-		CachedTokens:     base.CachedTokens + delta.CachedTokens,
-		CompletionTokens: base.CompletionTokens + delta.CompletionTokens,
-		TotalTokens:      base.TotalTokens + delta.TotalTokens,
-		Credit:           base.Credit + delta.Credit,
+		Requests:           base.Requests + delta.Requests,
+		FailedRequests:     base.FailedRequests + delta.FailedRequests,
+		UnreportedRequests: base.UnreportedRequests + delta.UnreportedRequests,
+		PromptTokens:       base.PromptTokens + delta.PromptTokens,
+		CachedTokens:       base.CachedTokens + delta.CachedTokens,
+		CompletionTokens:   base.CompletionTokens + delta.CompletionTokens,
+		TotalTokens:        base.TotalTokens + delta.TotalTokens,
+		Credit:             base.Credit + delta.Credit,
 	}
 }
 

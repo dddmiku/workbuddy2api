@@ -24,6 +24,7 @@
 // 2026-09-18：将命名空间的使用说明附在扁平工具描述中，保留分组提供的单位和业务语义。
 // 2026-09-18：展平名字使用稳定摘要限制在64字节内，声明、历史、指名选择和返回项共用别名。
 // 2026-09-18：顶层公开工具也使用同一别名规则，保留原始声明和模型可见的工具身份说明。
+// 2026-09-19：输入估计倍率拒绝非有限值并防止整数溢出；合并迟到用量、保留标准缓存明细并传回终态写失败。
 package server
 
 import (
@@ -42,6 +43,7 @@ import (
 	"unicode/utf8"
 	"workbuddy2api/internal/jsonutil"
 	"workbuddy2api/internal/prompt"
+	"workbuddy2api/internal/upstream"
 )
 
 // applyActNote 在翻译后的 chat 请求体上追加运行约定（见 prompt.ActNote）。
@@ -1226,7 +1228,7 @@ func (rw *responsesWriter) finish() {
 		}
 		rw.inner.Header().Set("Content-Type", ct)
 		rw.inner.WriteHeader(rw.status)
-		_, _ = rw.inner.Write(rw.buf)
+		_, rw.writeErr = rw.inner.Write(rw.buf)
 	case 2:
 		rw.finishJSON()
 	default:
@@ -1241,6 +1243,7 @@ func (rw *responsesWriter) finish() {
 func (rw *responsesWriter) finishJSON() {
 	var chat map[string]any
 	if json.Unmarshal(rw.buf, &chat) != nil {
+		rw.status = http.StatusBadGateway
 		// 解析不了就原样透传，别把本来能用的响应弄坏。
 		writeOpenAIError(rw.inner, http.StatusBadGateway, "upstream_parse", "upstream response is not valid JSON")
 		return
@@ -1252,6 +1255,7 @@ func (rw *responsesWriter) finishJSON() {
 	if rw.req != nil {
 		rw.req.applyEcho(result)
 		if err := rw.validateJSONCompletion(chat, result); err != nil {
+			rw.status = http.StatusBadGateway
 			writeOpenAIError(rw.inner, http.StatusBadGateway, "response_contract_violation", err.Error())
 			return
 		}
@@ -1259,7 +1263,7 @@ func (rw *responsesWriter) finishJSON() {
 	raw, _ := json.Marshal(result)
 	rw.inner.Header().Set("Content-Type", "application/json")
 	rw.inner.WriteHeader(http.StatusOK)
-	_, _ = rw.inner.Write(raw)
+	_, rw.writeErr = rw.inner.Write(raw)
 }
 
 func (rw *responsesWriter) resolvedModel() string {
@@ -1364,7 +1368,7 @@ func (rw *responsesWriter) handleChunk(chunk map[string]any) {
 		rw.modelName = v
 	}
 	if u, ok := chunk["usage"].(map[string]any); ok {
-		rw.usage = u
+		rw.usage = upstream.MergeUsage(rw.usage, u)
 	}
 	choices, ok := chunk["choices"].([]any)
 	if !ok {
@@ -1988,7 +1992,7 @@ func (rw *responsesWriter) usageObject() map[string]any {
 		in = intOf(rw.usage["prompt_tokens"])
 		out = intOf(rw.usage["completion_tokens"])
 		total = intOf(rw.usage["total_tokens"])
-		cached = intOf(rw.usage["prompt_cache_hit_tokens"])
+		cached, _ = upstream.CachedInputTokens(rw.usage)
 		reason = intOf(rw.usage["completion_thinking_tokens"])
 		if reason == 0 {
 			if d, ok := rw.usage["completion_tokens_details"].(map[string]any); ok {
@@ -2010,22 +2014,11 @@ func (rw *responsesWriter) usageObject() map[string]any {
 	return usage
 }
 
-// scaleContextUsage 把 usage 的输入侧换算到「上游判上限用的那套口径」。
-//
-// 背景（实测，2026-09-19）：上游的用量计数器与它自己的 1,048,576 上限不是同一套分词器。
-// 同一段中文文本，用量按 0.57 token/字符计、上限按 0.76 token/字符判（×1.33）；
-// 各角色消息（user/assistant/tool/system）、工具声明、图片都正常计入，只有
-// reasoning_content 两边都不算。于是客户端拿到的 input_tokens 系统性地小于
-// 真正参与上限判断的数字，客户端按自己的窗口阈值压缩就会一路等到上游 400
-// context_length_exceeded 才停。
-//
-// 换算只动输入侧：上游对输出只有一个口径；total_tokens 随输入重算，
-// cached_tokens 同乘并夹到 input 以内，保证 input + output == total 与
-// cached ≤ input 两条不变式在换算后仍然成立。
-//
-// scale <= 1 时不改动任何字段（1 = 关闭换算）。
+// scaleContextUsage 为 Responses 客户端提供按配置倍率校准的上下文估计。
+// 只调整返回值的输入侧，输出原值和独立账本保持不变；该估计不代表上游计费或分词器事实。
+// 2026-09-19：在整数转换前检查范围，并为输出预留空间，避免异常值导致负缓存数或 total 溢出。
 func scaleContextUsage(usage map[string]any, scale float64) {
-	if usage == nil || scale <= 1 {
+	if usage == nil || math.IsNaN(scale) || math.IsInf(scale, 0) || scale <= 1 || scale > 5 {
 		return
 	}
 	in := intOf(usage["input_tokens"])
@@ -2033,22 +2026,32 @@ func scaleContextUsage(usage map[string]any, scale float64) {
 		return
 	}
 	out := intOf(usage["output_tokens"])
-	scaled := int(math.Round(float64(in) * scale))
-	if scaled <= in {
+	if out < 0 {
+		return
+	}
+	maxInput := int(^uint(0)>>1) - out
+	scaled := boundedScaledTokens(in, scale, maxInput)
+	if scaled <= in && in < maxInput {
 		scaled = in + 1
 	}
 	usage["input_tokens"] = scaled
 	usage["total_tokens"] = scaled + out
 	if details, ok := usage["input_tokens_details"].(map[string]any); ok {
 		cached := intOf(details["cached_tokens"])
-		if cached > 0 {
-			scaledCached := int(math.Round(float64(cached) * scale))
-			if scaledCached > scaled {
-				scaledCached = scaled
-			}
-			details["cached_tokens"] = scaledCached
-		}
+		details["cached_tokens"] = boundedScaledTokens(cached, scale, scaled)
 	}
+}
+
+func boundedScaledTokens(value int, scale float64, limit int) int {
+	if value <= 0 || limit <= 0 {
+		return 0
+	}
+	rounded := math.Round(float64(value) * scale)
+	// float64(MaxInt) 可能向上舍入为不可表示的整数；必须先比较，再转换。
+	if rounded >= float64(limit) {
+		return limit
+	}
+	return int(rounded)
 }
 
 // chatToResponses 把一次完整的 chat completion 翻成 Responses 对象（非流式路径）。
@@ -2145,6 +2148,7 @@ func chatToResponses(chat map[string]any, model string, req *responsesRequest) m
 		"output_tokens_details": map[string]any{"reasoning_tokens": 0},
 	}
 	if u, ok := chat["usage"].(map[string]any); ok {
+		cached, _ := upstream.CachedInputTokens(u)
 		in := intOf(u["prompt_tokens"])
 		out := intOf(u["completion_tokens"])
 		total := intOf(u["total_tokens"])
@@ -2159,7 +2163,7 @@ func chatToResponses(chat map[string]any, model string, req *responsesRequest) m
 		}
 		usage = map[string]any{
 			"input_tokens": in, "output_tokens": out, "total_tokens": total,
-			"input_tokens_details":  map[string]any{"cached_tokens": intOf(u["prompt_cache_hit_tokens"])},
+			"input_tokens_details":  map[string]any{"cached_tokens": cached},
 			"output_tokens_details": map[string]any{"reasoning_tokens": reason},
 		}
 	}
