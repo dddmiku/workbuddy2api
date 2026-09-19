@@ -1,5 +1,6 @@
 // sse.go 处理上游 SSE 流：聚合成单个 OpenAI 响应，或透传给客户端。
 // ═══ 更新日志 ═══
+// 2026-09-19：工具参数允许在早到的结束标记后补齐；传输收尾统一校验，成功终态延迟到校验通过后发送。
 // 2026-09-19：可选重复推理保护共享流/聚合入口，保留已观察帧并以明确错误终止，真实正文/工具进展重置窗口。
 // 2026-09-16：统一 SSE 事件解析与结束校验，保留上游错误并防止断流和残缺工具参数伪装成功。
 // 2026-09-16：将完整消息快照转成缺失增量并核对已有输出，区分工具参数暂缺、显式空串和类型错误。
@@ -445,10 +446,9 @@ func (s *streamState) observe(obj map[string]any) error {
 				return &StreamError{Code: "upstream_parse", Message: "upstream stream contained an unknown finish_reason"}
 			}
 			state.finishReason = reason
-			// 成功 finish 帧写出之前就校验，不能先允许客户端执行工具、随后再报残参错误。
-			if err := state.validateArguments(); err != nil {
-				return err
-			}
+			// WorkBuddy may send a finish marker before the final argument delta or
+			// message snapshot. Validate once all frames through DONE/EOF arrive.
+			// Stream withholds the finish marker until that validation succeeds.
 		}
 	}
 	return nil
@@ -833,6 +833,7 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 	// 一律补 chatcmpl-wb2api 哨兵，造成同流 id 分裂）。全流无真实 id → 才出现哨兵。
 	firstID := ""
 	var usage map[string]any
+	terminalMeta := map[string]any{}
 
 	// 正常帧和错误帧共享一个写出口，任何客户端断开均向上传递。
 	writeRaw := func(payload string) error {
@@ -863,13 +864,12 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 			obj["usage"] = usage
 		}
 		guardErr := state.observeReasoningLoops(obj)
-		if guardErr != nil {
-			// Keep the observed text/usage frame, but do not publish a successful
-			// finish marker immediately before reporting a guard failure.
-			choices, _ := obj["choices"].([]any)
-			for _, raw := range choices {
-				raw.(map[string]any)["finish_reason"] = nil
-			}
+		// Text, argument deltas and observed usage continue streaming. A finish
+		// is not safe to expose until late arguments and upstream errors have
+		// been consumed; the authoritative reasons remain in streamState.
+		choices, _ := obj["choices"].([]any)
+		for _, raw := range choices {
+			raw.(map[string]any)["finish_reason"] = nil
 		}
 		stripToolCallNames(obj, toolCallSeen)
 		if firstID == "" {
@@ -878,6 +878,11 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 			}
 		} else if value, ok := obj["id"].(string); !ok || value == "" {
 			obj["id"] = firstID
+		}
+		for _, key := range []string{"id", "model", "created", "system_fingerprint", "service_tier"} {
+			if value, exists := obj[key]; exists && value != nil {
+				terminalMeta[key] = value
+			}
 		}
 		raw, err := json.Marshal(normalizeFrame(obj))
 		if err != nil {
@@ -901,6 +906,31 @@ func Stream(w http.ResponseWriter, r io.Reader, options ...StreamOptions) error 
 	}
 	if err == nil {
 		err = state.end()
+	}
+	if err == nil {
+		indexes := make([]int, 0, len(state.choices))
+		for index, choice := range state.choices {
+			if choice.finishReason != "" {
+				indexes = append(indexes, index)
+			}
+		}
+		sort.Ints(indexes)
+		if len(indexes) > 0 {
+			choices := make([]any, 0, len(indexes))
+			for _, index := range indexes {
+				choices = append(choices, map[string]any{"index": index, "delta": map[string]any{}, "finish_reason": state.choices[index].finishReason})
+			}
+			terminalMeta["choices"] = choices
+			// Usage was already streamed in its observed frames; do not count it
+			// again when publishing this deferred finish-only event.
+			raw, marshalErr := json.Marshal(normalizeFrame(terminalMeta))
+			if marshalErr != nil {
+				return marshalErr
+			}
+			if writeErr := writeRaw(string(raw)); writeErr != nil {
+				return writeErr
+			}
+		}
 	}
 	if err != nil {
 		var streamErr *StreamError

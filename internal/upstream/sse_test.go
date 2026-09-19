@@ -465,8 +465,8 @@ func TestStreamNormalizesFrames(t *testing.T) {
 	if done != 1 {
 		t.Fatalf("done frames=%d want 1", done)
 	}
-	if len(frames) != 3 {
-		t.Fatalf("frames=%d want 3", len(frames))
+	if len(frames) != 4 {
+		t.Fatalf("frames=%d want 4 (observed frames plus validated finish)", len(frames))
 	}
 
 	// 帧 1：噪声全剔除，finish_reason ""→null，usage 缺失→null，顶层非标字段剥除
@@ -507,14 +507,21 @@ func TestStreamNormalizesFrames(t *testing.T) {
 		t.Errorf("frame2 finish_reason=%v want null (input empty string)", ch1["finish_reason"])
 	}
 
-	// 帧 3：finish_reason 非空保留，usage 保留
+	// 帧 3 保留 usage；成功终态在校验完成后的帧 4 单独发送。
 	f2 := frames[2]
 	ch2 := f2["choices"].([]any)[0].(map[string]any)
-	if ch2["finish_reason"] != "stop" {
-		t.Errorf("frame3 finish_reason=%v want stop", ch2["finish_reason"])
+	if ch2["finish_reason"] != nil {
+		t.Errorf("frame3 finish_reason=%v want null before stream validation", ch2["finish_reason"])
 	}
 	if f2["usage"].(map[string]any)["total_tokens"].(float64) != 7 {
 		t.Errorf("frame3 usage=%v", f2["usage"])
+	}
+	f3 := frames[3]
+	if f3["choices"].([]any)[0].(map[string]any)["finish_reason"] != "stop" || f3["usage"] != nil {
+		t.Fatalf("validated finish missing or usage duplicated: %v", f3)
+	}
+	if f3["id"] != "x1" || f3["model"] != "m" || f3["created"] != float64(1) {
+		t.Fatalf("deferred finish metadata changed: %v", f3)
 	}
 }
 
@@ -533,8 +540,8 @@ func TestStreamFirstIdPassthrough(t *testing.T) {
 	if done != 1 {
 		t.Fatalf("done=%d want 1", done)
 	}
-	if len(frames) != 3 {
-		t.Fatalf("frames=%d want 3", len(frames))
+	if len(frames) != 4 {
+		t.Fatalf("frames=%d want 4", len(frames))
 	}
 	for i, fr := range frames {
 		if got := fr["id"]; got != "chatcmpl-upstream-9" {
@@ -551,8 +558,8 @@ func TestStreamNoIdFallsBackToSentinel(t *testing.T) {
 		"\"finish_reason\":\"stop\"}]}\n\n" +
 		"data: [DONE]\n\n"
 	frames, _ := streamFrames(t, raw)
-	if len(frames) != 2 {
-		t.Fatalf("frames=%d want 2", len(frames))
+	if len(frames) != 3 {
+		t.Fatalf("frames=%d want 3", len(frames))
 	}
 	for i, fr := range frames {
 		if got := fr["id"]; got != "chatcmpl-wb2api" {

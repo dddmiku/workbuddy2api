@@ -53,6 +53,8 @@ custom 的 grammar/CFG 描述仅作为模型提示，不提供原生语法执行
 
 `strict:true` 函数参数按声明的 JSON Schema 校验，非法 schema 或外部 schema 引用在请求阶段拒绝。`strict:false` 或未声明 strict 的函数保持尽力模式，不额外套用严格参数 schema；工具名称、参数形状和完整性仍按相应协议路径检查。
 
+工具参数完整性在本次上游流的 `[DONE]` 或合法 EOF 收尾时校验。早到的 `finish_reason` 后仍可接收参数增量或完整消息快照；正文、参数和已观测用量继续流式发送，成功结束标记在校验通过后发送一次。这样既能接住迟到的完整参数，也不会先宣告成功再报告残参或上游错误。真正缺失、残缺或不是合法 JSON 的参数仍返回错误，不自动补写或猜测工具操作；`length`、`content_filter` 保留原有不完整语义。
+
 `text.format=json_schema` 检查最终文本是否匹配 schema；`json_object` 要求完整 JSON 对象，不能带 Markdown 围栏或尾随文字。可以先返回工具调用，随后再给最终结构化文本。纯拒答以及明确的 length/content_filter 不完整结果有独立语义，不会被 required 或指定工具约束强改成工具违约。
 
 ## 内置工具的边界
